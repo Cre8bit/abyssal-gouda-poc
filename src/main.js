@@ -59,6 +59,7 @@ const joinBtn = document.getElementById("join-btn");
 const statusPanel = document.getElementById("status");
 const statusText = document.getElementById("status-text");
 const peerIdText = document.getElementById("peer-id");
+const copyLinkBtn = document.getElementById("copy-link-btn");
 const hud = document.getElementById("hud");
 const compassCanvas = document.getElementById("compass");
 const depthText = document.getElementById("depth");
@@ -83,9 +84,10 @@ hostBtn.addEventListener("click", async () => {
   try {
     const id = await hostGame();
     initVoice(getPeer());
-    showStatus("Waiting for a diver to join. Share this ID:");
+    showStatus("Waiting for a diver to join. Share this ID or link:");
     peerIdText.textContent = id;
     peerIdText.classList.remove("hidden");
+    copyLinkBtn.classList.remove("hidden");
     menu.classList.add("hidden");
     hud.classList.remove("hidden");
   } catch (err) {
@@ -93,10 +95,24 @@ hostBtn.addEventListener("click", async () => {
   }
 });
 
-joinBtn.addEventListener("click", async () => {
-  const hostId = prompt("Enter the Host ID:");
-  if (!hostId) return;
+// Invite link: open it in another window/device to auto-join this game.
+function inviteUrl() {
+  return `${location.origin}${location.pathname}?join=${encodeURIComponent(peerIdText.textContent)}`;
+}
 
+copyLinkBtn.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(inviteUrl());
+    copyLinkBtn.textContent = "✔ Copied!";
+  } catch {
+    // Clipboard can be unavailable (e.g. non-HTTPS LAN) — show the URL.
+    peerIdText.textContent = inviteUrl();
+    copyLinkBtn.textContent = "Copy manually above";
+  }
+  setTimeout(() => (copyLinkBtn.textContent = "📋 Copy invite link"), 2000);
+});
+
+async function join(hostId) {
   showStatus("Connecting…");
   try {
     const remoteId = await joinGame(hostId.trim());
@@ -106,8 +122,21 @@ joinBtn.addEventListener("click", async () => {
     hud.classList.remove("hidden");
   } catch (err) {
     showStatus(`Connection failed: ${err.message ?? err.type ?? err}`);
+    menu.classList.remove("hidden");
   }
+}
+
+joinBtn.addEventListener("click", () => {
+  const hostId = prompt("Enter the Host ID:");
+  if (hostId) join(hostId);
 });
+
+// Auto-join when opened through an invite link (?join=<host-id>).
+const joinParam = new URLSearchParams(location.search).get("join");
+if (joinParam) {
+  menu.classList.add("hidden");
+  join(joinParam);
+}
 
 scatterBtn.addEventListener("click", scatter);
 
