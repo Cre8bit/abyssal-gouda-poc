@@ -32,16 +32,55 @@ export function getPeer() {
   return peer;
 }
 
-// In dev, use the local signaling server started by Vite (vite.config.js).
-// If it isn't running, fall back to the public PeerJS cloud automatically.
-// In production (GitHub Pages) the public cloud is used directly.
-function newPeer(useLocal) {
-  return useLocal
-    ? new Peer({ host: location.hostname, port: 9001, path: "/abyssal" })
-    : new Peer();
+// ICE: STUN for direct connections + a free public TURN relay as fallback.
+// TURN rescues the cases where direct WebRTC fails even on one machine:
+// mDNS candidates blocked by firewalls/VPNs, NAT hairpin failures, etc.
+const ICE_CONFIG = {
+  iceServers: [
+    {
+      urls: [
+        "stun:stun.l.google.com:19302",
+        "stun:stun1.l.google.com:19302",
+      ],
+    },
+    {
+      urls: [
+        "turn:openrelay.metered.ca:80",
+        "turn:openrelay.metered.ca:443",
+        "turn:openrelay.metered.ca:443?transport=tcp",
+      ],
+      username: "openrelayproject",
+      credential: "openrelayproject",
+    },
+  ],
+};
+
+// In dev, use the local signaling server started by Vite (vite.config.js),
+// falling back to the public PeerJS cloud. In production: cloud directly.
+// Both players MUST end up on the same signaling server — invite links pin
+// the joiner to the host's mode (see getSignalingMode / joinGame).
+let signalingMode = null; // 'local' | 'cloud' once connected
+
+export function getSignalingMode() {
+  return signalingMode;
 }
 
-function createPeer() {
+function newPeer(useLocal) {
+  const opts = {
+    config: ICE_CONFIG,
+    debug: import.meta.env.DEV ? 2 : 0,
+  };
+  return useLocal
+    ? new Peer({
+        host: location.hostname,
+        port: 9001,
+        path: "/abyssal",
+        ...opts,
+      })
+    : new Peer(opts);
+}
+
+function createPeer({ forceMode = null } = {}) {
   return new Promise((resolve, reject) => {
     const attempt = (useLocal, canFallback) => {
       const p = newPeer(useLocal);
@@ -49,20 +88,31 @@ function createPeer() {
       p.on("open", () => {
         opened = true;
         peer = p;
+        signalingMode = useLocal ? "local" : "cloud";
+        console.log(`[net] signaling: ${signalingMode} server`);
         resolve(p);
       });
       p.on("error", (err) => {
         if (opened) return; // post-open errors are handled per-connection
         p.destroy();
         if (canFallback) {
-          console.warn("Local PeerJS server unreachable, using public cloud…");
+          console.warn("[net] local PeerJS server unreachable, using cloud…");
           attempt(false, false);
+        } else if (forceMode === "local") {
+          reject(
+            new Error(
+              "The host is on the local dev signaling server, which isn't reachable from here. Is `npm run dev` still running?",
+            ),
+          );
         } else {
           reject(err);
         }
       });
     };
-    attempt(import.meta.env.DEV, import.meta.env.DEV);
+
+    const wantLocal = forceMode ? forceMode === "local" : !!import.meta.env.DEV;
+    const canFallback = !forceMode && !!import.meta.env.DEV;
+    attempt(wantLocal, canFallback);
   });
 }
 
@@ -74,14 +124,26 @@ export async function hostGame() {
 }
 
 // Client: connect to a host by ID. Resolves once the data channel is open.
-export async function joinGame(hostId) {
-  const p = await createPeer();
+// `mode` (from the invite link) pins us to the host's signaling server.
+export async function joinGame(hostId, mode = null) {
+  const p = await createPeer({ forceMode: mode });
   return new Promise((resolve, reject) => {
     const timer = setTimeout(
-      () => reject(new Error("Connection timed out — is the host still open?")),
-      12000,
+      () =>
+        reject(
+          new Error(
+            "Connection timed out. Check the host window is still open; see the console (F12) for the ICE state — 'failed'/'disconnected' usually means a firewall or VPN is blocking WebRTC.",
+          ),
+        ),
+      15000,
     );
     const conn = p.connect(hostId, { reliable: false });
+
+    // Diagnostics: watch the actual WebRTC connection state.
+    conn.on("iceStateChanged", (state) => {
+      console.log("[net] ice state:", state);
+    });
+
     conn.on("open", () => {
       clearTimeout(timer);
       setupConnection(conn, { alreadyOpen: true });

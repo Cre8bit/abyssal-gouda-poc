@@ -21,6 +21,7 @@ import {
   onPeerDisconnected,
   isConnected,
   getPeer,
+  getSignalingMode,
 } from "./network.js";
 import {
   initInput,
@@ -83,8 +84,11 @@ hostBtn.addEventListener("click", async () => {
   showStatus("Creating game…");
   try {
     const id = await hostGame();
+    hostedId = id;
     initVoice(getPeer());
-    showStatus("Waiting for a diver to join. Share this ID or link:");
+    showStatus(
+      `Waiting for a diver to join (signaling: ${getSignalingMode()}). Share this ID or link:`,
+    );
     peerIdText.textContent = id;
     peerIdText.classList.remove("hidden");
     copyLinkBtn.classList.remove("hidden");
@@ -96,8 +100,10 @@ hostBtn.addEventListener("click", async () => {
 });
 
 // Invite link: open it in another window/device to auto-join this game.
+// Includes the signaling mode so the joiner uses the SAME server as the host.
+let hostedId = null;
 function inviteUrl() {
-  return `${location.origin}${location.pathname}?join=${encodeURIComponent(peerIdText.textContent)}`;
+  return `${location.origin}${location.pathname}?join=${encodeURIComponent(hostedId)}&s=${getSignalingMode()}`;
 }
 
 copyLinkBtn.addEventListener("click", async () => {
@@ -112,10 +118,10 @@ copyLinkBtn.addEventListener("click", async () => {
   setTimeout(() => (copyLinkBtn.textContent = "📋 Copy invite link"), 2000);
 });
 
-async function join(hostId) {
+async function join(hostId, mode = null) {
   showStatus("Connecting…");
   try {
-    const remoteId = await joinGame(hostId.trim());
+    const remoteId = await joinGame(hostId.trim(), mode);
     initVoice(getPeer());
     callPeer(getPeer(), remoteId); // start proximity voice
     menu.classList.add("hidden");
@@ -131,11 +137,13 @@ joinBtn.addEventListener("click", () => {
   if (hostId) join(hostId);
 });
 
-// Auto-join when opened through an invite link (?join=<host-id>).
-const joinParam = new URLSearchParams(location.search).get("join");
+// Auto-join when opened through an invite link (?join=<host-id>&s=<mode>).
+const urlParams = new URLSearchParams(location.search);
+const joinParam = urlParams.get("join");
 if (joinParam) {
   menu.classList.add("hidden");
-  join(joinParam);
+  const mode = urlParams.get("s");
+  join(joinParam, mode === "local" || mode === "cloud" ? mode : null);
 }
 
 scatterBtn.addEventListener("click", scatter);
