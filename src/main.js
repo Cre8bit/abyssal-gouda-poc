@@ -19,17 +19,20 @@ import {
 import {
   initInput,
   initMouseLook,
+  updateLook,
   getMovement,
   getYaw,
   getPitch,
 } from "./input.js";
+import { SnapshotBuffer } from "./interpolation.js";
 
-const MOVE_SPEED = 5; // units per second
+const MAX_SPEED = 4.5; // units per second
+const WATER_INERTIA = 4; // how quickly velocity reaches its target
 const NETWORK_RATE = 1 / 20; // send state 20x per second
+const FLOOR_Y = -1.3; // eye level can't go below this
+const SURFACE_Y = 28;
 
-const LOCAL_ID = "local";
-const LOCAL_COLOR = 0xffa64d; // orange
-const REMOTE_COLOR = 0x66ff99; // green
+const REMOTE_COLOR = 0x66ff99;
 
 // --- UI elements ---
 const menu = document.getElementById("menu");
@@ -39,14 +42,16 @@ const statusPanel = document.getElementById("status");
 const statusText = document.getElementById("status-text");
 const peerIdText = document.getElementById("peer-id");
 
-const localPosition = { x: 0, y: 0, z: 0 };
+const localPosition = { x: 0, y: 2, z: 0 };
+const velocity = { x: 0, y: 0, z: 0 };
 let networkTimer = 0;
+
+const remoteBuffers = new Map(); // peerId -> SnapshotBuffer
 
 // --- Setup ---
 const canvas = initGraphics(document.getElementById("scene-container"));
 initInput();
 initMouseLook(canvas);
-addPlayer(LOCAL_ID, LOCAL_COLOR);
 
 // --- UI handlers ---
 hostBtn.addEventListener("click", async () => {
@@ -78,47 +83,79 @@ joinBtn.addEventListener("click", async () => {
 // --- Network callbacks ---
 onPeerConnected((peerId) => {
   addPlayer(peerId, REMOTE_COLOR);
-  showStatus("Player connected! Swim with ZQSD, aim with mouse.");
+  remoteBuffers.set(peerId, new SnapshotBuffer());
+  showStatus("Diver connected! Swim: ZQSD/WASD · Look: mouse · Up/Down: Space/Shift");
   peerIdText.classList.add("hidden");
 });
 
 onPeerDisconnected((peerId) => {
   removePlayer(peerId);
-  showStatus("Player disconnected.");
+  remoteBuffers.delete(peerId);
+  showStatus("Diver disconnected.");
 });
 
-onStateReceived((peerId, { x, y, z }) => {
-  updatePlayerPosition(peerId, x, y, z);
+// Don't apply remote state directly — buffer it for interpolation.
+onStateReceived((peerId, { x, y, z, yaw }) => {
+  remoteBuffers.get(peerId)?.push({ x, y, z, yaw });
 });
 
 // --- Game loop ---
 renderLoop((delta) => {
-  // 1. Read local input and move the local player relative to camera yaw.
-  const move = getMovement();
+  // 1. Smooth the camera look toward the mouse target.
+  updateLook(delta);
   const yaw = getYaw();
-  const cos = Math.cos(yaw),
-    sin = Math.sin(yaw);
-  localPosition.x += (move.x * cos + move.z * sin) * MOVE_SPEED * delta;
-  localPosition.z += (-move.x * sin + move.z * cos) * MOVE_SPEED * delta;
+  const pitch = getPitch();
 
-  // 2. Update local graphics and camera.
-  updatePlayerPosition(
-    LOCAL_ID,
-    localPosition.x,
-    localPosition.y,
-    localPosition.z,
-  );
-  updateCamera(localPosition, yaw, getPitch());
+  // 2. Build the desired velocity in world space:
+  //    forward follows the full look direction (swim where you look),
+  //    strafe stays horizontal, Space/Shift add vertical thrust.
+  const move = getMovement();
+  const cosP = Math.cos(pitch);
+  const fwd = {
+    x: -Math.sin(yaw) * cosP,
+    y: Math.sin(pitch),
+    z: -Math.cos(yaw) * cosP,
+  };
+  const right = { x: Math.cos(yaw), z: -Math.sin(yaw) };
 
-  // 3. Broadcast state, throttled to NETWORK_RATE.
+  const target = {
+    x: (fwd.x * move.z + right.x * move.x) * MAX_SPEED,
+    y: (fwd.y * move.z + move.y) * MAX_SPEED,
+    z: (fwd.z * move.z + right.z * move.x) * MAX_SPEED,
+  };
+
+  // 3. Water inertia: ease velocity toward the target (no instant stops).
+  const k = 1 - Math.exp(-WATER_INERTIA * delta);
+  velocity.x += (target.x - velocity.x) * k;
+  velocity.y += (target.y - velocity.y) * k;
+  velocity.z += (target.z - velocity.z) * k;
+
+  localPosition.x += velocity.x * delta;
+  localPosition.y = clamp(localPosition.y + velocity.y * delta, FLOOR_Y, SURFACE_Y);
+  localPosition.z += velocity.z * delta;
+
+  // 4. First-person camera.
+  updateCamera(localPosition, yaw, pitch);
+
+  // 5. Broadcast local state, throttled.
   networkTimer += delta;
   if (networkTimer >= NETWORK_RATE && isConnected()) {
     networkTimer = 0;
-    broadcastState(localPosition.x, localPosition.y, localPosition.z);
+    broadcastState(localPosition.x, localPosition.y, localPosition.z, yaw);
+  }
+
+  // 6. Sample interpolation buffers for smooth remote movement.
+  for (const [peerId, buffer] of remoteBuffers) {
+    const s = buffer.sample();
+    if (s) updatePlayerPosition(peerId, s.x, s.y, s.z, s.yaw);
   }
 });
 
 function showStatus(text) {
   statusPanel.classList.remove("hidden");
   statusText.textContent = text;
+}
+
+function clamp(v, min, max) {
+  return Math.max(min, Math.min(max, v));
 }

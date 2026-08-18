@@ -95,6 +95,37 @@ button:active {
   user-select: all;
 }
 
+.hint {
+  margin-top: 1.25rem;
+  font-size: 0.75rem;
+  line-height: 1.5;
+  color: #6aa8c4;
+}
+
+/* Diver-mask vignette: darkens the edges of the view. */
+#vignette {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse at center,
+    transparent 55%,
+    rgba(0, 5, 10, 0.55) 100%
+  );
+}
+
+#crosshair {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  margin: -2px 0 0 -2px;
+  border-radius: 50%;
+  background: rgba(200, 240, 255, 0.5);
+  pointer-events: none;
+}
+
 .hidden {
   display: none !important;
 }
