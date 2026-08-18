@@ -7,6 +7,7 @@ import {
   updateCamera,
   renderLoop,
   toggleFlashlight,
+  setPlayerLight,
   terrainHeight,
 } from "./graphics.js";
 import {
@@ -67,6 +68,7 @@ const scatterBtn = document.getElementById("scatter-btn");
 const localPosition = { x: 0, y: 2, z: 8 };
 const velocity = { x: 0, y: 0, z: 0 };
 let networkTimer = 0;
+let flashlightOn = true;
 
 const remoteBuffers = new Map(); // peerId -> SnapshotBuffer
 
@@ -112,8 +114,19 @@ scatterBtn.addEventListener("click", scatter);
 // Action keys (physical positions — layout-agnostic).
 window.addEventListener("keydown", (e) => {
   if (e.code === "KeyF") {
-    const on = toggleFlashlight();
-    showStatus(on ? "Flashlight ON" : "Flashlight OFF — pitch black…");
+    flashlightOn = toggleFlashlight();
+    showStatus(flashlightOn ? "Flashlight ON" : "Flashlight OFF — pitch black…");
+    // Sync immediately so the other diver sees your light die right away.
+    if (isConnected()) {
+      broadcastState(
+        localPosition.x,
+        localPosition.y,
+        localPosition.z,
+        getYaw(),
+        getPitch(),
+        flashlightOn,
+      );
+    }
   } else if (e.code === "KeyV") {
     toggleMute();
   } else if (e.code === "KeyT" && isConnected()) {
@@ -151,7 +164,14 @@ function teleportLocal(x, z) {
   // Forget remote history so interpolation doesn't sweep across the map.
   for (const buffer of remoteBuffers.values()) buffer.reset();
   if (isConnected()) {
-    broadcastState(localPosition.x, localPosition.y, localPosition.z, getYaw(), getPitch());
+    broadcastState(
+      localPosition.x,
+      localPosition.y,
+      localPosition.z,
+      getYaw(),
+      getPitch(),
+      flashlightOn,
+    );
   }
 }
 
@@ -172,8 +192,10 @@ onPeerDisconnected((peerId) => {
 });
 
 // Buffer remote state for interpolation — never applied directly.
-onStateReceived((peerId, { x, y, z, yaw, pitch }) => {
+// (Flashlight state is applied instantly: lights don't interpolate.)
+onStateReceived((peerId, { x, y, z, yaw, pitch, light }) => {
   remoteBuffers.get(peerId)?.push({ x, y, z, yaw, pitch });
+  setPlayerLight(peerId, light !== false);
 });
 
 onEventReceived((peerId, data) => {
@@ -244,7 +266,14 @@ renderLoop((delta) => {
   networkTimer += delta;
   if (networkTimer >= NETWORK_RATE && isConnected()) {
     networkTimer = 0;
-    broadcastState(localPosition.x, localPosition.y, localPosition.z, yaw, pitch);
+    broadcastState(
+      localPosition.x,
+      localPosition.y,
+      localPosition.z,
+      yaw,
+      pitch,
+      flashlightOn,
+    );
   }
 
   // 7. Smooth remote players from interpolation buffers + move their voices.

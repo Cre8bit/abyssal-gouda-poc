@@ -84,9 +84,9 @@ function setupConnection(conn, { alreadyOpen = false } = {}) {
   });
 }
 
-// Send the local player's position + facing to every connected peer.
-export function broadcastState(x, y, z, yaw = 0, pitch = 0) {
-  const payload = { type: "state", x, y, z, yaw, pitch };
+// Send the local player's position, facing, and flashlight state.
+export function broadcastState(x, y, z, yaw = 0, pitch = 0, light = true) {
+  const payload = { type: "state", x, y, z, yaw, pitch, light };
   for (const conn of connections) {
     if (conn.open) conn.send(payload);
   }
