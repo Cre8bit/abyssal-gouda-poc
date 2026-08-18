@@ -807,6 +807,7 @@ export function addPlayer(id, color) {
     color,
     bones: null,
     torch: null,
+    headGlow: null,
     phase: Math.random() * 10, // desync swim cycles between divers
   };
   players.set(id, player);
@@ -852,7 +853,12 @@ export function addPlayer(id, color) {
       lowerLegR: bone("LowerLegR", "LowerLeg.R"),
     };
 
-    // --- Hand-held torch: real prop in the right hand. ---
+    // --- Hand-held torch: real prop following the right hand. ---
+    // IMPORTANT: never parent props into the skeleton — the rig's bones
+    // carry a ×45 world scale (armature ×100, compensated by inverse bind
+    // matrices for the skinned mesh, but inherited raw by any child).
+    // The torch lives at scene level; updateDiverRig copies the wrist's
+    // world position (and the diver's look orientation) onto it each frame.
     if (player.bones.wristR) {
       const torch = new THREE.Group();
       const torchBody = new THREE.Mesh(
@@ -876,7 +882,7 @@ export function addPlayer(id, color) {
       torchLens.position.z = -0.175;
       torch.add(torchLens);
 
-      // Reparent the whole lamp rig into the hand.
+      // Reparent the whole lamp rig into the torch (unit scale, scene level).
       torch.add(spot);
       spot.position.set(0, 0, -0.1);
       torch.add(spot.target);
@@ -886,18 +892,18 @@ export function addPlayer(id, color) {
       torch.add(halo);
       halo.position.set(0, 0, -0.22);
 
-      player.bones.wristR.add(torch);
-      torch.position.set(0, 0.06, 0);
+      scene.add(torch);
       player.torch = torch;
     }
 
-    // --- Colored glow around the diver's helmet. ---
+    // --- Colored glow following the diver's helmet (scene level too). ---
     if (player.bones.head) {
-      const headHalo = createHalo(1.8, 0.55, color);
-      player.bones.head.add(headHalo);
-      headHalo.position.set(0, 0.12, 0);
-      player.bones.head.add(glow); // the point light glows from the helmet
-      glow.position.set(0, 0.1, 0);
+      const headGlow = new THREE.Group();
+      headGlow.add(createHalo(0.9, 0.55, color));
+      glow.position.set(0, 0, 0);
+      headGlow.add(glow);
+      scene.add(headGlow);
+      player.headGlow = headGlow;
     }
 
     // Base layer: Idle clip (breathing), procedural swim on top.
@@ -961,23 +967,36 @@ function updateDiverRig(player, delta) {
     b.upperArmR.quaternion.premultiply(_q4);
   }
 
-  // Torch: lock its WORLD orientation to the diver's look direction, so the
-  // beam always points where they're looking, whatever the hand pose does.
-  if (player.torch) {
+  // Torch: scene-level prop. Follow the wrist's world POSITION, but lock the
+  // orientation to the diver's look direction so the beam aims correctly.
+  // (Never parented to the bone — bones carry a ×45 world scale.)
+  if (player.torch && b.wristR) {
     player.pivot.getWorldQuaternion(_q1);
-    player.torch.parent.getWorldQuaternion(_q2);
-    player.torch.quaternion.copy(_q2.invert().multiply(_q1));
+    b.wristR.getWorldPosition(_v1);
+    // Nudge from the wrist joint into the palm, in look-space.
+    _v1.add(_v2.set(0.02, -0.02, -0.1).applyQuaternion(_q1));
+    player.torch.position.copy(_v1);
+    player.torch.quaternion.copy(_q1);
+  }
+
+  // Helmet glow follows the head bone's world position.
+  if (player.headGlow && b.head) {
+    b.head.getWorldPosition(_v1);
+    player.headGlow.position.copy(_v1);
   }
 }
 
 export function removePlayer(id) {
   const player = players.get(id);
   if (!player) return;
-  scene.remove(player.group);
-  player.group.traverse((obj) => {
-    obj.geometry?.dispose();
-    if (obj.material?.dispose) obj.material.dispose();
-  });
+  for (const obj of [player.group, player.torch, player.headGlow]) {
+    if (!obj) continue;
+    scene.remove(obj);
+    obj.traverse((child) => {
+      child.geometry?.dispose();
+      if (child.material?.dispose) child.material.dispose();
+    });
+  }
   players.delete(id);
 }
 
@@ -1112,11 +1131,12 @@ export function renderLoop(onFrame) {
     animateFlashlight();
     updateFlicker(delta);
 
-    for (const player of players.values()) updateDiverRig(player, delta);
-
     if (onFrame) onFrame(delta);
 
-    updateSnowLightUniforms(); // after game logic moved the camera
+    // After game logic moved players/camera: animate rigs (torch follows the
+    // moved wrist), then feed the beam poses to the snow shader.
+    for (const player of players.values()) updateDiverRig(player, delta);
+    updateSnowLightUniforms();
     composer.render();
   });
 }
