@@ -32,31 +32,69 @@ export function getPeer() {
   return peer;
 }
 
-// Host: create a Peer on the public PeerJS cloud and wait for connections.
-// Resolves with the generated peer ID to share with the other player.
-export function hostGame() {
-  return new Promise((resolve, reject) => {
-    peer = new Peer(); // default public PeerJS signaling server
+// In dev, use the local signaling server started by Vite (vite.config.js).
+// If it isn't running, fall back to the public PeerJS cloud automatically.
+// In production (GitHub Pages) the public cloud is used directly.
+function newPeer(useLocal) {
+  return useLocal
+    ? new Peer({ host: location.hostname, port: 9001, path: "/abyssal" })
+    : new Peer();
+}
 
-    peer.on("open", (id) => resolve(id));
-    peer.on("error", (err) => reject(err));
-    peer.on("connection", (conn) => setupConnection(conn));
+function createPeer() {
+  return new Promise((resolve, reject) => {
+    const attempt = (useLocal, canFallback) => {
+      const p = newPeer(useLocal);
+      let opened = false;
+      p.on("open", () => {
+        opened = true;
+        peer = p;
+        resolve(p);
+      });
+      p.on("error", (err) => {
+        if (opened) return; // post-open errors are handled per-connection
+        p.destroy();
+        if (canFallback) {
+          console.warn("Local PeerJS server unreachable, using public cloud…");
+          attempt(false, false);
+        } else {
+          reject(err);
+        }
+      });
+    };
+    attempt(import.meta.env.DEV, import.meta.env.DEV);
   });
 }
 
-// Client: connect to a host by ID. Resolves once the data channel is open.
-export function joinGame(hostId) {
-  return new Promise((resolve, reject) => {
-    peer = new Peer();
+// Host: wait for connections. Resolves with the ID to share.
+export async function hostGame() {
+  const p = await createPeer();
+  p.on("connection", (conn) => setupConnection(conn));
+  return p.id;
+}
 
-    peer.on("error", (err) => reject(err));
-    peer.on("open", () => {
-      const conn = peer.connect(hostId, { reliable: false });
-      conn.on("open", () => {
-        setupConnection(conn, { alreadyOpen: true });
-        resolve(conn.peer);
-      });
-      conn.on("error", (err) => reject(err));
+// Client: connect to a host by ID. Resolves once the data channel is open.
+export async function joinGame(hostId) {
+  const p = await createPeer();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error("Connection timed out — is the host still open?")),
+      12000,
+    );
+    const conn = p.connect(hostId, { reliable: false });
+    conn.on("open", () => {
+      clearTimeout(timer);
+      setupConnection(conn, { alreadyOpen: true });
+      resolve(conn.peer);
+    });
+    conn.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    // e.g. "peer-unavailable" (wrong/expired ID) surfaces on the peer itself.
+    p.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
     });
   });
 }

@@ -31,10 +31,18 @@ npm run dev
 2. Open the copied link in a second window (or another device on your LAN —
    the dev server listens on your local IP too). It joins automatically.
 
-Notes: both windows will ask for mic access (proximity voice). Signaling goes
-through the public PeerJS cloud even locally, so an internet connection is
-required. Clipboard may be blocked on non-HTTPS LAN URLs — the invite URL is
-shown for manual copying in that case.
+Notes:
+
+- `npm run dev` also starts a **local PeerJS signaling server** (port 9001) —
+  local games don't depend on the public PeerJS cloud at all. If the local
+  server can't start (e.g. `peer` not installed yet), the app falls back to
+  the public cloud automatically.
+- Both windows will ask for mic access (proximity voice) — press V in one
+  window to avoid feedback.
+- Clipboard may be blocked on non-HTTPS LAN URLs — the invite URL is then
+  shown for manual copying.
+- Joining now times out after 12s with a clear error instead of hanging on
+  "Connecting…".
 
 ## Deployment
 
