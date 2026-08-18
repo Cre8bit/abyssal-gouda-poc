@@ -168,23 +168,37 @@ button:active {
   opacity: 0.75;
 }
 
-/* Event center: transient torch/scatter notifications (fades on its own,
-   unlike the connection #status panel which stays until dismissed). */
+/* Event feed: transient torch/scatter notifications stacked on the side,
+   like a chat log (fades on its own, unlike the connection #status panel
+   which stays until dismissed). */
 #event-center {
   position: absolute;
-  top: 30%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  font-size: 1rem;
-  letter-spacing: 0.05em;
-  text-align: center;
-  text-shadow: 0 0 10px rgba(0, 20, 40, 0.9);
-  opacity: 0;
-  transition: opacity 0.4s ease;
+  top: 45%;
+  left: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  max-width: 280px;
 }
 
-#event-center.visible {
+.event-toast {
+  padding: 0.5rem 0.85rem;
+  background: rgba(0, 20, 35, 0.55);
+  border-left: 3px solid rgba(120, 220, 255, 0.6);
+  border-radius: 4px;
+  font-size: 0.85rem;
+  letter-spacing: 0.03em;
+  text-shadow: 0 0 8px rgba(0, 20, 40, 0.9);
+  opacity: 0;
+  transform: translateX(-16px);
+  transition:
+    opacity 0.35s ease,
+    transform 0.35s ease;
+}
+
+.event-toast.visible {
   opacity: 1;
+  transform: translateX(0);
 }
 
 #scatter-btn {

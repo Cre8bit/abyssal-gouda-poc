@@ -375,9 +375,12 @@ function drawCompass(yaw) {
   ctx.textAlign = "center";
   ctx.lineWidth = 1;
 
-  for (let deg = -60; deg <= 60; deg += 5) {
-    const abs = (((heading + deg) % 360) + 360) % 360;
-    if (abs % 15 !== 0) continue;
+  // Iterate fixed absolute headings (heading is a continuous float, so
+  // comparing it against multiples of 15 directly would almost never match).
+  for (let abs = 0; abs < 360; abs += 15) {
+    // Signed shortest distance from the current heading, in (-180, 180].
+    const deg = ((((abs - heading + 540) % 360) + 360) % 360) - 180;
+    if (deg < -60 || deg > 60) continue;
     const x = w / 2 + deg * pxPerDeg;
     const major = abs % 45 === 0;
     ctx.beginPath();
@@ -398,15 +401,18 @@ function showStatus(text) {
   statusText.textContent = text;
 }
 
-let eventTimer = null;
+// Chat-like feed of transient toasts stacked on the side of the screen.
 function showEvent(text, duration = 2200) {
-  eventCenter.textContent = text;
-  eventCenter.classList.add("visible");
-  clearTimeout(eventTimer);
-  eventTimer = setTimeout(
-    () => eventCenter.classList.remove("visible"),
-    duration,
-  );
+  const toast = document.createElement("div");
+  toast.className = "event-toast";
+  toast.textContent = text;
+  eventCenter.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add("visible"));
+  setTimeout(() => {
+    toast.classList.remove("visible");
+    toast.classList.add("leaving");
+    setTimeout(() => toast.remove(), 400);
+  }, duration);
 }
 
 function clamp(v, min, max) {
