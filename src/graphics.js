@@ -2,12 +2,15 @@
 //
 // Lighting model:
 //  - Flashlight = hot core spotlight (shadows) + wide soft spill light
-//  - Custom volumetric beam shader: fresnel-soft cone with distance falloff
-//    and drifting particulate wisps, visible even in open water
+//  - Custom volumetric beam: tight core + wide soft haze cone (fresnel-soft,
+//    distance falloff, drifting particulate wisps) plus camera-facing
+//    dispersal halos spaced along the axis, so the beam's throw and dimming
+//    read clearly even with no floor/walls in view
 //  - Marine snow is LIT by the beams (uniform-driven cone lighting), so the
 //    light visibly diffuses through the thickness of the water
 //  - Scatter halo sprites at every lamp
-//  - Gentle Perlin-noise flicker with rare soft dips (no strobing)
+//  - Lights are steady (no flicker); the dying bell lamp only breathes with
+//    a slow, smooth pulse
 //  - Slow current drift on particles + occasional rising bubble bursts
 import * as THREE from "three";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
@@ -33,6 +36,7 @@ const BURST_PARTICLES = 24;
 const FLASHLIGHT_INTENSITY = 650;
 const SPILL_INTENSITY = 90;
 const REMOTE_LAMP_INTENSITY = 420;
+const MAX_PIXEL_RATIO = 1.5;
 
 const DIVER_MODEL_URL = `${import.meta.env.BASE_URL}models/diver.glb`;
 const DIVER_SCALE = 0.45; // must match the diver model's own scale below
@@ -49,10 +53,8 @@ let flashlight; // { group, spot, spill, beam, lens, halo, on }
 let bellLight;
 let elapsed = 0;
 let moveFactor = 0;
-let flickerMult = 1;
-let dipTimer = 0;
-let dipDuration = 0;
-let dipDepth = 0;
+let resizeFrame = null;
+let nextShadowUpdate = 0;
 
 const players = new Map();
 const noise = new ImprovedNoise();
@@ -71,6 +73,10 @@ function loadDiverModel() {
     .loadAsync(DIVER_MODEL_URL)
     .catch(() => null);
   return diverModelPromise;
+}
+
+function renderPixelRatio() {
+  return Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO);
 }
 
 export function terrainHeight(x, z) {
@@ -96,13 +102,18 @@ export function initGraphics(container) {
   camera.position.set(0, 2, 8);
   scene.add(camera);
 
-  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer = new THREE.WebGLRenderer({
+    antialias: true,
+    powerPreference: "high-performance",
+    stencil: false,
+  });
+  renderer.setPixelRatio(renderPixelRatio());
   renderer.setSize(window.innerWidth, window.innerHeight);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = 1.15;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.autoUpdate = false;
   container.appendChild(renderer.domElement);
 
   setupPostProcessing();
@@ -132,12 +143,11 @@ function setupPostProcessing() {
 
   const bloom = new UnrealBloomPass(
     new THREE.Vector2(window.innerWidth, window.innerHeight),
-    0.45,
-    0.6,
-    0.75,
+    0.55,
+    0.8,
+    0.7,
   );
   composer.addPass(bloom);
-  composer.addPass(new OutputPass());
 
   horrorPass = new ShaderPass({
     uniforms: {
@@ -156,16 +166,12 @@ function setupPostProcessing() {
       uniform float uTime;
       varying vec2 vUv;
 
-      float rand(vec2 co) {
-        return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
-      }
-
       void main() {
         vec2 uv = vUv;
         uv += vec2(
-          sin(uv.y * 42.0 + uTime * 0.9),
-          cos(uv.x * 34.0 - uTime * 0.7)
-        ) * 0.0011;
+          sin(uv.y * 18.0 + uTime * 0.35),
+          cos(uv.x * 15.0 - uTime * 0.28)
+        ) * 0.00035;
 
         vec3 col = texture2D(tDiffuse, uv).rgb;
 
@@ -176,20 +182,20 @@ function setupPostProcessing() {
         float d = distance(vUv, vec2(0.5));
         col *= smoothstep(0.88, 0.32, d);
 
-        float g = rand(vUv * 900.0 + fract(uTime * 13.7) * 100.0) - 0.5;
-        col += g * (0.04 + (1.0 - lum) * 0.035);
-
         gl_FragColor = vec4(col, 1.0);
       }
     `,
   });
   composer.addPass(horrorPass);
+  composer.addPass(new OutputPass());
 }
 
 // --- Shared helpers: volumetric beam + scatter halo ---------------------
 
 // Fresnel-soft additive cone with distance falloff and drifting wisps.
-function createBeam({ length, endRadius, tint, strength }) {
+// `falloffPow` shapes how quickly it dims with distance: high (~1.6) for a
+// tight bright core, low (~0.6) for a slow-dimming diffuse haze.
+function createBeam({ length, endRadius, tint, strength, falloffPow = 1.6 }) {
   const geo = new THREE.CylinderGeometry(0.03, endRadius, length, 32, 8, true);
   geo.translate(0, -length / 2, 0);
   geo.rotateX(Math.PI / 2); // extend along -Z
@@ -204,6 +210,7 @@ function createBeam({ length, endRadius, tint, strength }) {
       uIntensity: { value: 1 },
       uColor: { value: new THREE.Color(tint) },
       uStrength: { value: strength },
+      uFalloffPow: { value: falloffPow },
     },
     vertexShader: /* glsl */ `
       varying vec2 vUv;
@@ -222,6 +229,7 @@ function createBeam({ length, endRadius, tint, strength }) {
       uniform float uIntensity;
       uniform vec3 uColor;
       uniform float uStrength;
+      uniform float uFalloffPow;
       varying vec2 vUv;
       varying vec3 vNormal;
       varying vec3 vViewDir;
@@ -229,8 +237,8 @@ function createBeam({ length, endRadius, tint, strength }) {
       void main() {
         float along = 1.0 - vUv.y; // 0 at the lens, 1 at the far end
 
-        // Bright core near the source, exponential-ish falloff with distance.
-        float axial = pow(1.0 - along, 1.6);
+        // Bright core near the source, dimming with distance travelled.
+        float axial = pow(1.0 - along, uFalloffPow);
 
         // Soft edges: strongest through the middle of the cone (more medium
         // to scatter through), fading at silhouette edges.
@@ -284,6 +292,36 @@ function createHalo(size, opacity, color = 0xcfe6ff) {
   );
   sprite.scale.setScalar(size);
   return sprite;
+}
+
+// A lamp's full volumetric presence: a tight bright core, a wider soft haze
+// scattering out past it (so the beam has visible bulk, not a hard edge),
+// and camera-facing glow puffs spaced along the axis. The puffs shrink and
+// dim with distance, giving a clear read on how far the light throws and
+// how much it has dispersed even when no floor or wall is in view to catch it.
+function createVolumetricLight({ length, endRadius, tint, strength }) {
+  const group = new THREE.Group();
+
+  const beam = createBeam({ length, endRadius, tint, strength });
+  group.add(beam);
+
+  const haze = createBeam({
+    length,
+    endRadius: endRadius * 2.2,
+    tint,
+    strength: strength * 0.4,
+    falloffPow: 0.6,
+  });
+  group.add(haze);
+
+  const halos = [0.18, 0.45, 0.78].map((f) => {
+    const halo = createHalo(endRadius * (0.55 + f), 0.16 * (1 - f * 0.7), tint);
+    halo.position.z = -length * f;
+    group.add(halo);
+    return halo;
+  });
+
+  return { group, beam, haze, halos };
 }
 
 // --- World -----------------------------------------------------------------
@@ -456,13 +494,14 @@ function createFlashlight() {
   spill.target = spot.target;
   group.add(spill);
 
-  // Long volumetric beam — visible even with no floor in sight.
-  const beam = createBeam({
+  // Long volumetric beam — core + haze + dispersal halos, visible even
+  // with no floor in sight.
+  const beam = createVolumetricLight({
     length: 24,
     endRadius: 3.6,
     tint: 0x8fc6ee,
     strength: 0.22,
-  });
+  }).group;
   beam.position.z = -0.12;
   group.add(beam);
 
@@ -789,12 +828,12 @@ export function addPlayer(id, color) {
   pivot.add(spot);
   pivot.add(spot.target);
 
-  const beam = createBeam({
+  const beam = createVolumetricLight({
     length: 20,
     endRadius: 3.2,
     tint: 0x9fd0f2,
     strength: 0.3,
-  });
+  }).group;
   beam.position.set(0, 0.05, -0.6);
   pivot.add(beam);
 
@@ -1060,48 +1099,18 @@ export function updateCamera(playerPos, yaw, pitch, speed = 0) {
   moveFactor += (speed - moveFactor) * 0.05;
 }
 
-// --- Flicker: subtle Perlin breathing + rare soft dips (no strobe). ---
-function updateFlicker(delta) {
+// The dying bell lamp: a slow, smooth pulse (never a sudden dip/strobe) —
+// all other lights stay perfectly steady.
+function updateBellLight(delta) {
+  if (!bellLight) return;
   const t = elapsed;
-
-  // Constant gentle breathing, ±3%.
-  let mult = 0.985 + noise.noise(t * 0.55, 3.7, 0) * 0.03;
-
-  // Rare dips: roughly one every ~25s, soft envelope, mild depth.
-  if (dipTimer <= 0 && Math.random() < delta * 0.04) {
-    dipDuration = 0.35 + Math.random() * 0.5;
-    dipTimer = dipDuration;
-    dipDepth = 0.2 + Math.random() * 0.3;
-  }
-  if (dipTimer > 0) {
-    dipTimer -= delta;
-    const p = 1 - dipTimer / dipDuration;
-    const envelope = Math.sin(Math.PI * Math.min(Math.max(p, 0), 1));
-    // Tiny tremble inside the dip, smoothed by the envelope.
-    const tremble = 1 + noise.noise(t * 6.0, 8.8, 0) * 0.25;
-    mult *= 1 - dipDepth * envelope * tremble;
-  }
-
-  flickerMult = Math.max(mult, 0.05);
-
-  if (flashlight.on) {
-    flashlight.spot.intensity = FLASHLIGHT_INTENSITY * flickerMult;
-    flashlight.spill.intensity = SPILL_INTENSITY * flickerMult;
-    flashlight.lens.material.emissiveIntensity = 6 * flickerMult;
-    flashlight.beam.material.uniforms.uIntensity.value = flickerMult;
-    flashlight.halo.material.opacity = 0.28 * flickerMult;
-  }
-
-  // The dying bell light: mostly steady, occasionally browns out.
-  if (bellLight) {
-    const b = noise.noise(t * 0.9, 40.2, 0);
-    const target = b > -0.25 ? 1 : 0.12;
-    bellLight.light.intensity +=
-      (14 * target - bellLight.light.intensity) * Math.min(delta * 12, 1);
-    const lit = bellLight.light.intensity / 14;
-    bellLight.mat.emissiveIntensity = 3 * lit;
-    bellLight.halo.material.opacity = 0.3 * lit;
-  }
+  const pulse = 0.82 + 0.18 * Math.sin(t * 0.35) + 0.06 * Math.sin(t * 0.13);
+  const target = 14 * pulse;
+  bellLight.light.intensity +=
+    (target - bellLight.light.intensity) * Math.min(delta * 2, 1);
+  const lit = bellLight.light.intensity / 14;
+  bellLight.mat.emissiveIntensity = 3 * lit;
+  bellLight.halo.material.opacity = 0.3 * lit;
 }
 
 function animateFlashlight() {
@@ -1122,7 +1131,7 @@ function updateSnowLightUniforms() {
   flashlight.spot.getWorldPosition(u.uLightPos.value[0]);
   flashlight.spot.target.getWorldPosition(_v1);
   u.uLightDir.value[0].copy(_v1).sub(u.uLightPos.value[0]).normalize();
-  u.uLightOn.value[0] = flashlight.on ? flickerMult : 0;
+  u.uLightOn.value[0] = flashlight.on ? 1 : 0;
 
   let remoteLit = 0;
   for (const player of players.values()) {
@@ -1136,11 +1145,25 @@ function updateSnowLightUniforms() {
   u.uLightOn.value[1] = remoteLit;
 }
 
-function onResize() {
-  camera.aspect = window.innerWidth / window.innerHeight;
+function applyResize() {
+  resizeFrame = null;
+  const width = window.innerWidth;
+  const height = window.innerHeight;
+  const pixelRatio = renderPixelRatio();
+
+  camera.aspect = width / height;
   camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  composer.setSize(window.innerWidth, window.innerHeight);
+  if (renderer.getPixelRatio() !== pixelRatio) {
+    renderer.setPixelRatio(pixelRatio);
+    composer.setPixelRatio(pixelRatio);
+  }
+  renderer.setSize(width, height);
+  composer.setSize(width, height);
+}
+
+function onResize() {
+  if (resizeFrame !== null) return;
+  resizeFrame = requestAnimationFrame(applyResize);
 }
 
 export function renderLoop(onFrame) {
@@ -1160,7 +1183,7 @@ export function renderLoop(onFrame) {
     updateBursts(delta);
 
     animateFlashlight();
-    updateFlicker(delta);
+    updateBellLight(delta);
 
     if (onFrame) onFrame(delta);
 
@@ -1168,6 +1191,10 @@ export function renderLoop(onFrame) {
     // moved wrist), then feed the beam poses to the snow shader.
     for (const player of players.values()) updateDiverRig(player, delta);
     updateSnowLightUniforms();
+    if (elapsed >= nextShadowUpdate) {
+      renderer.shadowMap.needsUpdate = true;
+      nextShadowUpdate = elapsed + 1 / 30;
+    }
     composer.render();
   });
 }
