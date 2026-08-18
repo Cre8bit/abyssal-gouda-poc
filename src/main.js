@@ -61,11 +61,13 @@ const statusPanel = document.getElementById("status");
 const statusText = document.getElementById("status-text");
 const peerIdText = document.getElementById("peer-id");
 const copyLinkBtn = document.getElementById("copy-link-btn");
+const miniCopyLinkBtn = document.getElementById("mini-copy-link-btn");
 const hud = document.getElementById("hud");
 const compassCanvas = document.getElementById("compass");
 const depthText = document.getElementById("depth");
 const voiceText = document.getElementById("voice-indicator");
 const scatterBtn = document.getElementById("scatter-btn");
+const eventCenter = document.getElementById("event-center");
 
 const localPosition = { x: 0, y: 2, z: 8 };
 const velocity = { x: 0, y: 0, z: 0 };
@@ -118,6 +120,18 @@ copyLinkBtn.addEventListener("click", async () => {
   setTimeout(() => (copyLinkBtn.textContent = "📋 Copy invite link"), 2000);
 });
 
+// Compact stand-in for the copy-link button once the status panel is gone
+// (a diver has joined) — still lets the host share the link for more peers.
+miniCopyLinkBtn.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(inviteUrl());
+    miniCopyLinkBtn.textContent = "✔";
+  } catch {
+    prompt("Copy this invite link:", inviteUrl());
+  }
+  setTimeout(() => (miniCopyLinkBtn.textContent = "📋"), 1500);
+});
+
 async function join(hostId, mode = null) {
   showStatus("Connecting…");
   try {
@@ -152,7 +166,9 @@ scatterBtn.addEventListener("click", scatter);
 window.addEventListener("keydown", (e) => {
   if (e.code === "KeyF") {
     flashlightOn = toggleFlashlight();
-    showStatus(flashlightOn ? "Flashlight ON" : "Flashlight OFF — pitch black…");
+    showEvent(
+      flashlightOn ? "🔦 Flashlight ON" : "🔦 Flashlight OFF — pitch black…",
+    );
     // Sync immediately so the other diver sees your light die right away.
     if (isConnected()) {
       broadcastState(
@@ -190,7 +206,9 @@ function scatter() {
 
   teleportLocal(a.x, a.z);
   sendEvent({ kind: "tp", x: b.x, z: b.z });
-  showStatus("Scattered! Find your teammate — look for their light, listen for their voice.");
+  showEvent(
+    "⨨ Scattered! Find your teammate — look for their light, listen for their voice.",
+  );
 }
 
 function teleportLocal(x, z) {
@@ -216,15 +234,16 @@ function teleportLocal(x, z) {
 onPeerConnected((peerId) => {
   addPlayer(peerId, REMOTE_COLOR);
   remoteBuffers.set(peerId, new SnapshotBuffer());
-  showStatus("Diver connected! ZQSD/WASD swim · mouse look · Space/Shift up/down · F light · T scatter · V mute");
-  peerIdText.classList.add("hidden");
+  statusPanel.classList.add("hidden");
   scatterBtn.classList.remove("hidden");
+  if (hostedId) miniCopyLinkBtn.classList.remove("hidden"); // only the host has a link to share
 });
 
 onPeerDisconnected((peerId) => {
   removePlayer(peerId);
   remoteBuffers.delete(peerId);
   scatterBtn.classList.add("hidden");
+  miniCopyLinkBtn.classList.add("hidden");
   showStatus("Diver disconnected.");
 });
 
@@ -238,7 +257,9 @@ onStateReceived((peerId, { x, y, z, yaw, pitch, light }) => {
 onEventReceived((peerId, data) => {
   if (data.kind === "tp") {
     teleportLocal(data.x, data.z);
-    showStatus("Scattered! Find your teammate — look for their light, listen for their voice.");
+    showEvent(
+      "⨨ Scattered! Find your teammate — look for their light, listen for their voice.",
+    );
   }
 });
 
@@ -329,14 +350,23 @@ renderLoop((delta) => {
 
 // --- Compass strip (canvas, like a dive HUD) ---
 const compassCtx = compassCanvas.getContext("2d");
-const CARDINALS = { 0: "N", 45: "NE", 90: "E", 135: "SE", 180: "S", 225: "SW", 270: "W", 315: "NW" };
+const CARDINALS = {
+  0: "N",
+  45: "NE",
+  90: "E",
+  135: "SE",
+  180: "S",
+  225: "SW",
+  270: "W",
+  315: "NW",
+};
 
 function drawCompass(yaw) {
   const w = compassCanvas.width;
   const h = compassCanvas.height;
   const ctx = compassCtx;
   const pxPerDeg = w / 120; // 120° field of view on the strip
-  const heading = ((-yaw * 180) / Math.PI % 360 + 360) % 360;
+  const heading = ((((-yaw * 180) / Math.PI) % 360) + 360) % 360;
 
   ctx.clearRect(0, 0, w, h);
   ctx.strokeStyle = "rgba(210, 235, 250, 0.75)";
@@ -346,7 +376,7 @@ function drawCompass(yaw) {
   ctx.lineWidth = 1;
 
   for (let deg = -60; deg <= 60; deg += 5) {
-    const abs = ((heading + deg) % 360 + 360) % 360;
+    const abs = (((heading + deg) % 360) + 360) % 360;
     if (abs % 15 !== 0) continue;
     const x = w / 2 + deg * pxPerDeg;
     const major = abs % 45 === 0;
@@ -366,6 +396,17 @@ function drawCompass(yaw) {
 function showStatus(text) {
   statusPanel.classList.remove("hidden");
   statusText.textContent = text;
+}
+
+let eventTimer = null;
+function showEvent(text, duration = 2200) {
+  eventCenter.textContent = text;
+  eventCenter.classList.add("visible");
+  clearTimeout(eventTimer);
+  eventTimer = setTimeout(
+    () => eventCenter.classList.remove("visible"),
+    duration,
+  );
 }
 
 function clamp(v, min, max) {

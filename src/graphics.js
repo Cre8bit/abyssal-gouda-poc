@@ -35,6 +35,7 @@ const SPILL_INTENSITY = 90;
 const REMOTE_LAMP_INTENSITY = 420;
 
 const DIVER_MODEL_URL = `${import.meta.env.BASE_URL}models/diver.glb`;
+const DIVER_SCALE = 0.45; // must match the diver model's own scale below
 
 let scene;
 let camera;
@@ -443,7 +444,14 @@ function createFlashlight() {
   group.add(spot.target);
 
   // Wide soft spill — real torches leak a corona around the hotspot.
-  const spill = new THREE.SpotLight(0xbcd8ee, SPILL_INTENSITY, 30, 0.85, 0.9, 1.9);
+  const spill = new THREE.SpotLight(
+    0xbcd8ee,
+    SPILL_INTENSITY,
+    30,
+    0.85,
+    0.9,
+    1.9,
+  );
   spill.position.set(0, 0, -0.1);
   spill.target = spot.target;
   group.add(spill);
@@ -458,8 +466,10 @@ function createFlashlight() {
   beam.position.z = -0.12;
   group.add(beam);
 
-  // Scatter halo at the lens.
-  const halo = createHalo(2.4, 0.28);
+  // Scatter halo at the lens. Small — this sits ~0.5 units from the camera,
+  // so a "world-size" halo tuned for a distant remote light would look like
+  // a giant glowing balloon this close up.
+  const halo = createHalo(0.3, 0.28);
   halo.position.z = -0.18;
   group.add(halo);
 
@@ -702,7 +712,8 @@ function updateBursts(delta) {
 
 // Slow-changing current direction (Perlin-driven), with occasional gusts.
 function currentDrift() {
-  const gust = Math.pow(Math.max(0, noise.noise(elapsed * 0.07, 5.5, 0)), 2) * 3;
+  const gust =
+    Math.pow(Math.max(0, noise.noise(elapsed * 0.07, 5.5, 0)), 2) * 3;
   return {
     x: noise.noise(elapsed * 0.04, 11.3, 0) * (0.6 + gust),
     z: noise.noise(elapsed * 0.04, 29.1, 0) * (0.6 + gust),
@@ -822,7 +833,7 @@ export function addPlayer(id, color) {
         obj.frustumCulled = false;
       }
     });
-    model.scale.setScalar(0.45);
+    model.scale.setScalar(DIVER_SCALE);
     model.rotation.y = Math.PI; // face -Z (our forward)
     model.rotation.x = -1.05; // prone swimming lean
     model.position.set(0, -0.3, 0.15);
@@ -851,7 +862,17 @@ export function addPlayer(id, color) {
       upperLegR: bone("UpperLegR", "UpperLeg.R"),
       lowerLegL: bone("LowerLegL", "LowerLeg.L"),
       lowerLegR: bone("LowerLegR", "LowerLeg.R"),
+      footL: bone("FootL", "Foot.L"),
+      footR: bone("FootR", "Foot.R"),
     };
+
+    // Rest-pose rotation.x for every bone the swim cycle offsets, so the
+    // cycle can be applied as an absolute value each frame instead of an
+    // ever-accumulating delta (see updateDiverRig).
+    player.restRotX = {};
+    for (const [name, b] of Object.entries(player.bones)) {
+      if (b) player.restRotX[name] = b.rotation.x;
+    }
 
     // --- Hand-held torch: real prop following the right hand. ---
     // IMPORTANT: never parent props into the skeleton — the rig's bones
@@ -861,6 +882,12 @@ export function addPlayer(id, color) {
     // world position (and the diver's look orientation) onto it each frame.
     if (player.bones.wristR) {
       const torch = new THREE.Group();
+      // The torch lives at scene level (unit scale) so its physical mesh
+      // needs its own scale-down to match the shrunk diver — otherwise it
+      // renders ~2x too big relative to the hand holding it.
+      const torchProp = new THREE.Group();
+      torchProp.scale.setScalar(DIVER_SCALE);
+      torch.add(torchProp);
       const torchBody = new THREE.Mesh(
         new THREE.CylinderGeometry(0.045, 0.06, 0.34, 12),
         new THREE.MeshStandardMaterial({
@@ -870,7 +897,7 @@ export function addPlayer(id, color) {
         }),
       );
       torchBody.rotation.x = Math.PI / 2;
-      torch.add(torchBody);
+      torchProp.add(torchBody);
       const torchLens = new THREE.Mesh(
         new THREE.CircleGeometry(0.05, 12),
         new THREE.MeshStandardMaterial({
@@ -880,9 +907,10 @@ export function addPlayer(id, color) {
         }),
       );
       torchLens.position.z = -0.175;
-      torch.add(torchLens);
+      torchProp.add(torchLens);
 
-      // Reparent the whole lamp rig into the torch (unit scale, scene level).
+      // Reparent the whole lamp rig into the torch (unit scale, scene level;
+      // the beam/halo stay full-size — they're environmental light, not prop).
       torch.add(spot);
       spot.position.set(0, 0, -0.1);
       torch.add(spot.target);
@@ -932,23 +960,32 @@ function updateDiverRig(player, delta) {
 
   const t = elapsed * 2.4 + player.phase;
   const s = Math.sin;
+  const rest = player.restRotX;
 
-  // Flutter kick: thighs anti-phase, knees follow with a lag.
-  if (b.upperLegL) b.upperLegL.rotation.x += 0.34 * s(t);
-  if (b.upperLegR) b.upperLegR.rotation.x += 0.34 * s(t + Math.PI);
-  if (b.lowerLegL) b.lowerLegL.rotation.x += 0.2 + 0.2 * s(t - 0.7);
-  if (b.lowerLegR) b.lowerLegR.rotation.x += 0.2 + 0.2 * s(t + Math.PI - 0.7);
+  // Flutter kick: thighs anti-phase, knees follow with a lag. Set as an
+  // absolute offset from the rest pose (not +=) — accumulating this every
+  // rendered frame would blow up to tens of radians within seconds.
+  if (b.upperLegL) b.upperLegL.rotation.x = rest.upperLegL + 0.22 * s(t);
+  if (b.upperLegR)
+    b.upperLegR.rotation.x = rest.upperLegR + 0.22 * s(t + Math.PI);
+  if (b.lowerLegL)
+    b.lowerLegL.rotation.x = rest.lowerLegL + 0.1 + 0.14 * s(t - 0.7);
+  if (b.lowerLegR)
+    b.lowerLegR.rotation.x = rest.lowerLegR + 0.1 + 0.14 * s(t + Math.PI - 0.7);
+  // Feet counter-flex opposite the calf so they trail relaxed, not splayed.
+  if (b.footL) b.footL.rotation.x = rest.footL - 0.16 * s(t - 0.7);
+  if (b.footR) b.footR.rotation.x = rest.footR - 0.16 * s(t + Math.PI - 0.7);
 
   // Gentle body undulation rippling up the spine.
-  if (b.abdomen) b.abdomen.rotation.x += 0.05 * s(t * 0.5);
-  if (b.torso) b.torso.rotation.x += 0.04 * s(t * 0.5 - 0.5);
+  if (b.abdomen) b.abdomen.rotation.x = rest.abdomen + 0.05 * s(t * 0.5);
+  if (b.torso) b.torso.rotation.x = rest.torso + 0.04 * s(t * 0.5 - 0.5);
 
   // Head up so the diver looks ahead while prone.
-  if (b.neck) b.neck.rotation.x -= 0.35;
-  if (b.head) b.head.rotation.x -= 0.25;
+  if (b.neck) b.neck.rotation.x = rest.neck - 0.35;
+  if (b.head) b.head.rotation.x = rest.head - 0.25;
 
   // Left arm: relaxed slow sweep.
-  if (b.upperArmL) b.upperArmL.rotation.x += 0.12 * s(t * 0.6);
+  if (b.upperArmL) b.upperArmL.rotation.x = rest.upperArmL + 0.12 * s(t * 0.6);
 
   // Right arm: aim it forward (corrective rotation in world space) so the
   // torch is held out ahead of the diver.
@@ -1084,10 +1121,7 @@ function updateSnowLightUniforms() {
 
   flashlight.spot.getWorldPosition(u.uLightPos.value[0]);
   flashlight.spot.target.getWorldPosition(_v1);
-  u.uLightDir.value[0]
-    .copy(_v1)
-    .sub(u.uLightPos.value[0])
-    .normalize();
+  u.uLightDir.value[0].copy(_v1).sub(u.uLightPos.value[0]).normalize();
   u.uLightOn.value[0] = flashlight.on ? flickerMult : 0;
 
   let remoteLit = 0;
@@ -1095,10 +1129,7 @@ function updateSnowLightUniforms() {
     if (!player.spot.visible) continue;
     player.spot.getWorldPosition(u.uLightPos.value[1]);
     player.spot.target.getWorldPosition(_v2);
-    u.uLightDir.value[1]
-      .copy(_v2)
-      .sub(u.uLightPos.value[1])
-      .normalize();
+    u.uLightDir.value[1].copy(_v2).sub(u.uLightPos.value[1]).normalize();
     remoteLit = 1;
     break;
   }
