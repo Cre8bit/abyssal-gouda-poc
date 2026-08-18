@@ -58,6 +58,11 @@ const noise = new ImprovedNoise();
 const beamMaterials = []; // all volumetric beam materials (share uTime)
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
+const _v3 = new THREE.Vector3();
+const _q1 = new THREE.Quaternion();
+const _q2 = new THREE.Quaternion();
+const _q3 = new THREE.Quaternion();
+const _q4 = new THREE.Quaternion();
 
 let diverModelPromise = null;
 function loadDiverModel() {
@@ -265,11 +270,11 @@ function getHaloTexture() {
 }
 
 // Soft scatter glow around a lamp — light bleeding into the murk.
-function createHalo(size, opacity) {
+function createHalo(size, opacity, color = 0xcfe6ff) {
   const sprite = new THREE.Sprite(
     new THREE.SpriteMaterial({
       map: getHaloTexture(),
-      color: 0xcfe6ff,
+      color,
       transparent: true,
       opacity,
       blending: THREE.AdditiveBlending,
@@ -734,6 +739,7 @@ export function addPlayer(id, color) {
   const pivot = new THREE.Group();
   group.add(pivot);
 
+  // Placeholder shown until the GLB loads (visor glow included).
   const placeholder = new THREE.Group();
   const body = new THREE.Mesh(
     new THREE.CapsuleGeometry(0.32, 0.65, 8, 16),
@@ -742,8 +748,6 @@ export function addPlayer(id, color) {
   body.rotation.x = Math.PI / 2;
   body.castShadow = true;
   placeholder.add(body);
-  pivot.add(placeholder);
-
   const visor = new THREE.Mesh(
     new THREE.SphereGeometry(0.13, 12, 12),
     new THREE.MeshStandardMaterial({
@@ -753,8 +757,11 @@ export function addPlayer(id, color) {
     }),
   );
   visor.position.set(0, 0.15, -0.5);
-  pivot.add(visor);
+  placeholder.add(visor);
+  pivot.add(placeholder);
 
+  // Headlamp rig — initially mounted on the pivot; reparented into the
+  // hand-held torch once the model loads.
   const spot = new THREE.SpotLight(
     0xdcecff,
     REMOTE_LAMP_INTENSITY,
@@ -784,10 +791,24 @@ export function addPlayer(id, color) {
   halo.position.set(0, 0.05, -0.7);
   pivot.add(halo);
 
-  pivot.add(new THREE.PointLight(color, 3, 12, 2));
+  const glow = new THREE.PointLight(color, 3, 12, 2);
+  pivot.add(glow);
 
   scene.add(group);
-  const player = { group, pivot, mixer: null, placeholder, spot, beam, halo };
+  const player = {
+    group,
+    pivot,
+    mixer: null,
+    placeholder,
+    spot,
+    beam,
+    halo,
+    glow,
+    color,
+    bones: null,
+    torch: null,
+    phase: Math.random() * 10, // desync swim cycles between divers
+  };
   players.set(id, player);
 
   loadDiverModel().then((gltf) => {
@@ -801,27 +822,152 @@ export function addPlayer(id, color) {
       }
     });
     model.scale.setScalar(0.45);
-    model.rotation.y = Math.PI;
-    model.rotation.x = -1.15;
-    model.position.set(0, -0.35, 0.15);
+    model.rotation.y = Math.PI; // face -Z (our forward)
+    model.rotation.x = -1.05; // prone swimming lean
+    model.position.set(0, -0.3, 0.15);
     pivot.add(model);
 
     placeholder.visible = false;
 
+    // GLTFLoader sanitizes node names ("Wrist.R" -> "WristR").
+    const bone = (...names) => {
+      for (const n of names) {
+        const b = model.getObjectByName(n);
+        if (b) return b;
+      }
+      return null;
+    };
+    player.bones = {
+      head: bone("Head"),
+      neck: bone("Neck"),
+      abdomen: bone("Abdomen"),
+      torso: bone("Torso"),
+      wristR: bone("WristR", "Wrist.R"),
+      upperArmR: bone("UpperArmR", "UpperArm.R"),
+      lowerArmR: bone("LowerArmR", "LowerArm.R"),
+      upperArmL: bone("UpperArmL", "UpperArm.L"),
+      upperLegL: bone("UpperLegL", "UpperLeg.L"),
+      upperLegR: bone("UpperLegR", "UpperLeg.R"),
+      lowerLegL: bone("LowerLegL", "LowerLeg.L"),
+      lowerLegR: bone("LowerLegR", "LowerLeg.R"),
+    };
+
+    // --- Hand-held torch: real prop in the right hand. ---
+    if (player.bones.wristR) {
+      const torch = new THREE.Group();
+      const torchBody = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.045, 0.06, 0.34, 12),
+        new THREE.MeshStandardMaterial({
+          color: 0x11181d,
+          roughness: 0.4,
+          metalness: 0.8,
+        }),
+      );
+      torchBody.rotation.x = Math.PI / 2;
+      torch.add(torchBody);
+      const torchLens = new THREE.Mesh(
+        new THREE.CircleGeometry(0.05, 12),
+        new THREE.MeshStandardMaterial({
+          color: 0xffffff,
+          emissive: 0xe8f4ff,
+          emissiveIntensity: 5,
+        }),
+      );
+      torchLens.position.z = -0.175;
+      torch.add(torchLens);
+
+      // Reparent the whole lamp rig into the hand.
+      torch.add(spot);
+      spot.position.set(0, 0, -0.1);
+      torch.add(spot.target);
+      spot.target.position.set(0, 0, -20);
+      torch.add(beam);
+      beam.position.set(0, 0, -0.15);
+      torch.add(halo);
+      halo.position.set(0, 0, -0.22);
+
+      player.bones.wristR.add(torch);
+      torch.position.set(0, 0.06, 0);
+      player.torch = torch;
+    }
+
+    // --- Colored glow around the diver's helmet. ---
+    if (player.bones.head) {
+      const headHalo = createHalo(1.8, 0.55, color);
+      player.bones.head.add(headHalo);
+      headHalo.position.set(0, 0.12, 0);
+      player.bones.head.add(glow); // the point light glows from the helmet
+      glow.position.set(0, 0.1, 0);
+    }
+
+    // Base layer: Idle clip (breathing), procedural swim on top.
     const clips = gltf.animations ?? [];
     if (clips.length > 0) {
       const clip =
-        clips.find((c) => /swim|float/i.test(c.name)) ??
+        clips.find((c) => /\|Idle$/i.test(c.name)) ??
         clips.find((c) => /idle/i.test(c.name)) ??
         clips[0];
       player.mixer = new THREE.AnimationMixer(model);
       const action = player.mixer.clipAction(clip);
-      action.timeScale = 0.6;
+      action.timeScale = 0.5;
       action.play();
     }
   });
 
   return group;
+}
+
+// --- Procedural swim: flutter kick + body undulation + torch aimed forward.
+// Runs every frame AFTER the mixer so it layers on top of the Idle base.
+function updateDiverRig(player, delta) {
+  player.mixer?.update(delta);
+  const b = player.bones;
+  if (!b) return;
+
+  const t = elapsed * 2.4 + player.phase;
+  const s = Math.sin;
+
+  // Flutter kick: thighs anti-phase, knees follow with a lag.
+  if (b.upperLegL) b.upperLegL.rotation.x += 0.34 * s(t);
+  if (b.upperLegR) b.upperLegR.rotation.x += 0.34 * s(t + Math.PI);
+  if (b.lowerLegL) b.lowerLegL.rotation.x += 0.2 + 0.2 * s(t - 0.7);
+  if (b.lowerLegR) b.lowerLegR.rotation.x += 0.2 + 0.2 * s(t + Math.PI - 0.7);
+
+  // Gentle body undulation rippling up the spine.
+  if (b.abdomen) b.abdomen.rotation.x += 0.05 * s(t * 0.5);
+  if (b.torso) b.torso.rotation.x += 0.04 * s(t * 0.5 - 0.5);
+
+  // Head up so the diver looks ahead while prone.
+  if (b.neck) b.neck.rotation.x -= 0.35;
+  if (b.head) b.head.rotation.x -= 0.25;
+
+  // Left arm: relaxed slow sweep.
+  if (b.upperArmL) b.upperArmL.rotation.x += 0.12 * s(t * 0.6);
+
+  // Right arm: aim it forward (corrective rotation in world space) so the
+  // torch is held out ahead of the diver.
+  if (b.upperArmR && b.lowerArmR) {
+    b.upperArmR.getWorldPosition(_v1);
+    b.lowerArmR.getWorldPosition(_v2);
+    _v2.sub(_v1).normalize(); // current upper-arm direction (world)
+
+    // Desired: mostly forward, slightly down-and-in. Forward = pivot -Z.
+    player.pivot.getWorldQuaternion(_q1);
+    _v3.set(0.15, -0.3, -0.95).applyQuaternion(_q1).normalize();
+
+    _q2.setFromUnitVectors(_v2, _v3); // world-space correction
+    b.upperArmR.parent.getWorldQuaternion(_q3);
+    _q4.copy(_q3).invert().multiply(_q2).multiply(_q3);
+    b.upperArmR.quaternion.premultiply(_q4);
+  }
+
+  // Torch: lock its WORLD orientation to the diver's look direction, so the
+  // beam always points where they're looking, whatever the hand pose does.
+  if (player.torch) {
+    player.pivot.getWorldQuaternion(_q1);
+    player.torch.parent.getWorldQuaternion(_q2);
+    player.torch.quaternion.copy(_q2.invert().multiply(_q1));
+  }
 }
 
 export function removePlayer(id) {
@@ -966,7 +1112,7 @@ export function renderLoop(onFrame) {
     animateFlashlight();
     updateFlicker(delta);
 
-    for (const player of players.values()) player.mixer?.update(delta);
+    for (const player of players.values()) updateDiverRig(player, delta);
 
     if (onFrame) onFrame(delta);
 
