@@ -126,6 +126,55 @@ button:active {
   pointer-events: none;
 }
 
+/* --- Dive HUD --- */
+#hud {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  font-family: monospace;
+  color: rgba(210, 235, 250, 0.85);
+}
+
+#compass {
+  position: absolute;
+  top: 0.75rem;
+  left: 50%;
+  transform: translateX(-50%);
+  opacity: 0.85;
+}
+
+#depth {
+  position: absolute;
+  bottom: 1.25rem;
+  left: 1.5rem;
+  font-size: 1.4rem;
+  letter-spacing: 0.1em;
+  text-shadow: 0 0 8px rgba(0, 20, 40, 0.9);
+}
+
+#voice-indicator {
+  position: absolute;
+  bottom: 1.35rem;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.75rem;
+  letter-spacing: 0.08em;
+  opacity: 0.75;
+}
+
+#scatter-btn {
+  position: absolute;
+  bottom: 1.25rem;
+  right: 1.5rem;
+  width: auto;
+  margin: 0;
+  padding: 0.6rem 1.1rem;
+  font-family: monospace;
+  font-size: 0.85rem;
+  pointer-events: auto;
+  background: rgba(0, 40, 60, 0.7);
+}
+
 .hidden {
   display: none !important;
 }

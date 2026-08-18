@@ -12,7 +12,12 @@ const BUFFER_TTL_MS = 1000;
 
 export class SnapshotBuffer {
   constructor() {
-    this.snapshots = []; // [{ t, x, y, z, yaw }]
+    this.snapshots = []; // [{ t, x, y, z, yaw, pitch }]
+  }
+
+  // Call on teleports: forget history so we don't interpolate across the map.
+  reset() {
+    this.snapshots.length = 0;
   }
 
   push(state) {
@@ -45,6 +50,7 @@ export class SnapshotBuffer {
           y: lerp(a.y, b.y, alpha),
           z: lerp(a.z, b.z, alpha),
           yaw: lerpAngle(a.yaw ?? 0, b.yaw ?? 0, alpha),
+          pitch: lerp(a.pitch ?? 0, b.pitch ?? 0, alpha),
         };
       }
     }
@@ -61,6 +67,7 @@ export class SnapshotBuffer {
         y: last.y + (last.y - prev.y) * alpha,
         z: last.z + (last.z - prev.z) * alpha,
         yaw: last.yaw ?? 0,
+        pitch: last.pitch ?? 0,
       };
     }
     return last;
