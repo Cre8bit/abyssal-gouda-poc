@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Abyssal — Underwater Multiplayer Prototype</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <!-- Three.js canvas container -->
+    <div id="scene-container"></div>
+
+    <!-- UI overlay -->
+    <div id="ui-overlay">
+      <div id="menu" class="panel">
+        <h1>Abyssal</h1>
+        <p class="subtitle">Underwater P2P prototype</p>
+        <button id="host-btn">Host Game</button>
+        <button id="join-btn">Join Game</button>
+      </div>
+
+      <div id="status" class="panel hidden">
+        <p id="status-text"></p>
+        <p id="peer-id" class="peer-id hidden"></p>
+      </div>
+    </div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
