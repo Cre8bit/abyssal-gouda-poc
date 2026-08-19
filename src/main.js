@@ -9,6 +9,7 @@ import {
   toggleFlashlight,
   setPlayerLight,
   loadWorld,
+  rebuildWorld,
 } from "./graphics.js";
 import {
   resolveCollision,
@@ -53,7 +54,7 @@ const WATER_INERTIA = 4; // how quickly velocity reaches its target
 const NETWORK_RATE = 1 / 30; // send state 30x per second
 const ABYSS_DEPTH = 612; // flavor: depth readout at y = 0
 const PLAYER_RADIUS = 0.6; // collision clearance against the cheese
-const WORLD_LIMIT = WORLD_R + 70; // soft leash: don't drift into the void
+const WORLD_LIMIT = WORLD_R + 25; // soft leash, just inside the boundary veil
 
 const SCATTER_MIN = 20; // min/max distance between the two divers
 const SCATTER_MAX = 34;
@@ -91,23 +92,40 @@ initInput();
 initMouseLook(canvas);
 
 // --- World generation, with a loading screen ---
+// Every game gets its own seed: from the URL if present (invite links carry
+// it), otherwise random. The host's seed wins — joiners rebuild on mismatch.
+const bootParams = new URLSearchParams(location.search);
+let seed = Number.parseInt(bootParams.get("seed") ?? "", 10);
+if (!Number.isFinite(seed)) seed = (Math.random() * 2 ** 31) | 0;
+let difficulty = Math.min(
+  3,
+  Math.max(1, Number.parseInt(bootParams.get("d") ?? "1", 10) || 1),
+);
+
 const loaderEl = document.getElementById("loader");
 const loaderFill = document.getElementById("loader-fill");
 const loaderLabel = document.getElementById("loader-label");
 
-loadWorld((done, total, label) => {
-  loaderFill.style.width = `${Math.round((done / total) * 100)}%`;
-  loaderLabel.textContent = `carving ${label} · ${done}/${total}`;
-}).then(() => {
-  // Spawn in open water at the labyrinth's edge, facing the maze (-Z).
+async function buildWorld(rebuild = false) {
+  worldReady = false;
+  loaderEl.classList.remove("done");
+  const progress = (done, total, label) => {
+    loaderFill.style.width = `${Math.round((done / total) * 100)}%`;
+    loaderLabel.textContent = `seed ${seed} · carving ${label} · ${done}/${total}`;
+  };
+  const build = rebuild ? rebuildWorld : loadWorld;
+  await build(progress, { seed, difficulty });
+  // Spawn at the drift's edge, the whole glowing system in view (-Z).
   const spawn = getSpawnPoint();
   localPosition.x = spawn.x;
   localPosition.y = spawn.y;
   localPosition.z = spawn.z;
+  velocity.x = velocity.y = velocity.z = 0;
+  for (const buffer of remoteBuffers.values()) buffer.reset();
   worldReady = true;
   loaderEl.classList.add("done");
-  setTimeout(() => loaderEl.remove(), 700); // after the fade-out
-});
+}
+buildWorld();
 
 // --- UI handlers ---
 hostBtn.addEventListener("click", async () => {
@@ -131,7 +149,7 @@ hostBtn.addEventListener("click", async () => {
 // Includes the signaling mode so the joiner uses the SAME server as the host.
 let hostedId = null;
 function inviteUrl() {
-  return `${location.origin}${location.pathname}?join=${encodeURIComponent(hostedId)}&s=${getSignalingMode()}`;
+  return `${location.origin}${location.pathname}?join=${encodeURIComponent(hostedId)}&s=${getSignalingMode()}&seed=${seed}&d=${difficulty}`;
 }
 
 copyLinkBtn.addEventListener("click", async () => {
@@ -253,6 +271,8 @@ function teleportLocal(x, y, z) {
 onPeerConnected((peerId) => {
   addPlayer(peerId, REMOTE_COLOR);
   remoteBuffers.set(peerId, new SnapshotBuffer());
+  // The host's map is the authoritative one: tell the joiner our seed.
+  if (hostedId) sendEvent({ kind: "seed", seed, d: difficulty });
   statusPanel.classList.add("hidden");
   scatterBtn.classList.remove("hidden");
   if (hostedId) miniCopyLinkBtn.classList.remove("hidden"); // only the host has a link to share
@@ -279,6 +299,12 @@ onEventReceived((peerId, data) => {
     showEvent(
       "⨨ Scattered! Find your teammate — look for their light, listen for their voice.",
     );
+  } else if (data.kind === "seed" && data.seed !== seed) {
+    // Joined a host with a different map: adopt their seed and rebuild.
+    seed = data.seed >>> 0;
+    difficulty = data.d ?? difficulty;
+    showEvent("🧀 Different map detected — rebuilding to the host's seed…");
+    buildWorld(true);
   }
 });
 

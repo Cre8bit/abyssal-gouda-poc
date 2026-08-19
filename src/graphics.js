@@ -15,7 +15,7 @@
 //  - The world itself is the procedural gouda labyrinth (see gouda.js):
 //    marching-cubes chunks with real enterable holes and tunnel systems
 import * as THREE from "three";
-import { buildGoudaWorld, updateGouda } from "./gouda.js";
+import { buildGoudaWorld, disposeWorld, updateGouda } from "./gouda.js";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
@@ -26,7 +26,22 @@ import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
 
 const ABYSS_COLOR = 0x020806; // murky green-black
-const FOG_DENSITY = 0.05;
+
+// ONION FOG — density depends on how deep into the ball the player is.
+// At the outer edge the water is almost clear: the whole glowing cheese
+// system is visible, floating in the dark. Each layer inward the murk
+// closes in, until the heart sits in claustrophobic soup.
+// Control points: [radial distance from map center, fog density].
+const FOG_BANDS = [
+  [0, 0.05], // the heart: ~60 m visibility
+  [46, 0.046],
+  [95, 0.034], // the hollows
+  [150, 0.022], // the bulwark approach
+  [195, 0.012], // the scree
+  [215, 0.006], // the drift: ~500 m — see the whole ball
+  [600, 0.005],
+];
+const FOG_DENSITY = FOG_BANDS[FOG_BANDS.length - 1][1]; // initial (spawn is outside)
 
 const SNOW_COUNT = 1500;
 const SNOW_RADIUS = 30;
@@ -88,7 +103,7 @@ export function initGraphics(container) {
     72,
     window.innerWidth / window.innerHeight,
     0.1,
-    150,
+    560, // far enough to take in the whole ball from the drift
   );
   camera.rotation.order = "YXZ";
   camera.position.set(0, 2, 8);
@@ -114,8 +129,10 @@ export function initGraphics(container) {
   setupPostProcessing();
 
   // Natural deep-water base light: faint sickly green murk, near-black below.
-  scene.add(new THREE.HemisphereLight(0x11322a, 0x010503, 0.16));
-  const gloom = new THREE.DirectionalLight(0x11402f, 0.08);
+  // Slightly stronger than realistic so the ball's silhouette reads from the
+  // drift; the per-zone bioluminescent veins do the rest of the storytelling.
+  scene.add(new THREE.HemisphereLight(0x14382e, 0x020604, 0.22));
+  const gloom = new THREE.DirectionalLight(0x11402f, 0.1);
   gloom.position.set(2, 40, 1);
   scene.add(gloom);
 
@@ -131,9 +148,40 @@ export function initGraphics(container) {
 
 // Generates the gouda labyrinth asynchronously (chunk by chunk) so the
 // loading screen can track progress. Call after initGraphics, await before
-// spawning the player.
-export function loadWorld(onProgress) {
-  return buildGoudaWorld(scene, onProgress);
+// spawning the player. opts: { seed, difficulty }.
+export function loadWorld(onProgress, opts) {
+  return buildGoudaWorld(scene, onProgress, opts);
+}
+
+// Tears down the current world and builds a new one (e.g. adopting the
+// host's seed after joining).
+export function rebuildWorld(onProgress, opts) {
+  disposeWorld(scene);
+  return buildGoudaWorld(scene, onProgress, opts);
+}
+
+// Smoothly retunes the fog to the player's current layer. Returns current
+// visibility (used for fog-aware culling).
+function fogDensityFor(radius) {
+  const bands = FOG_BANDS;
+  if (radius <= bands[0][0]) return bands[0][1];
+  for (let i = 1; i < bands.length; i++) {
+    if (radius < bands[i][0]) {
+      const [r0, d0] = bands[i - 1];
+      const [r1, d1] = bands[i];
+      const t = (radius - r0) / (r1 - r0);
+      return d0 + (d1 - d0) * t;
+    }
+  }
+  return bands[bands.length - 1][1];
+}
+
+function updateAtmosphere(delta) {
+  const radius = camera.position.length();
+  const target = fogDensityFor(radius);
+  const k = Math.min(1, delta * 0.7); // slow, diver-paced transition
+  scene.fog.density += (target - scene.fog.density) * k;
+  return 3 / scene.fog.density; // ~visibility in world units
 }
 
 function setupPostProcessing() {
@@ -1068,10 +1116,11 @@ export function renderLoop(onFrame) {
 
     if (onFrame) onFrame(delta);
 
-    // After game logic moved players/camera: bioluminescent pulse + distance
-    // culling, rig animation (torch follows the moved wrist), then feed the
-    // beam poses to the snow shader.
-    updateGouda(elapsed, camera.position);
+    // After game logic moved players/camera: layer fog, bioluminescent pulse,
+    // fog-aware culling, rig animation (torch follows the moved wrist), then
+    // feed the beam poses to the snow shader.
+    const visibility = updateAtmosphere(delta);
+    updateGouda(elapsed, camera.position, visibility);
     for (const player of players.values()) updateDiverRig(player, delta);
     updateSnowLightUniforms();
     composer.render();

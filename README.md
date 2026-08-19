@@ -4,13 +4,23 @@ Minimal 3D underwater multiplayer prototype. 100% static frontend, hosted on Git
 
 ## The Gouda Labyrinth (Phase 1)
 
-The map is a ball of concentric zones, outside → in: **the drift** (lone pale
-chunks, first silhouettes), **the scree** (dense belt of small swiss-cheese
-pebbles), **the bulwark** (a near-sealed shell of giant fused wheels — ~93% of
-straight paths are blocked, so you must pass THROUGH their guaranteed radial
-through-tunnels), **the hollows** (cavernous mid wheels), and **the heart**
-(colossal central wheel whose core cavern holds the gouda gold). The compass
-carries a gold marker and distance readout pointing at the prize.
+An onion/ball map of concentric biomes, outside → in: **the drift** (sparse
+pale cut blocks — from spawn the water is nearly clear and the whole glowing
+system is visible), **the scree** (dense belt of small slabs and wedges with
+clean round holes), **the bulwark** (a ~87%-sealed shell of giant fused hunks;
+each has guaranteed radial through-tunnels — the way down is through the
+cheese), **the hollows** (cavernous flattened wheels, red pulse), and **the
+heart** (colossal hunk, gold core in its grand cavern). Fog thickens layer by
+layer as you descend; each biome has its own bioluminescent vein colour.
+
+Interiors are mazes: winding tunnels, chamber rooms, loops for multiple
+routes, and dead-end chambers sealed by deliberately thin walls, marked with
+a pulsing crack-glow (`getBlastPoints()`) for the future explosives/digging
+feature. Maps are seeded per game — the host's seed rides the invite link and
+the P2P handshake (joiners rebuild automatically), and `?seed=N&d=1..3` in
+the URL reproduces any map at any difficulty (narrower tunnels, thicker
+bulwark, more dead ends). The compass carries a gold marker and distance
+readout pointing at the prize.
 
 The world is a procedural 3D labyrinth of massive gouda chunks (`src/gouda.js`).
 Each chunk is an analytic SDF — a noise-crusted ellipsoid minus a connected graph
