@@ -1,52 +1,69 @@
-// gouda.js — the procedural abyssal gouda labyrinth, v2.
+// gouda.js — the procedural abyssal gouda labyrinth, v3.
 //
 // SHAPE GRAMMAR — every chunk is an analytic SDF built from:
 //   · a squashed ellipsoid base ("wheel": flattened round; "hunk": rounder)
-//   · optional flat plane cuts ("block"/"wedge": cut-cheese slabs, like the
-//     concept art's angular debris) with slightly beveled edges
-//   · smooth crust noise (kept LOW so faces stay flat and holes stay round)
+//   · optional flat plane cuts ("block": cut slabs/wedges; "slab": thin
+//     plates riddled with big through-holes, like the concept art)
+//   · low crust noise (faces stay flat, holes stay round, surfaces waxy)
 //   · minus perfectly spherical eyes (caverns/chambers) and pores
-//   · minus winding tunnel capsules (bent polylines, not straight rods)
+//   · minus winding tunnel capsules (bent polylines)
+//   · minus PLAYER DIGS (runtime sphere carves — see digAt)
 //
-// CAVE SYSTEMS — eyes are linked by a spanning tree plus extra loops
-// (multiple routes), exit tunnels are punched to the surface, bulwark wheels
-// get guaranteed radial THROUGH-routes, and dead-end branches end in sealed
-// chambers separated from a neighbouring cavity by a deliberately thin wall:
-// marked blast walls, for the future explosives/digging feature
-// (getBlastPoints()).
+// DIGGING — after generation each chunk keeps its voxel field cached. A dig
+// edits only the voxels around the carve sphere and re-runs marching cubes
+// on that single chunk. Collision stays exact because the same dig list is
+// part of the chunk's SDF. The world is fully destructible.
 //
-// ONION MAP — concentric zones, outside → in, each its own biome:
-//   the drift    (~195–225)  sparse pale cut blocks, first silhouettes
-//   the scree    (~150–190)  dense belt of small slabs & wedges to weave through
-//   the bulwark  (~120)      near-sealed shell of giant fused wheels — pass
-//                            THROUGH their tunnel complexes
-//   the hollows  (~60–88)    cavernous wheels, red ominous glow
-//   the heart    (0)         colossal hunk, gold core in its central cavern
+// ONION MAP (~R 330) — nine biomes, outside → in. A run to the gold should
+// take 10–20 minutes through two sealed walls and three maze biomes:
+//   the drift     (285–330)  sparse pale blocks, first silhouettes
+//   the reef      (240–290)  fields of thin slabs with big through-holes —
+//                            weave between and through the plates
+//   the scree     (205–245)  dense belt of small cut blocks
+//   the warrens   (175–205)  speleology: long tangled narrow tunnels
+//   the crust     (~150)     SEALED WALL #1 — many giant fused hunks,
+//                            passable only through their tunnel complexes
+//   the galleries (95–130)   cathedral wheels: huge chambers, wide tunnels
+//   the bulwark   (~78)      SEALED WALL #2 — tighter, meaner
+//   the hollows   (38–58)    cramped approach wheels
+//   the heart     (0)        colossal hunk, gold core in its grand cavern
 //
-// The same SDF is meshed once (marching cubes) and sampled at runtime for
-// swim collision. Generation is seeded per game (host shares the seed), so
-// every peer builds the identical maze — and every game is a new one.
+// Dead-end chambers sealed by deliberately thin walls are marked with a
+// crack-glow (getBlastPoints()) — dig or (future) blast through them.
+// Generation is seeded per game; the host's seed rides the invite link and
+// the handshake, so peers share the exact same maze.
 
 import * as THREE from "three";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { MarchingCubes } from "three/examples/jsm/objects/MarchingCubes.js";
 
-export const WORLD_R = 225; // outer edge of the drift (world units)
-export const BOUNDARY_R = 255; // visible map boundary sphere
-export const HEART_POS = { x: 0, y: 0, z: 0 }; // the gouda gold
+export const WORLD_R = 420; // outer edge of the drift
+export const BOUNDARY_R = 470; // visible map boundary veil
+export const HEART_POS = { x: 0, y: 0, z: 0 }; // map center — a DECOY.
+// The gold hides in a random cavern inside one of the mid-radius wheels
+// (see GOLD_BAND) and is NOT shown on the compass. Search, listen, dig.
+const GOLD_BAND = [60, 175];
 
-const HEART_S = 62;
+const HEART_S = 56;
 const HEART_RES = 96;
-const BULWARK_R = 120; // the crust wall: dense shell, sealed except tunnels
-const BULWARK_N = 40; // many parts, spaced ⇒ crusts fuse into one wall
-const HOLLOW_COUNT = 12;
-const WARREN_COUNT = 6; // speleology chunks: long tangled narrow tunnels
-const SCREE_COUNT = 24;
-const DRIFT_COUNT = 8;
-const DEBRIS_COUNT = 300;
 
-const RES_BIG = 72;
-const RES_BULWARK = 64;
+const CRUST_R = 155; // sealed wall #1
+const CRUST_N = 48;
+const BULWARK_R = 80; // sealed wall #2
+const BULWARK_N = 18;
+
+const REEF_COUNT = 18;
+const CHIMNEY_COUNT = 14;
+const SCREE_COUNT = 44;
+const WARREN_COUNT = 10;
+const GALLERY_COUNT = 12;
+const HOLLOW_COUNT = 8;
+const DRIFT_COUNT = 12;
+const DEBRIS_COUNT = 460;
+
+const RES_HEART = HEART_RES;
+const RES_WARREN = 64;
+const RES_WALL = 48;
 const RES_MED = 48;
 const RES_SMALL = 32;
 const MAX_POLYS = {
@@ -60,32 +77,33 @@ const MAX_POLYS = {
 
 // Local-space (unit-sphere) shape parameters. Surface ~ |p| = R0, grid [-1,1].
 const R0 = 0.6;
-const NOISE_FREQ = 1.6; // low frequency: waxy undulation, not rocky grit
+const NOISE_FREQ = 1.6;
 const SHELL = 0.22;
 const CARVE_SKIP = 0.3;
-const SMOOTH_K = 0.05; // rounder, softer hole rims
-const PLANE_K = 0.025; // slight bevel on cut faces
+const SMOOTH_K = 0.05;
+const PLANE_K = 0.025;
 
 const noise = new ImprovedNoise();
 
-// --- Generation parameters (set per game) -----------------------------------
+// --- Generation parameters (set per game) --------------------------------------
 
 let worldSeed = 1337;
-let difficulty = 1; // 1..3: narrower tunnels, thicker bulwark, more dead ends
+let difficulty = 1;
 
-const chunks = [];
-const debris = [];
-const blastPoints = []; // { x, y, z } world-space thin walls (future explosives)
+const chunks = []; // each: SDF params + cached voxel field + live mesh
+const debris = []; // { center, r, mesh }
+const blastPoints = [];
 let worldGroup = null;
-let extrasGroup = null; // gold core, boundary, markers, center glow
+let extrasGroup = null;
 let goldCore = null;
+let goldPos = null; // world position of the hidden gold
 let markerMaterial = null;
 let spawnPoint = null;
 let lastCull = -1;
 
 const uGoudaTime = { value: 0 };
 
-// --- Seeded RNG (mulberry32) -------------------------------------------------
+// --- Seeded RNG ------------------------------------------------------------------
 
 function mulberry32(seed) {
   let a = seed >>> 0;
@@ -113,7 +131,7 @@ function randDir(rng, out) {
   return out;
 }
 
-// --- SDF primitives ----------------------------------------------------------
+// --- SDF primitives -----------------------------------------------------------------
 
 function fbm3(x, y, z) {
   return (
@@ -122,14 +140,12 @@ function fbm3(x, y, z) {
   );
 }
 
-// Smooth max(a, -b): subtraction with a rounded seam of width k.
 function smoothCut(d, cut, k) {
   const b = -cut;
   const h = Math.max(k - Math.abs(d - b), 0) / k;
   return Math.max(d, b) + h * h * k * 0.25;
 }
 
-// Smooth max(a, b): intersection with a small bevel (for plane cuts).
 function smoothMax(a, b, k) {
   const h = Math.max(k - Math.abs(a - b), 0) / k;
   return Math.max(a, b) + h * h * k * 0.25;
@@ -152,18 +168,17 @@ function segDist(px, py, pz, ax, ay, az, bx, by, bz) {
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-// The chunk SDF in LOCAL grid space [-1,1]. Used verbatim for both meshing
-// and collision — keep them in lockstep.
-function chunkSdf(c, x, y, z) {
-  // Squashed base form.
+// The UNCARVED chunk body: ellipsoid + crust noise + plane cuts. Besides
+// meshing/collision, this is what tells rind from paste: a surface vertex
+// whose base distance is near zero sits on the outer waxed rind; one that is
+// DEEP INSIDE the base body (a hole, tunnel, cut face or dig) shows the
+// bright interior paste — the cheese signature.
+function baseSdf(c, x, y, z) {
   const ex = x * c.ix,
     ey = y * c.iy,
     ez = z * c.iz;
   let d = (Math.sqrt(ex * ex + ey * ey + ez * ez) - R0) * c.minAxis;
 
-  // Crust noise, faded away from the base surface. Applied BEFORE the plane
-  // cuts so the cut faces stay flat (fresh-cut cheese), and kept low so the
-  // round sides read waxy, not rocky.
   const ad = Math.abs(d);
   if (ad < SHELL) {
     let fade = 1 - ad / SHELL;
@@ -178,16 +193,21 @@ function chunkSdf(c, x, y, z) {
       fade;
   }
 
-  // Flat cuts: slabs and wedges (blocks only; wheels have none).
   const planes = c.planes;
   for (let i = 0; i < planes.length; i++) {
     const pl = planes[i];
     d = smoothMax(d, x * pl.nx + y * pl.ny + z * pl.nz - pl.off, PLANE_K);
   }
+  return d;
+}
 
-  if (d > CARVE_SKIP) return d; // far outside: nothing to carve
+// The full chunk SDF in LOCAL grid space [-1,1]. Meshing, collision AND
+// digging all run through this — keep them in lockstep.
+function chunkSdf(c, x, y, z) {
+  let d = baseSdf(c, x, y, z);
 
-  // Eyes, chambers and pores — perfect spheres, soft rims.
+  if (d > CARVE_SKIP) return d;
+
   const holes = c.holes;
   for (let i = 0; i < holes.length; i++) {
     const h = holes[i];
@@ -195,12 +215,9 @@ function chunkSdf(c, x, y, z) {
       dy = y - h.y,
       dz = z - h.z;
     d = smoothCut(d, Math.sqrt(dx * dx + dy * dy + dz * dz) - h.r, SMOOTH_K);
-    // Deep inside a cavern the exact value no longer matters for the mesh
-    // (no surface crossing) — bail out early, this is the hot loop.
-    if (d > 0.45) return d;
+    if (d > 0.45) return d; // deep in a cavern: no surface near, bail out
   }
 
-  // Winding tunnels.
   const tunnels = c.tunnels;
   for (let i = 0; i < tunnels.length; i++) {
     const t = tunnels[i];
@@ -212,16 +229,26 @@ function chunkSdf(c, x, y, z) {
     if (d > 0.45) return d;
   }
 
+  // Player digs (runtime carves) — kept in the SDF so collision matches the
+  // re-meshed geometry exactly.
+  const digs = c.digs;
+  for (let i = 0; i < digs.length; i++) {
+    const g = digs[i];
+    const dx = x - g.x,
+      dy = y - g.y,
+      dz = z - g.z;
+    d = smoothCut(d, Math.sqrt(dx * dx + dy * dy + dz * dz) - g.r, SMOOTH_K);
+  }
+
   return d;
 }
 
-// --- Chunk data generation -----------------------------------------------------
+// --- Chunk data generation -------------------------------------------------------------
 
 const _dir = new THREE.Vector3();
 const _dir2 = new THREE.Vector3();
 
-// A tunnel from a to b as a bent polyline. bends=0: straight bore;
-// bends=1: winding maze tunnel; bends=2+: long snaking speleology passage.
+// Bent polyline tunnel. bends=0 straight, 1 winding, 2+ snaking (speleology).
 function addTunnel(c, rng, a, b, r, bends) {
   if (!bends) {
     c.tunnels.push({ ax: a.x, ay: a.y, az: a.z, bx: b.x, by: b.y, bz: b.z, r });
@@ -253,29 +280,28 @@ function addTunnel(c, rng, a, b, r, bends) {
   }
 }
 
-// opts:
-//  kind: "wheel" | "hunk" | "block"
-//  eyesMin/eyesMax, eyeRBase/eyeRVar, exits, coreEye
-//  deadEnds: sealed chambers with thin marked walls
-//  axis: radial through-route (bulwark)
+// opts: kind ("wheel"|"hunk"|"block"|"slab"), eyesMin/Max, eyeRBase/Var,
+// exits, coreEye, deadEnds, axis (radial through-route), narrow, tangle,
+// pores [min,max], poreR [base,var], tunnelR [base,var]
 function makeChunkData(rng, center, s, res, opts) {
   const cell = 2 / res;
-  // narrow (warrens): allow tunnels near the grid limit — occasional pinch
-  // points and squeezes are the point (speleology).
   const minTunnelR = (opts.narrow ? 2.2 : 2.6) * cell;
   const tunnelScale = [1.15, 1.0, 0.85][difficulty - 1] ?? 1.0;
   const tr = (base) => Math.max(minTunnelR, base * tunnelScale);
-  // Straight bores for blocks, winding for wheels/hunks, long snaking
-  // passages for the warrens.
-  const bends = opts.narrow ? 2 : opts.kind !== "block" ? 1 : 0;
+  const bends =
+    opts.narrow ? 2 : opts.kind === "block" || opts.kind === "slab" ? 0 : 1;
+  const [trBase, trVar] = opts.tunnelR ?? [0.055, 0.04];
 
-  // Base proportions: wheels are flattened rounds; hunks stay chunky;
-  // blocks start chunky and get their identity from the plane cuts.
   let sx, sy, sz;
   if (opts.kind === "wheel") {
     sx = 0.95 + rng() * 0.2;
     sy = 0.5 + rng() * 0.2;
     sz = 0.95 + rng() * 0.2;
+  } else if (opts.kind === "column") {
+    // Tall chimney: narrow footprint, full grid height.
+    sx = 0.38 + rng() * 0.14;
+    sy = 1.1 + rng() * 0.15;
+    sz = 0.38 + rng() * 0.14;
   } else {
     sx = 0.85 + rng() * 0.35;
     sy = 0.85 + rng() * 0.35;
@@ -285,24 +311,30 @@ function makeChunkData(rng, center, s, res, opts) {
   const c = {
     center,
     s,
+    res,
     ix: 1 / sx,
     iy: 1 / sy,
     iz: 1 / sz,
     minAxis: Math.min(sx, sy, sz),
     nOff: rng() * 100,
-    amp: opts.kind === "block" ? 0.05 : 0.1, // blocks: crisp; wheels: waxy
+    // LOW noise: waxy smooth wheels, crisp flat cuts, round readable holes.
+    amp: opts.kind === "block" || opts.kind === "slab" ? 0.04 : 0.08,
     planes: [],
     holes: [],
     tunnels: [],
+    digs: [],
+    field: null, // cached voxel field (filled at meshing, edited by digs)
+    mesh: null,
   };
 
-  // Plane cuts for blocks: a parallel pair (slab thickness) + angled cuts.
-  if (opts.kind === "block") {
+  // Plane cuts.
+  if (opts.kind === "block" || opts.kind === "slab") {
     randDir(rng, _dir);
-    const half = 0.22 + rng() * 0.14; // slab half-thickness
+    const half =
+      opts.kind === "slab" ? 0.13 + rng() * 0.07 : 0.22 + rng() * 0.14;
     c.planes.push({ nx: _dir.x, ny: _dir.y, nz: _dir.z, off: half });
     c.planes.push({ nx: -_dir.x, ny: -_dir.y, nz: -_dir.z, off: half });
-    const nCuts = 1 + Math.floor(rng() * 3);
+    const nCuts = opts.kind === "slab" ? 1 : 1 + Math.floor(rng() * 3);
     for (let i = 0; i < nCuts; i++) {
       randDir(rng, _dir);
       c.planes.push({
@@ -316,14 +348,12 @@ function makeChunkData(rng, center, s, res, opts) {
 
   const eyes = [];
 
-  // The heart's guaranteed grand cavern — where the gold lives.
   if (opts.coreEye) {
     const core = { x: 0, y: 0, z: 0, r: opts.coreEye };
     eyes.push(core);
     c.holes.push(core);
   }
 
-  // Interior eyes: caverns and chambers.
   const nEyes =
     opts.eyesMin + Math.floor(rng() * (opts.eyesMax - opts.eyesMin + 1));
   for (let i = 0; i < nEyes; i++) {
@@ -339,22 +369,23 @@ function makeChunkData(rng, center, s, res, opts) {
     c.holes.push(eye);
   }
 
-  // Round surface pores — the gouda skin. Placed through the crust so many
-  // read as clean circular holes; on thin slabs they punch right through.
-  const nPores = 10 + Math.floor(rng() * 9);
+  // Round pores. Slabs get many BIG ones — clean through-holes in the plate.
+  const [pMin, pMax] = opts.pores ?? [10, 18];
+  const [prBase, prVar] = opts.poreR ?? [0.055, 0.075];
+  const nPores = pMin + Math.floor(rng() * (pMax - pMin + 1));
   for (let i = 0; i < nPores; i++) {
     randDir(rng, _dir);
-    const t = R0 * (0.85 + 0.3 * rng());
+    const t = R0 * (opts.kind === "slab" ? 0.5 + 0.6 * rng() : 0.85 + 0.3 * rng());
     c.holes.push({
       x: _dir.x * t * sx,
       y: _dir.y * t * sy,
       z: _dir.z * t * sz,
-      r: Math.max(3.2 * cell * 0.5, 0.055 + 0.075 * rng()),
+      r: Math.max(1.6 * cell, prBase + prVar * rng()),
     });
   }
 
-  // Spanning tree: every eye reachable from eye 0. Occasionally attach to
-  // the SECOND-nearest instead — longer, more winding routes.
+  // Spanning tree (+tangle: attach to a random earlier chamber — long
+  // intertwined passages, easy to descend, hard to retrace).
   for (let i = 1; i < eyes.length; i++) {
     let best = 0,
       second = 0,
@@ -375,9 +406,6 @@ function makeChunkData(rng, center, s, res, opts) {
         second = j;
       }
     }
-    // tangle (warrens): often attach to a RANDOM earlier chamber instead of
-    // the nearest — long intertwined passages that cross each other, easy to
-    // descend into, hard to retrace.
     const j = opts.tangle
       ? i > 1 && rng() < 0.5
         ? Math.floor(rng() * i)
@@ -385,32 +413,17 @@ function makeChunkData(rng, center, s, res, opts) {
       : i > 2 && rng() < 0.3
         ? second
         : best;
-    addTunnel(
-      c,
-      rng,
-      eyes[i],
-      eyes[j],
-      tr(opts.narrow ? 0.038 + 0.022 * rng() : 0.055 + 0.04 * rng()),
-      bends,
-    );
+    addTunnel(c, rng, eyes[i], eyes[j], tr(trBase + trVar * rng()), bends);
   }
-  // Extra loops: multiple paths through the maze.
   const loops = 2 + Math.floor(eyes.length / 6);
   for (let i = 0; i < loops; i++) {
     const a = eyes[Math.floor(rng() * eyes.length)];
     const b = eyes[Math.floor(rng() * eyes.length)];
     if (a === b) continue;
-    addTunnel(
-      c,
-      rng,
-      a,
-      b,
-      tr(opts.narrow ? 0.035 + 0.02 * rng() : 0.05 + 0.035 * rng()),
-      bends,
-    );
+    addTunnel(c, rng, a, b, tr(trBase * 0.9 + trVar * rng()), bends);
   }
 
-  // Exit tunnels from the outermost eyes to open water.
+  // Exits to open water.
   const sorted = [...eyes].sort(
     (a, b) =>
       b.x * b.x + b.y * b.y + b.z * b.z - (a.x * a.x + a.y * a.y + a.z * a.z),
@@ -426,11 +439,11 @@ function makeChunkData(rng, center, s, res, opts) {
       e,
       { x: e.x * out, y: e.y * out, z: e.z * out },
       tr(0.07 + 0.03 * rng()),
-      false, // exits bore straight so the mouth is easy to read
+      0,
     );
   }
 
-  // Radial through-route (bulwark): guaranteed wide exits on BOTH faces.
+  // Radial through-route for wall chunks.
   if (opts.axis) {
     const a = opts.axis;
     for (const sign of [1, -1]) {
@@ -453,21 +466,17 @@ function makeChunkData(rng, center, s, res, opts) {
           z: sign * a.z * (R0 + 0.28) * sz,
         },
         tr(0.09 + 0.03 * rng()),
-        false,
+        0,
       );
     }
   }
 
-  // Dead-end branches with SEALED thin walls (future explosives).
-  // A side tunnel leads to a chamber placed deliberately close to another
-  // cavern — separated by a wall just ~1–3 m thick. The wall's midpoint is
-  // recorded as a blast point and marked in-world.
+  // Dead-end chambers behind thin marked walls (dig/blast through).
   const nDead = (opts.deadEnds ?? 0) + (difficulty - 1);
   for (let k = 0; k < nDead && eyes.length >= 2; k++) {
     const start = eyes[Math.floor(rng() * eyes.length)];
     let target = eyes[Math.floor(rng() * eyes.length)];
     if (target === start) target = eyes[(eyes.indexOf(target) + 1) % eyes.length];
-    // Chamber sits off the target cavern, wall thickness ~0.05 local.
     randDir(rng, _dir);
     const chR = 0.06 + 0.05 * rng();
     const wall = 0.045 + 0.02 * rng();
@@ -477,29 +486,31 @@ function makeChunkData(rng, center, s, res, opts) {
       z: target.z + _dir.z * (target.r + chR + wall),
       r: chR,
     };
-    // Keep the chamber inside the crust.
     const el = Math.sqrt(
       (ch.x / sx) ** 2 + (ch.y / sy) ** 2 + (ch.z / sz) ** 2,
     );
     if (el > R0 - chR * 0.8) continue;
     c.holes.push(ch);
     addTunnel(c, rng, start, ch, tr(0.045 + 0.03 * rng()), bends);
-    // Blast point: middle of the thin wall, in world space.
-    const bx = target.x + _dir.x * (target.r + wall / 2);
-    const by = target.y + _dir.y * (target.r + wall / 2);
-    const bz = target.z + _dir.z * (target.r + wall / 2);
     blastPoints.push({
-      x: center.x + bx * s,
-      y: center.y + by * s,
-      z: center.z + bz * s,
+      x: center.x + (target.x + _dir.x * (target.r + wall / 2)) * s,
+      y: center.y + (target.y + _dir.y * (target.r + wall / 2)) * s,
+      z: center.z + (target.z + _dir.z * (target.r + wall / 2)) * s,
     });
   }
+
+  // Remember the grandest cavern — a candidate hiding spot for the gold.
+  let biggest = eyes[0] ?? null;
+  for (const e of eyes) if (e.r > (biggest?.r ?? 0)) biggest = e;
+  c.biggestEye = biggest;
 
   return c;
 }
 
-// --- Meshing --------------------------------------------------------------------
+// --- Meshing -------------------------------------------------------------------------
 
+// The scratch marching-cubes instances stay alive for the whole session:
+// digging re-uses them to re-mesh single chunks on the fly.
 const mcCache = new Map();
 
 function getMC(res) {
@@ -515,6 +526,45 @@ function getMC(res) {
     mcCache.set(res, mc);
   }
   return mc;
+}
+
+// Turns the MC's current triangulation into a compact static geometry with
+// sanitized normals (zero-length normals ⇒ NaN in GLSL ⇒ black bloom smears)
+// and a per-vertex RIND factor: 1 on the outer waxed crust, 0 on any carved
+// surface (holes, tunnels, cut faces, digs) — which the material renders as
+// bright interior paste. This contrast is what makes it read as CHEESE.
+function extractGeometry(mc, c) {
+  const count = mc.count;
+  const positions = mc.geometry.attributes.position.array.slice(0, count * 3);
+  const normals = mc.geometry.attributes.normal.array.slice(0, count * 3);
+  const crust = new Float32Array(count);
+  for (let i = 0; i < count; i++) {
+    const i3 = i * 3;
+    const nx = normals[i3],
+      ny = normals[i3 + 1],
+      nz = normals[i3 + 2];
+    const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (len > 1e-6) {
+      normals[i3] = nx / len;
+      normals[i3 + 1] = ny / len;
+      normals[i3 + 2] = nz / len;
+    } else {
+      normals[i3] = 0;
+      normals[i3 + 1] = 1;
+      normals[i3 + 2] = 0;
+    }
+    // Rind factor from the UNCARVED body: ~0 at the outer surface ⇒ rind;
+    // clearly negative (deep inside the body) ⇒ carved-open paste.
+    const bd = baseSdf(c, positions[i3], positions[i3 + 1], positions[i3 + 2]);
+    const t = (bd + 0.055) / 0.04; // -0.055 → 0 (paste), -0.015 → 1 (rind)
+    crust[i] = Math.max(0, Math.min(1, t));
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
+  geometry.setAttribute("aCrust", new THREE.BufferAttribute(crust, 1));
+  geometry.computeBoundingSphere();
+  return geometry;
 }
 
 function meshChunk(c, res, material) {
@@ -534,58 +584,144 @@ function meshChunk(c, res, material) {
       }
     }
   }
+  // Cache the field: digs edit it incrementally instead of re-evaluating
+  // the whole analytic SDF.
+  c.field = field.slice();
 
   mc.update();
-  const count = mc.count;
-  if (count / 3 > (MAX_POLYS[res] ?? 100000)) {
+  if (mc.count / 3 > (MAX_POLYS[res] ?? 100000)) {
     console.warn("gouda: chunk exceeded poly budget, geometry truncated");
   }
 
-  const positions = mc.geometry.attributes.position.array.slice(0, count * 3);
-  const normals = mc.geometry.attributes.normal.array.slice(0, count * 3);
-
-  // Sanitize normals: zero-length ones become NaN in GLSL and smear through
-  // the bloom pass as black rectangles.
-  for (let i = 0; i < normals.length; i += 3) {
-    const nx = normals[i],
-      ny = normals[i + 1],
-      nz = normals[i + 2];
-    const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-    if (len > 1e-6) {
-      normals[i] = nx / len;
-      normals[i + 1] = ny / len;
-      normals[i + 2] = nz / len;
-    } else {
-      normals[i] = 0;
-      normals[i + 1] = 1;
-      normals[i + 2] = 0;
-    }
-  }
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
-  geometry.computeBoundingSphere();
-
-  const mesh = new THREE.Mesh(geometry, material);
+  const mesh = new THREE.Mesh(extractGeometry(mc, c), material);
   mesh.position.copy(c.center);
   mesh.scale.setScalar(c.s);
   mesh.castShadow = true;
   mesh.receiveShadow = true;
+  c.mesh = mesh;
   return mesh;
 }
 
-// --- Biome materials: waxy cheese, per-zone bioluminescence ----------------------
+// Re-runs marching cubes for one chunk from its cached (dug) field.
+function remeshChunk(c) {
+  const mc = getMC(c.res);
+  mc.reset();
+  mc.isolation = 0;
+  mc.field.set(c.field);
+  mc.update();
+  const geometry = extractGeometry(mc, c);
+  c.mesh.geometry.dispose();
+  c.mesh.geometry = geometry;
+}
 
-// One MeshStandardMaterial per zone; each gets its own vein colour/strength
-// so descending through the layers visibly changes the world's glow.
-function createGoudaMaterial({ color, rough, vein, veinStrength }) {
+// --- DIGGING ---------------------------------------------------------------------------
+
+// Carves a sphere of radius r (world units) at world point (x,y,z) out of
+// every overlapping chunk, updates their cached fields, re-meshes them, and
+// destroys small debris. Returns true if anything changed.
+export function digAt(x, y, z, r) {
+  let changed = false;
+
+  for (const c of chunks) {
+    const dx = x - c.center.x,
+      dy = y - c.center.y,
+      dz = z - c.center.z;
+    const dc = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (dc > c.s * 1.35 + r) continue;
+
+    const lx = dx / c.s,
+      ly = dy / c.s,
+      lz = dz / c.s;
+    const lr = r / c.s;
+    c.digs.push({ x: lx, y: ly, z: lz, r: lr });
+
+    // Edit only the voxels the dig can touch.
+    const res = c.res;
+    const half = res / 2;
+    const cell = 1 / half;
+    const reach = lr + SMOOTH_K + 2 * cell;
+    const min = (v) => Math.max(0, Math.floor((v - reach + 1) * half));
+    const max = (v) => Math.min(res - 1, Math.ceil((v + reach + 1) * half));
+    const field = c.field;
+    for (let zi = min(lz); zi <= max(lz); zi++) {
+      const vz = (zi - half) / half;
+      for (let yi = min(ly); yi <= max(ly); yi++) {
+        const vy = (yi - half) / half;
+        const rowBase = zi * res * res + yi * res;
+        for (let xi = min(lx); xi <= max(lx); xi++) {
+          const vx = (xi - half) / half;
+          const ddx = vx - lx,
+            ddy = vy - ly,
+            ddz = vz - lz;
+          const dd = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz) - lr;
+          const idx = rowBase + xi;
+          const d = -field[idx];
+          field[idx] = -smoothCut(d, dd, SMOOTH_K);
+        }
+      }
+    }
+
+    remeshChunk(c);
+    changed = true;
+  }
+
+  // Small crumbs shatter outright.
+  for (let i = debris.length - 1; i >= 0; i--) {
+    const b = debris[i];
+    const dx = x - b.center.x,
+      dy = y - b.center.y,
+      dz = z - b.center.z;
+    if (Math.sqrt(dx * dx + dy * dy + dz * dz) < b.r + r * 0.7) {
+      if (b.mesh) worldGroup?.remove(b.mesh);
+      debris.splice(i, 1);
+      changed = true;
+    }
+  }
+
+  return changed;
+}
+
+// Sphere-traces the world SDF along a ray. Returns the hit point (just
+// outside the surface) or null. Used to aim the dig tool.
+export function raycastSolid(origin, dir, maxDist) {
+  let t = 0;
+  let x = origin.x,
+    y = origin.y,
+    z = origin.z;
+  for (let i = 0; i < 80 && t < maxDist; i++) {
+    const d = worldDistance(x, y, z);
+    if (d < 0.4) return { x, y, z };
+    const step = Math.max(0.15, d * 0.85);
+    t += step;
+    x = origin.x + dir.x * t;
+    y = origin.y + dir.y * t;
+    z = origin.z + dir.z * t;
+  }
+  return null;
+}
+
+// --- Biome materials ---------------------------------------------------------------------
+
+function vec3str(hex) {
+  const c = new THREE.Color(hex);
+  return `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`;
+}
+
+// The cheese material. Two-tone via the aCrust vertex attribute:
+//   paste — bright pale-yellow interior, shown on every carved surface
+//           (holes, tunnels, cut faces, player digs)
+//   rind  — the zone's wax coating on the outer crust
+// Bioluminescent veins live in the PASTE (glowing from within); the rind
+// stays dead and dark. That contrast is the gouda signature.
+function createGoudaMaterial({ paste, rind, rough, vein, veinStrength }) {
   const material = new THREE.MeshStandardMaterial({
-    color,
+    color: 0xffffff, // overridden per-fragment by the paste/rind mix
     roughness: rough,
     metalness: 0.0,
   });
 
+  const pasteVec = vec3str(paste);
+  const rindVec = vec3str(rind);
   const veinVec = `vec3(${vein[0].toFixed(3)}, ${vein[1].toFixed(3)}, ${vein[2].toFixed(3)})`;
   const vs = veinStrength.toFixed(3);
 
@@ -593,19 +729,31 @@ function createGoudaMaterial({ color, rough, vein, veinStrength }) {
     shader.uniforms.uGoudaTime = uGoudaTime;
 
     shader.vertexShader =
-      "varying vec3 vGoudaWorld;\nvarying vec3 vGoudaNormal;\n" +
+      "attribute float aCrust;\nvarying float vCrust;\nvarying vec3 vGoudaWorld;\nvarying vec3 vGoudaNormal;\n" +
       shader.vertexShader.replace(
         "#include <begin_vertex>",
         `#include <begin_vertex>
+        vCrust = aCrust;
         vGoudaWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;
         vGoudaNormal = mat3(modelMatrix) * objectNormal;`,
       );
 
     shader.fragmentShader =
-      "uniform float uGoudaTime;\nvarying vec3 vGoudaWorld;\nvarying vec3 vGoudaNormal;\n" +
-      shader.fragmentShader.replace(
-        "#include <emissivemap_fragment>",
-        `#include <emissivemap_fragment>
+      "uniform float uGoudaTime;\nvarying float vCrust;\nvarying vec3 vGoudaWorld;\nvarying vec3 vGoudaNormal;\n" +
+      shader.fragmentShader
+        .replace(
+          "#include <color_fragment>",
+          `#include <color_fragment>
+        {
+          // Slight albedo mottling so big waxy surfaces aren't flat.
+          float mottle = 0.92 + 0.08 * sin(vGoudaWorld.x * 0.9 + vGoudaWorld.y * 1.3)
+                                     * sin(vGoudaWorld.z * 1.1 - vGoudaWorld.y * 0.7);
+          diffuseColor.rgb = mix(${pasteVec}, ${rindVec}, vCrust) * mottle;
+        }`,
+        )
+        .replace(
+          "#include <emissivemap_fragment>",
+          `#include <emissivemap_fragment>
         {
           vec3 gp = vGoudaWorld;
           float g1 = sin(gp.x * 0.21 + 1.3) * sin(gp.y * 0.19 + 3.1) * sin(gp.z * 0.23 + 5.2);
@@ -615,72 +763,115 @@ function createGoudaMaterial({ color, rough, vein, veinStrength }) {
           float pulse = 0.5 + 0.5 * sin(uGoudaTime * 0.55 + g2 * 6.0);
           pulse *= 0.7 + 0.3 * sin(uGoudaTime * 0.173 + gp.y * 0.05);
           vec3 gv = normalize(cameraPosition - gp);
-          // Guarded: pow(x<0) and normalize(0) are NaN ⇒ black bloom rectangles.
           vec3 gn = normalize(vGoudaNormal + vec3(1e-5));
           float rim = pow(clamp(1.0 - abs(dot(gn, gv)), 0.0, 1.0), 2.2);
-          totalEmissiveRadiance += ${veinVec} * patches * (0.25 + 0.75 * pulse) * ${vs};
-          totalEmissiveRadiance += vec3(0.95, 0.62, 0.16) * rim * (0.05 + 0.06 * pulse);
+          float inPaste = 1.0 - vCrust * 0.85; // the glow lives in the paste
+          // Faint constant self-glow so the paste reads yellow even unlit.
+          totalEmissiveRadiance += ${pasteVec} * inPaste * 0.05;
+          totalEmissiveRadiance += ${veinVec} * patches * (0.25 + 0.75 * pulse) * ${vs} * inPaste;
+          totalEmissiveRadiance += vec3(0.95, 0.62, 0.16) * rim * (0.04 + 0.05 * pulse);
         }`,
-      );
+        );
   };
 
   return material;
 }
 
 function createZoneMaterials() {
-  // All-yellow family — recognizably gouda everywhere; only the VEIN glow
-  // shifts with depth to mark the biomes.
+  // Bright pale-yellow paste everywhere (that's the cheese), while each
+  // biome wears its own WAX RIND — like a warehouse of differently-waxed
+  // gouda wheels. Veins glow through the paste only.
+  const PASTE = 0xecc76a;
   return {
-    // pale aged rind, faint warm shimmer
+    // bleached natural rind, ghost-pale
     drift: createGoudaMaterial({
-      color: 0xd6bc55,
-      rough: 0.58,
+      paste: 0xe3cc86,
+      rind: 0xb3a06a,
+      rough: 0.6,
       vein: [0.55, 0.52, 0.2],
       veinStrength: 0.4,
     }),
-    // bright young gouda, yellow-green glow
-    scree: createGoudaMaterial({
-      color: 0xdcaa2e,
+    // young yellow wax plates
+    reef: createGoudaMaterial({
+      paste: PASTE,
+      rind: 0xc79a2f,
+      rough: 0.5,
+      vein: [0.6, 0.6, 0.18],
+      veinStrength: 0.45,
+    }),
+    // tall smoked-rind chimneys
+    chimneys: createGoudaMaterial({
+      paste: 0xe0b955,
+      rind: 0x6e4f28,
       rough: 0.52,
+      vein: [0.7, 0.55, 0.15],
+      veinStrength: 0.5,
+    }),
+    // classic yellow gouda blocks
+    scree: createGoudaMaterial({
+      paste: PASTE,
+      rind: 0xbd8f2a,
+      rough: 0.5,
       vein: [0.6, 0.62, 0.12],
       veinStrength: 0.5,
     }),
-    // the warrens: sickly green-gold — something lives in these
+    // mouldy green-tinged burrow cheese
     warrens: createGoudaMaterial({
-      color: 0xd9a52c,
-      rough: 0.5,
+      paste: 0xd8c266,
+      rind: 0x77692f,
+      rough: 0.55,
       vein: [0.5, 0.72, 0.12],
       veinStrength: 0.55,
     }),
-    // amber, strong — the wall is alive
-    bulwark: createGoudaMaterial({
-      color: 0xdda434,
-      rough: 0.48,
+    // THE classic: red wax gouda wall
+    crust: createGoudaMaterial({
+      paste: PASTE,
+      rind: 0x8e3c22,
+      rough: 0.42,
       vein: [0.95, 0.62, 0.12],
       veinStrength: 0.6,
     }),
-    // deep red pulse — too close to the heart
-    hollows: createGoudaMaterial({
-      color: 0xcc9226,
-      rough: 0.45,
-      vein: [0.95, 0.28, 0.08],
+    // orange wax cathedrals
+    galleries: createGoudaMaterial({
+      paste: 0xeabf58,
+      rind: 0xa85e20,
+      rough: 0.44,
+      vein: [1.0, 0.45, 0.1],
+      veinStrength: 0.6,
+    }),
+    // dark burgundy wax — the inner wall
+    bulwark: createGoudaMaterial({
+      paste: 0xe5b64a,
+      rind: 0x5e2a1c,
+      rough: 0.42,
+      vein: [0.95, 0.35, 0.1],
       veinStrength: 0.65,
     }),
-    // gold
-    heart: createGoudaMaterial({
-      color: 0xdda838,
+    // black wax, aged — too close to the heart
+    hollows: createGoudaMaterial({
+      paste: 0xdca93e,
+      rind: 0x2c251c,
       rough: 0.4,
+      vein: [0.95, 0.22, 0.08],
+      veinStrength: 0.7,
+    }),
+    // gold wax decoy centerpiece
+    heart: createGoudaMaterial({
+      paste: 0xf0c85a,
+      rind: 0xa77b22,
+      rough: 0.38,
       vein: [1.0, 0.8, 0.22],
       veinStrength: 0.85,
     }),
   };
 }
 
-// --- Gold core, boundary sphere, blast markers ------------------------------------
+// --- Gold core, boundary, blast markers ------------------------------------------------------
 
-function createGoldCore(parent, rng) {
+function createGoldCore(parent, rng, pos, scale = 1) {
   const group = new THREE.Group();
-  group.position.set(HEART_POS.x, HEART_POS.y, HEART_POS.z);
+  group.position.set(pos.x, pos.y, pos.z);
+  group.scale.setScalar(scale);
 
   const goldMat = new THREE.MeshStandardMaterial({
     color: 0xffc23d,
@@ -710,19 +901,17 @@ function createGoldCore(parent, rng) {
     group.add(shard);
   }
 
-  // Cavern light + a huge soft "the gold is that way" glow that warms the
-  // inner layers and strengthens as you descend.
+  // Cavern light + a soft glow that leaks through nearby tunnels — the only
+  // hint of where the gold hides (it is NOT on the compass).
   const light = new THREE.PointLight(0xffb742, 900, 90, 1.8);
   group.add(light);
-  const deepGlow = new THREE.PointLight(0xff9c33, 26, 290, 1.15);
+  const deepGlow = new THREE.PointLight(0xff9c33, 24, 160, 1.3);
   group.add(deepGlow);
 
   parent.add(group);
   goldCore = { group, core, light, deepGlow, shards };
 }
 
-// A barely-there fresnel shell marking the map's edge: from inside it reads
-// as a faint curtain of deeper water — the boundary of the playable ball.
 function createBoundarySphere(parent) {
   const material = new THREE.ShaderMaterial({
     transparent: true,
@@ -766,7 +955,6 @@ function getMarkerTexture() {
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = size;
   const ctx = canvas.getContext("2d");
-  // Radial glow with crack spokes.
   const grad = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
   grad.addColorStop(0, "rgba(255,140,60,0.9)");
   grad.addColorStop(0.35, "rgba(255,100,40,0.25)");
@@ -808,16 +996,15 @@ function createBlastMarkers(parent) {
   }
 }
 
-// --- Per-frame updates -------------------------------------------------------------
+// --- Per-frame updates ------------------------------------------------------------------------
 
-// visibility: current fog visibility in world units (drives culling).
 export function updateGouda(elapsed, cameraPos = null, visibility = 90) {
   uGoudaTime.value = elapsed;
 
   if (goldCore) {
     const pulse = 0.75 + 0.25 * Math.sin(elapsed * 0.8);
     goldCore.light.intensity = 900 * pulse;
-    goldCore.deepGlow.intensity = 26 * (0.85 + 0.15 * Math.sin(elapsed * 0.31));
+    goldCore.deepGlow.intensity = 24 * (0.85 + 0.15 * Math.sin(elapsed * 0.31));
     goldCore.core.material.emissiveIntensity = 1.8 + 1.2 * pulse;
     goldCore.core.rotation.y = elapsed * 0.1;
     goldCore.core.rotation.x = elapsed * 0.04;
@@ -835,11 +1022,9 @@ export function updateGouda(elapsed, cameraPos = null, visibility = 90) {
     markerMaterial.opacity = 0.35 + 0.22 * Math.sin(elapsed * 2.6);
   }
 
-  // Fog-aware distance culling (throttled). In clear outer water you can see
-  // the whole ball; in the deep murk almost everything can be skipped.
   if (cameraPos && worldGroup && elapsed - lastCull > 0.25) {
     lastCull = elapsed;
-    const cullDist = Math.min(Math.max(visibility * 1.25, 80), 520);
+    const cullDist = Math.min(Math.max(visibility * 1.25, 80), 720);
     for (const child of worldGroup.children) {
       const reach = child.scale.x * 1.4;
       child.visible = child.position.distanceTo(cameraPos) - reach < cullDist;
@@ -847,14 +1032,14 @@ export function updateGouda(elapsed, cameraPos = null, visibility = 90) {
   }
 }
 
-// --- World assembly -------------------------------------------------------------------
+// --- World assembly -----------------------------------------------------------------------------
 
 function placeChunks(rng) {
   const specs = [
     {
       center: new THREE.Vector3(0, 0, 0),
       s: HEART_S,
-      res: HEART_RES,
+      res: RES_HEART,
       label: "the heart",
       zone: "heart",
       opts: {
@@ -864,7 +1049,7 @@ function placeChunks(rng) {
         eyeRBase: 0.1,
         eyeRVar: 0.17,
         exits: 6,
-        coreEye: 0.32,
+        coreEye: 0.34,
         deadEnds: 4,
       },
     },
@@ -893,36 +1078,59 @@ function placeChunks(rng) {
     }
   };
 
+  // A fibonacci shell of fused wall chunks with radial through-routes.
+  const shell = (zone, label, radius, n, sMin, sVar, res, opts) => {
+    const GOLDEN = 2.399963229728653;
+    for (let i = 0; i < n; i++) {
+      const y = 1 - (2 * (i + 0.5)) / n;
+      const r = Math.sqrt(Math.max(0, 1 - y * y));
+      const th = i * GOLDEN;
+      const axis = new THREE.Vector3(
+        Math.cos(th) * r + (rng() - 0.5) * 0.08,
+        y + (rng() - 0.5) * 0.08,
+        Math.sin(th) * r + (rng() - 0.5) * 0.08,
+      ).normalize();
+      const rad = radius + (rng() - 0.5) * 4;
+      const colossal = i % 13 === 0;
+      specs.push({
+        center: axis.clone().multiplyScalar(rad),
+        s: colossal ? sMin + sVar + 12 + rng() * 8 : sMin + rng() * sVar,
+        res: colossal ? 64 : res,
+        label: colossal ? `a colossal wheel` : label,
+        zone,
+        opts: { ...opts, axis: { x: axis.x, y: axis.y, z: axis.z } },
+      });
+    }
+  };
+
   const hollowOpts = {
     kind: "wheel",
-    eyesMin: 9,
-    eyesMax: 14,
-    eyeRBase: 0.11,
-    eyeRVar: 0.14,
+    eyesMin: 8,
+    eyesMax: 12,
+    eyeRBase: 0.1,
+    eyeRVar: 0.12,
     exits: 4,
     deadEnds: 1,
   };
-  // "hunk", not "wheel": flattened wheels leave lens-shaped gaps between
-  // shell neighbours and the wall stops being a wall (measured: seal drops
-  // from ~93% to ~72%). The showcase flattened wheels live in the hollows.
-  const bulwarkOpts = {
+  const galleryOpts = {
+    kind: "wheel",
+    eyesMin: 6,
+    eyesMax: 9,
+    eyeRBase: 0.16,
+    eyeRVar: 0.12,
+    exits: 4,
+    deadEnds: 2,
+    tunnelR: [0.08, 0.04], // wide cathedral corridors
+  };
+  const wallOpts = {
     kind: "hunk",
-    eyesMin: 14,
-    eyesMax: 20,
+    eyesMin: 12,
+    eyesMax: 18,
     eyeRBase: 0.1,
-    eyeRVar: 0.16,
+    eyeRVar: 0.15,
     exits: 3,
     deadEnds: 1,
   };
-  const smallOpts = {
-    kind: "block",
-    eyesMin: 2,
-    eyesMax: 4,
-    eyeRBase: 0.09,
-    eyeRVar: 0.09,
-    exits: 2,
-  };
-
   const warrenOpts = {
     kind: "hunk",
     eyesMin: 18,
@@ -933,51 +1141,70 @@ function placeChunks(rng) {
     deadEnds: 2,
     narrow: true,
     tangle: true,
+    tunnelR: [0.038, 0.022],
+  };
+  const blockOpts = {
+    kind: "block",
+    eyesMin: 2,
+    eyesMax: 4,
+    eyeRBase: 0.09,
+    eyeRVar: 0.09,
+    exits: 2,
+  };
+  const slabOpts = {
+    kind: "slab",
+    eyesMin: 2,
+    eyesMax: 4,
+    eyeRBase: 0.1,
+    eyeRVar: 0.08,
+    exits: 2,
+    pores: [14, 20],
+    poreR: [0.08, 0.09], // big clean through-holes
   };
 
-  // THE HOLLOWS: cavernous wheels — some properly big.
+  const chimneyOpts = {
+    kind: "column",
+    eyesMin: 5,
+    eyesMax: 8,
+    eyeRBase: 0.08,
+    eyeRVar: 0.08,
+    exits: 3,
+    pores: [12, 18],
+  };
+
+  // THE HOLLOWS: cramped approach wheels around the heart.
   for (let i = 0; i < HOLLOW_COUNT; i++)
-    tryBand("hollows", 60, 90, 18 + rng() * 14, RES_MED, "the hollows", hollowOpts, 0.5);
+    tryBand("hollows", 38, 60, 14 + rng() * 7, RES_MED, "the hollows", hollowOpts, 0.5);
 
-  // THE CRUST WALL: many giant hunks on a dense fibonacci shell. Spaced so
-  // neighbouring crusts fuse hard — with 40 wheels the spacing (~67) is well
-  // under the combined reach (~100): effectively no way around, only through
-  // the radial tunnel routes. Every 13th piece is EXTRA colossal.
-  const bulwarkN = BULWARK_N + (difficulty - 1) * 4;
-  const GOLDEN = 2.399963229728653;
-  for (let i = 0; i < bulwarkN; i++) {
-    const y = 1 - (2 * (i + 0.5)) / bulwarkN;
-    const r = Math.sqrt(Math.max(0, 1 - y * y));
-    const th = i * GOLDEN;
-    const axis = new THREE.Vector3(
-      Math.cos(th) * r + (rng() - 0.5) * 0.08,
-      y + (rng() - 0.5) * 0.08,
-      Math.sin(th) * r + (rng() - 0.5) * 0.08,
-    ).normalize();
-    const rad = BULWARK_R + (rng() - 0.5) * 4;
-    const colossal = i % 13 === 0;
-    specs.push({
-      center: axis.clone().multiplyScalar(rad),
-      s: colossal ? 76 + rng() * 10 : 57 + rng() * 11,
-      res: colossal ? RES_BULWARK : 56,
-      label: colossal ? "a colossal wheel" : "the crust wall",
-      zone: "bulwark",
-      opts: { ...bulwarkOpts, axis: { x: axis.x, y: axis.y, z: axis.z } },
-    });
-  }
+  // THE BULWARK: sealed wall #2 — tight shell of fused hunks.
+  shell("bulwark", "the bulwark", BULWARK_R, BULWARK_N + (difficulty - 1) * 2, 44, 10, RES_WALL, wallOpts);
 
-  // THE WARRENS: speleology chunks nestled against the crust's outer face,
-  // plugging gaps — long tangled narrow tunnels you sink into.
+  // THE GALLERIES: cathedral wheels between the walls.
+  for (let i = 0; i < GALLERY_COUNT; i++)
+    tryBand("galleries", 100, 140, 22 + rng() * 12, RES_MED, "the galleries", galleryOpts, 0.5);
+
+  // THE CRUST: sealed wall #1 — the big outer wall of many giant parts.
+  shell("crust", "the crust wall", CRUST_R, CRUST_N + (difficulty - 1) * 4, 60, 12, RES_WALL, wallOpts);
+
+  // THE WARRENS: speleology chunks against the crust's outer face.
   for (let i = 0; i < WARREN_COUNT; i++)
-    tryBand("warrens", 150, 172, 28 + rng() * 8, RES_BULWARK, "the warrens", warrenOpts, 0.55);
+    tryBand("warrens", 185, 225, 30 + rng() * 8, RES_WARREN, "the warrens", warrenOpts, 0.55);
 
-  // THE SCREE: small cut blocks littered over the crust's surface.
+  // THE SCREE: dense belt of small cut blocks.
   for (let i = 0; i < SCREE_COUNT; i++)
-    tryBand("scree", 155, 188, 10 + rng() * 6, RES_SMALL, "the scree", smallOpts, 0.65);
+    tryBand("scree", 230, 285, 10 + rng() * 8, RES_SMALL, "the scree", blockOpts, 0.65);
+
+  // THE CHIMNEYS: a forest of tall smoked columns — swim the vertical maze.
+  for (let i = 0; i < CHIMNEY_COUNT; i++)
+    tryBand("chimneys", 285, 340, 30 + rng() * 12, RES_MED, "the chimneys", chimneyOpts, 0.5);
+
+  // THE REEF: fields of thin plates with big through-holes.
+  for (let i = 0; i < REEF_COUNT; i++)
+    tryBand("reef", 335, 385, 30 + rng() * 14, RES_MED, "the reef", slabOpts, 0.55);
 
   // THE DRIFT: sparse pale blocks at the very edge.
   for (let i = 0; i < DRIFT_COUNT; i++)
-    tryBand("drift", 192, WORLD_R, 10 + rng() * 7, RES_SMALL, "the drift", smallOpts, 1.3);
+    tryBand("drift", 388, WORLD_R, 11 + rng() * 8, RES_SMALL, "the drift", blockOpts, 1.2);
 
   return specs;
 }
@@ -1001,8 +1228,6 @@ function nextTick() {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-// Builds the world asynchronously. opts: { seed, difficulty }.
-// onProgress(done, total, label).
 export async function buildGoudaWorld(scene, onProgress = () => {}, opts = {}) {
   worldSeed = (opts.seed ?? worldSeed) >>> 0;
   difficulty = Math.min(3, Math.max(1, opts.difficulty ?? difficulty));
@@ -1021,6 +1246,7 @@ export async function buildGoudaWorld(scene, onProgress = () => {}, opts = {}) {
   for (let i = 0; i < specs.length; i++) {
     const spec = specs[i];
     const chunk = makeChunkData(rng, spec.center, spec.s, spec.res, spec.opts);
+    chunk.zone = spec.zone;
     chunks.push(chunk);
     const mesh = meshChunk(chunk, spec.res, materials[spec.zone]);
     triangles += mesh.geometry.attributes.position.count / 3;
@@ -1028,11 +1254,9 @@ export async function buildGoudaWorld(scene, onProgress = () => {}, opts = {}) {
     onProgress(i + 1, total, spec.label);
     await nextTick();
   }
+  // NOTE: the MC scratch instances are deliberately KEPT — digging reuses
+  // them to re-mesh chunks at runtime.
 
-  for (const mc of mcCache.values()) mc.geometry.dispose();
-  mcCache.clear();
-
-  // Crumbs hug the wheels, littering swim lanes and tunnel mouths.
   const crumbGeos = [
     makeDebrisGeometry(rng),
     makeDebrisGeometry(rng),
@@ -1057,20 +1281,44 @@ export async function buildGoudaWorld(scene, onProgress = () => {}, opts = {}) {
       crumb.castShadow = true;
       crumb.receiveShadow = true;
       group.add(crumb);
-      debris.push({ center: p, r: s * 0.8 });
+      debris.push({ center: p, r: s * 0.8, mesh: crumb });
       break;
     }
   }
 
   scene.add(group);
-  createGoldCore(extrasGroup, rng);
+
+  // HIDE THE GOLD: a random grand cavern inside a mid-radius wheel — never
+  // at the center (the heart is a decoy), never near the borders, and never
+  // on the compass. Seeded, so every peer hides it in the same place.
+  const candidates = chunks.filter((c) => {
+    const r = c.center.length();
+    return (
+      c.biggestEye &&
+      r >= GOLD_BAND[0] &&
+      r <= GOLD_BAND[1] &&
+      c.biggestEye.r * c.s > 6
+    );
+  });
+  const host = candidates.length
+    ? candidates[Math.floor(rng() * candidates.length)]
+    : chunks[0];
+  const eye = host.biggestEye;
+  goldPos = {
+    x: host.center.x + eye.x * host.s,
+    y: host.center.y + eye.y * host.s,
+    z: host.center.z + eye.z * host.s,
+  };
+  const goldScale = Math.min(1, Math.max(0.4, (eye.r * host.s) / 16));
+
+  createGoldCore(extrasGroup, rng, goldPos, goldScale);
   createBoundarySphere(extrasGroup);
   createBlastMarkers(extrasGroup);
   scene.add(extrasGroup);
 
   // Spawn at the drift's edge with the whole glowing ball in view.
-  const p = new THREE.Vector3(0, 14, WORLD_R + 18);
-  while (worldDistance(p.x, p.y, p.z) < 6 && p.z < BOUNDARY_R - 4) p.z += 3;
+  const p = new THREE.Vector3(0, 18, WORLD_R + 14);
+  while (worldDistance(p.x, p.y, p.z) < 6 && p.z < BOUNDARY_R - 6) p.z += 3;
   spawnPoint = p;
 
   onProgress(total, total, "gold");
@@ -1082,8 +1330,6 @@ export async function buildGoudaWorld(scene, onProgress = () => {}, opts = {}) {
   return group;
 }
 
-// Tears the world down so a new seed can be built (e.g. joining a host whose
-// seed differs from ours).
 export function disposeWorld(scene) {
   for (const g of [worldGroup, extrasGroup]) {
     if (!g) continue;
@@ -1096,11 +1342,17 @@ export function disposeWorld(scene) {
   worldGroup = null;
   extrasGroup = null;
   goldCore = null;
+  goldPos = null;
   markerMaterial = null;
   chunks.length = 0;
   debris.length = 0;
   blastPoints.length = 0;
   spawnPoint = null;
+}
+
+// Where the gold actually hides (for win-condition logic — NOT for the HUD).
+export function getGoldPos() {
+  return goldPos;
 }
 
 export function getWorldSeed() {
@@ -1111,7 +1363,7 @@ export function getBlastPoints() {
   return blastPoints;
 }
 
-// --- Runtime queries: collision + open-water sampling ----------------------------
+// --- Runtime queries -----------------------------------------------------------------------
 
 export function worldDistance(x, y, z) {
   let best = 1e9;
@@ -1194,5 +1446,5 @@ export function findOpenSpot(near = null, minD = 0, maxD = 0) {
 }
 
 export function getSpawnPoint() {
-  return spawnPoint ?? { x: 0, y: 14, z: WORLD_R + 18 };
+  return spawnPoint ?? { x: 0, y: 18, z: WORLD_R + 14 };
 }

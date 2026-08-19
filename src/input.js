@@ -16,13 +16,21 @@ const KEY_MAP = {
 
 const MOUSE_SENSITIVITY = 0.0022;
 const LOOK_SMOOTHING = 14; // higher = snappier
-const PITCH_LIMIT = Math.PI / 2 - 0.08;
+const SWIM_SMOOTHING = 5; // the BODY follows the head lazily (see below)
+const PITCH_LIMIT = Math.PI / 2 - 0.09;
+const PITCH_SOFT = 0.38; // cushion zone before the pitch limit (radians)
 
 // Raw targets driven by the mouse; smoothed values exposed to the game.
 let targetYaw = 0;
 let targetPitch = 0;
 let yaw = 0;
 let pitch = 0;
+// Swim orientation: a heavier, slower "body" trailing the look direction.
+// Moving along THIS (not the raw look) means quick glances around don't
+// zigzag your trajectory — you can check over your shoulder mid-swim.
+let swimYaw = 0;
+let swimPitch = 0;
+let yawVelocity = 0; // smoothed, for camera banking into turns
 
 export function initInput() {
   window.addEventListener("keydown", (e) => {
@@ -46,8 +54,18 @@ export function initMouseLook(canvas) {
   document.addEventListener("mousemove", (e) => {
     if (document.pointerLockElement !== canvas) return;
     targetYaw -= e.movementX * MOUSE_SENSITIVITY;
+
+    // Soft pitch: sensitivity fades as you approach straight up/down, so the
+    // camera never slams into a hard stop — no more "locked rotation" feel.
+    // Moving back toward the horizon is always full speed.
+    const toward = -e.movementY * MOUSE_SENSITIVITY;
+    let cushion = 1;
+    if (toward * targetPitch > 0) {
+      const headroom = PITCH_LIMIT - Math.abs(targetPitch);
+      cushion = clamp(headroom / PITCH_SOFT, 0.15, 1);
+    }
     targetPitch = clamp(
-      targetPitch - e.movementY * MOUSE_SENSITIVITY,
+      targetPitch + toward * cushion,
       -PITCH_LIMIT,
       PITCH_LIMIT,
     );
@@ -55,11 +73,20 @@ export function initMouseLook(canvas) {
 }
 
 // Call once per frame: eases the camera toward the mouse target
-// (frame-rate independent exponential smoothing).
+// (frame-rate independent exponential smoothing), then trails the swim
+// body behind the head and measures turn rate for camera banking.
 export function updateLook(delta) {
   const k = 1 - Math.exp(-LOOK_SMOOTHING * delta);
+  const prevYaw = yaw;
   yaw += (targetYaw - yaw) * k;
   pitch += (targetPitch - pitch) * k;
+
+  const instantVel = (yaw - prevYaw) / Math.max(delta, 1e-4);
+  yawVelocity += (instantVel - yawVelocity) * Math.min(1, delta * 10);
+
+  const ks = 1 - Math.exp(-SWIM_SMOOTHING * delta);
+  swimYaw += (yaw - swimYaw) * ks;
+  swimPitch += (pitch - swimPitch) * ks;
 }
 
 export function getYaw() {
@@ -68,6 +95,20 @@ export function getYaw() {
 
 export function getPitch() {
   return pitch;
+}
+
+// The lazy body orientation — use for MOVEMENT, not for the camera.
+export function getSwimYaw() {
+  return swimYaw;
+}
+
+export function getSwimPitch() {
+  return swimPitch;
+}
+
+// Smoothed yaw turn rate (rad/s) — drives the camera's bank into turns.
+export function getYawVelocity() {
+  return yawVelocity;
 }
 
 export function isPointerLocked(canvas) {

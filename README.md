@@ -4,14 +4,22 @@ Minimal 3D underwater multiplayer prototype. 100% static frontend, hosted on Git
 
 ## The Gouda Labyrinth (Phase 1)
 
-An onion/ball map of concentric biomes, outside → in: **the drift** (sparse
-pale cut blocks — from spawn the water is nearly clear and the whole glowing
-system is visible), **the scree** (dense belt of small slabs and wedges with
-clean round holes), **the bulwark** (a ~87%-sealed shell of giant fused hunks;
-each has guaranteed radial through-tunnels — the way down is through the
-cheese), **the hollows** (cavernous flattened wheels, red pulse), and **the
-heart** (colossal hunk, gold core in its grand cavern). Fog thickens layer by
-layer as you descend; each biome has its own bioluminescent vein colour.
+An onion/ball map (R≈330) of nine concentric biomes, outside → in: **the
+drift** (sparse pale blocks; from spawn the water is nearly clear and the
+whole glowing system floats in view), **the reef** (fields of thin plates
+with big through-holes), **the scree** (dense belt of small cut blocks),
+**the warrens** (speleology: long tangled narrow tunnels), **the crust**
+(sealed wall #1 — many giant fused hunks with radial through-routes), **the
+galleries** (cathedral wheels, huge chambers), **the bulwark** (sealed wall
+#2), **the hollows** (cramped wheels), and **the heart** (gold core in its
+grand cavern). Fog thickens layer by layer; each biome has its own
+bioluminescent vein colour. A run to the gold targets 10–20 minutes.
+
+**The world is destructible**: press **E** to dig. Each chunk keeps its
+voxel field cached — a dig edits the carved voxels and re-runs marching
+cubes on that single chunk (~20 ms), collision follows exactly, and dig
+events sync to teammates over the P2P channel. Thin marked blast walls in
+dead-end chambers can be dug through today and blasted in the future.
 
 Interiors are mazes: winding tunnels, chamber rooms, loops for multiple
 routes, and dead-end chambers sealed by deliberately thin walls, marked with

@@ -15,8 +15,9 @@ import {
   resolveCollision,
   findOpenSpot,
   getSpawnPoint,
+  digAt,
+  raycastSolid,
   WORLD_R,
-  HEART_POS,
 } from "./gouda.js";
 import {
   hostGame,
@@ -38,6 +39,9 @@ import {
   getMovement,
   getYaw,
   getPitch,
+  getSwimYaw,
+  getSwimPitch,
+  getYawVelocity,
 } from "./input.js";
 import { SnapshotBuffer } from "./interpolation.js";
 import {
@@ -59,6 +63,10 @@ const WORLD_LIMIT = WORLD_R + 25; // soft leash, just inside the boundary veil
 const SCATTER_MIN = 20; // min/max distance between the two divers
 const SCATTER_MAX = 34;
 
+const DIG_RADIUS = 2.4; // carve sphere radius (world units)
+const DIG_RANGE = 7; // how far the dig tool reaches
+const DIG_COOLDOWN_MS = 400;
+
 const REMOTE_COLOR = 0x66ff99;
 
 // --- UI elements ---
@@ -73,7 +81,6 @@ const miniCopyLinkBtn = document.getElementById("mini-copy-link-btn");
 const hud = document.getElementById("hud");
 const compassCanvas = document.getElementById("compass");
 const depthText = document.getElementById("depth");
-const goldText = document.getElementById("gold-indicator");
 const voiceText = document.getElementById("voice-indicator");
 const scatterBtn = document.getElementById("scatter-btn");
 const eventCenter = document.getElementById("event-center");
@@ -83,6 +90,7 @@ const velocity = { x: 0, y: 0, z: 0 };
 let networkTimer = 0;
 let flashlightOn = true;
 let worldReady = false;
+let cameraRoll = 0; // eased bank angle while turning
 
 const remoteBuffers = new Map(); // peerId -> SnapshotBuffer
 
@@ -228,8 +236,40 @@ window.addEventListener("keydown", (e) => {
     toggleMute();
   } else if (e.code === "KeyT" && isConnected()) {
     scatter();
+  } else if (e.code === "KeyE") {
+    tryDig();
   }
 });
+
+// --- Dig tool: carve a sphere out of whatever cheese you're aiming at. ---
+// The world is a live SDF: digAt() edits the chunk's cached voxel field and
+// re-runs marching cubes on just that chunk — collision follows exactly.
+let lastDigAt = 0;
+function tryDig() {
+  if (!worldReady) return;
+  const now = performance.now();
+  if (now - lastDigAt < DIG_COOLDOWN_MS) return;
+
+  const yaw = getYaw();
+  const pitch = getPitch();
+  const cosP = Math.cos(pitch);
+  const dir = {
+    x: -Math.sin(yaw) * cosP,
+    y: Math.sin(pitch),
+    z: -Math.cos(yaw) * cosP,
+  };
+  const hit = raycastSolid(localPosition, dir, DIG_RANGE);
+  if (!hit) {
+    showEvent("⛏ Nothing within reach");
+    return;
+  }
+  lastDigAt = now;
+  digAt(hit.x, hit.y, hit.z, DIG_RADIUS);
+  showEvent("⛏ You carve into the gouda");
+  if (isConnected()) {
+    sendEvent({ kind: "dig", x: hit.x, y: hit.y, z: hit.z, r: DIG_RADIUS });
+  }
+}
 
 // --- Scatter teleport: throw both divers into random open pockets of the
 // labyrinth, 20-34 units apart.
@@ -299,6 +339,9 @@ onEventReceived((peerId, data) => {
     showEvent(
       "⨨ Scattered! Find your teammate — look for their light, listen for their voice.",
     );
+  } else if (data.kind === "dig") {
+    // Teammate dug somewhere: apply the same carve locally.
+    digAt(data.x, data.y, data.z, data.r ?? DIG_RADIUS);
   } else if (data.kind === "seed" && data.seed !== seed) {
     // Joined a host with a different map: adopt their seed and rebuild.
     seed = data.seed >>> 0;
@@ -330,15 +373,19 @@ renderLoop((delta) => {
   const yaw = getYaw();
   const pitch = getPitch();
 
-  // 2. Desired velocity: swim where you look; strafe horizontal; Space/Shift vertical.
+  // 2. Desired velocity — along the lazy BODY orientation, not the raw look.
+  // The body trails the head, so glancing around mid-swim doesn't zigzag
+  // your trajectory; hold a direction and the body settles onto it.
   const move = getMovement();
-  const cosP = Math.cos(pitch);
+  const swimYaw = getSwimYaw();
+  const swimPitch = getSwimPitch();
+  const cosP = Math.cos(swimPitch);
   const fwd = {
-    x: -Math.sin(yaw) * cosP,
-    y: Math.sin(pitch),
-    z: -Math.cos(yaw) * cosP,
+    x: -Math.sin(swimYaw) * cosP,
+    y: Math.sin(swimPitch),
+    z: -Math.cos(swimYaw) * cosP,
   };
-  const right = { x: Math.cos(yaw), z: -Math.sin(yaw) };
+  const right = { x: Math.cos(swimYaw), z: -Math.sin(swimYaw) };
 
   const target = {
     x: (fwd.x * move.z + right.x * move.x) * MAX_SPEED,
@@ -382,9 +429,12 @@ renderLoop((delta) => {
     localPosition.z -= (localPosition.z / distFromCenter) * pull;
   }
 
-  // 4. First-person camera (speed drives the flashlight bob).
+  // 4. First-person camera (speed drives the flashlight bob) with a subtle
+  // bank into turns — reads as swimming, not as a tripod spinning.
   const speed = Math.hypot(velocity.x, velocity.y, velocity.z) / MAX_SPEED;
-  updateCamera(localPosition, yaw, pitch, Math.min(speed, 1));
+  const rollTarget = Math.max(-0.09, Math.min(0.09, -getYawVelocity() * 0.03));
+  cameraRoll += (rollTarget - cameraRoll) * Math.min(1, delta * 5);
+  updateCamera(localPosition, yaw, pitch, Math.min(speed, 1), cameraRoll);
 
   // 5. Spatial audio listener follows the camera.
   setListenerPose(localPosition, yaw, pitch);
@@ -412,18 +462,10 @@ renderLoop((delta) => {
     }
   }
 
-  // 8. HUD.
+  // 8. HUD. (No gold tracker: the gold is hidden — search, listen for the
+  // glow leaking out of tunnel mouths.)
   drawCompass(yaw);
   depthText.textContent = `▼ ${Math.max(0, Math.round(ABYSS_DEPTH - localPosition.y))} m`;
-
-  // Gold tracker: distance + a vertical hint (the compass strip only gives
-  // the horizontal bearing).
-  const gdx = HEART_POS.x - localPosition.x;
-  const gdy = HEART_POS.y - localPosition.y;
-  const gdz = HEART_POS.z - localPosition.z;
-  const goldDist = Math.round(Math.hypot(gdx, gdy, gdz));
-  const vert = gdy > 8 ? " ↑" : gdy < -8 ? " ↓" : "";
-  goldText.textContent = `◆ GOLD ${goldDist} m${vert}`;
 });
 
 // --- Compass strip (canvas, like a dive HUD) ---
@@ -473,28 +515,8 @@ function drawCompass(yaw) {
   // Center marker.
   ctx.fillRect(w / 2 - 1, h - 12, 2, 12);
 
-  // Gold marker: bearing toward the heart of the maze. Clamped to the strip's
-  // edge (dimmed) when the gold is behind you.
-  const bearing =
-    ((Math.atan2(
-      HEART_POS.x - localPosition.x,
-      -(HEART_POS.z - localPosition.z),
-    ) *
-      180) /
-      Math.PI +
-      360) %
-    360;
-  const rel = ((((bearing - heading + 540) % 360) + 360) % 360) - 180;
-  const onStrip = rel >= -60 && rel <= 60;
-  const gx = w / 2 + Math.max(-60, Math.min(60, rel)) * pxPerDeg;
-  ctx.fillStyle = onStrip ? "#ffc23d" : "rgba(255, 194, 61, 0.35)";
-  ctx.beginPath();
-  ctx.moveTo(gx, 1);
-  ctx.lineTo(gx + 4.5, 7.5);
-  ctx.lineTo(gx, 14);
-  ctx.lineTo(gx - 4.5, 7.5);
-  ctx.closePath();
-  ctx.fill();
+  // (No gold bearing — the gold is hidden somewhere in the wheels; the
+  // compass only keeps you oriented.)
 }
 
 function showStatus(text) {

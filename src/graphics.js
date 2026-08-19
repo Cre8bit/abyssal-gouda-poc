@@ -34,12 +34,16 @@ const ABYSS_COLOR = 0x020806; // murky green-black
 // Control points: [radial distance from map center, fog density].
 const FOG_BANDS = [
   [0, 0.05], // the heart: ~60 m visibility
-  [46, 0.046],
-  [90, 0.036], // the hollows
-  [130, 0.026], // inside the crust wall
-  [168, 0.016], // the warrens / scree, hugging the crust
-  [195, 0.008], // the drift: water clears fast
-  [600, 0.0055], // spawn: see the whole glowing ball
+  [42, 0.046], // the hollows
+  [80, 0.04], // the bulwark (wall #2)
+  [120, 0.032], // the galleries
+  [158, 0.026], // the crust (wall #1)
+  [205, 0.02], // the warrens
+  [255, 0.015], // the scree
+  [310, 0.01], // the chimneys
+  [360, 0.007], // the reef
+  [400, 0.005], // the drift: water clears fast
+  [900, 0.0038], // spawn: see the whole glowing ball
 ];
 const FOG_DENSITY = FOG_BANDS[FOG_BANDS.length - 1][1]; // initial (spawn is outside)
 
@@ -103,7 +107,7 @@ export function initGraphics(container) {
     72,
     window.innerWidth / window.innerHeight,
     0.1,
-    560, // far enough to take in the whole ball from the drift
+    1000, // far enough to take in the whole ball from the drift
   );
   camera.rotation.order = "YXZ";
   camera.position.set(0, 2, 8);
@@ -117,7 +121,7 @@ export function initGraphics(container) {
   renderer.setPixelRatio(renderPixelRatio());
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.15;
+  renderer.toneMappingExposure = 1.3; // cheese should read YELLOW, not olive
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   // Shadows update EVERY frame. The old 30 Hz throttle showed a stale shadow
@@ -131,7 +135,7 @@ export function initGraphics(container) {
   // Natural deep-water base light: faint sickly green murk, near-black below.
   // Slightly stronger than realistic so the ball's silhouette reads from the
   // drift; the per-zone bioluminescent veins do the rest of the storytelling.
-  scene.add(new THREE.HemisphereLight(0x33401c, 0x040502, 0.22));
+  scene.add(new THREE.HemisphereLight(0x3d451e, 0x050503, 0.28));
   const gloom = new THREE.DirectionalLight(0x3a4418, 0.1);
   gloom.position.set(2, 40, 1);
   scene.add(gloom);
@@ -1036,10 +1040,11 @@ export function setPlayerLight(id, on) {
   player.halo.visible = on;
 }
 
-export function updateCamera(playerPos, yaw, pitch, speed = 0) {
+export function updateCamera(playerPos, yaw, pitch, speed = 0, roll = 0) {
   camera.position.set(playerPos.x, playerPos.y, playerPos.z);
   camera.rotation.y = yaw;
   camera.rotation.x = pitch;
+  camera.rotation.z = roll; // subtle bank into turns (order YXZ: applied last)
   moveFactor += (speed - moveFactor) * 0.05;
 }
 
