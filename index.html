@@ -14,9 +14,18 @@
     <div id="vignette"></div>
     <div id="crosshair"></div>
 
+    <!-- World generation loading screen -->
+    <div id="loader">
+      <div class="loader-title">ABYSSAL</div>
+      <div class="loader-sub">descending into the gouda labyrinth</div>
+      <div class="loader-bar"><div id="loader-fill"></div></div>
+      <div id="loader-label">charting the abyss…</div>
+    </div>
+
     <!-- Dive HUD -->
     <div id="hud" class="hidden">
-      <canvas id="compass" width="420" height="26"></canvas>
+      <canvas id="compass" width="420" height="34"></canvas>
+      <div id="gold-indicator">◆ GOLD — m</div>
       <div id="depth">▼ 0 m</div>
       <div id="voice-indicator">VOICE · off</div>
       <div id="event-center"></div>

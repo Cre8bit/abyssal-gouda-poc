@@ -2,6 +2,26 @@
 
 Minimal 3D underwater multiplayer prototype. 100% static frontend, hosted on GitHub Pages.
 
+## The Gouda Labyrinth (Phase 1)
+
+The map is a ball of concentric zones, outside → in: **the drift** (lone pale
+chunks, first silhouettes), **the scree** (dense belt of small swiss-cheese
+pebbles), **the bulwark** (a near-sealed shell of giant fused wheels — ~93% of
+straight paths are blocked, so you must pass THROUGH their guaranteed radial
+through-tunnels), **the hollows** (cavernous mid wheels), and **the heart**
+(colossal central wheel whose core cavern holds the gouda gold). The compass
+carries a gold marker and distance readout pointing at the prize.
+
+The world is a procedural 3D labyrinth of massive gouda chunks (`src/gouda.js`).
+Each chunk is an analytic SDF — a noise-crusted ellipsoid minus a connected graph
+of hole-spheres and tunnel-capsules — meshed once at load with marching cubes.
+Interior cavities are always linked by tunnels and punched out to the surface, so
+every chunk can be entered and explored. The same SDF drives swim collision
+(gradient push-out with wall sliding). Generation is seeded, so all peers build
+the identical maze with zero network traffic. The material carries a pulsing
+bioluminescent vein pattern and fake-SSS rim glow — in the pitch-black murk you
+navigate by the glow and your flashlight alone.
+
 ## Stack
 
 - **Vite** — bundling & dev server

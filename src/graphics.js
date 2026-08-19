@@ -12,7 +12,10 @@
 //  - Lights are steady (no flicker); the dying bell lamp only breathes with
 //    a slow, smooth pulse
 //  - Slow current drift on particles + occasional rising bubble bursts
+//  - The world itself is the procedural gouda labyrinth (see gouda.js):
+//    marching-cubes chunks with real enterable holes and tunnel systems
 import * as THREE from "three";
+import { buildGoudaWorld, updateGouda } from "./gouda.js";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
@@ -22,10 +25,9 @@ import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPa
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
 
-const ABYSS_COLOR = 0x00070a;
+const ABYSS_COLOR = 0x020806; // murky green-black
 const FOG_DENSITY = 0.05;
 
-const TERRAIN_SIZE = 340;
 const SNOW_COUNT = 1500;
 const SNOW_RADIUS = 30;
 const BUBBLE_COUNT = 160;
@@ -50,11 +52,9 @@ let snow;
 let bubbles;
 let bursts; // { points, states: [{origin, age, duration, delay}] }
 let flashlight; // { group, spot, spill, beam, lens, halo, on }
-let bellLight;
 let elapsed = 0;
 let moveFactor = 0;
 let resizeFrame = null;
-let nextShadowUpdate = 0;
 
 const players = new Map();
 const noise = new ImprovedNoise();
@@ -77,14 +77,6 @@ function loadDiverModel() {
 
 function renderPixelRatio() {
   return Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO);
-}
-
-export function terrainHeight(x, z) {
-  let h = 0;
-  h += noise.noise(x * 0.011, z * 0.011, 0.5) * 10;
-  h += noise.noise(x * 0.045, z * 0.045, 17.7) * 2.4;
-  h += noise.noise(x * 0.16, z * 0.16, 31.4) * 0.5;
-  return h - 4;
 }
 
 export function initGraphics(container) {
@@ -113,20 +105,20 @@ export function initGraphics(container) {
   renderer.toneMappingExposure = 1.15;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-  renderer.shadowMap.autoUpdate = false;
+  // Shadows update EVERY frame. The old 30 Hz throttle showed a stale shadow
+  // on alternate frames — with the light glued to the camera, that reads as
+  // constant flicker against the cheese walls.
+  renderer.shadowMap.autoUpdate = true;
   container.appendChild(renderer.domElement);
 
   setupPostProcessing();
 
-  // Natural deep-water base light: faint cool sky vs dead-black floor.
-  scene.add(new THREE.HemisphereLight(0x0e2b42, 0x010407, 0.16));
-  const gloom = new THREE.DirectionalLight(0x0e3149, 0.08);
+  // Natural deep-water base light: faint sickly green murk, near-black below.
+  scene.add(new THREE.HemisphereLight(0x11322a, 0x010503, 0.16));
+  const gloom = new THREE.DirectionalLight(0x11402f, 0.08);
   gloom.position.set(2, 40, 1);
   scene.add(gloom);
 
-  createTerrain();
-  scatterRocks();
-  createDivingBell();
   createFlashlight();
   createSnow();
   createBubbles();
@@ -135,6 +127,13 @@ export function initGraphics(container) {
   window.addEventListener("resize", onResize);
 
   return renderer.domElement;
+}
+
+// Generates the gouda labyrinth asynchronously (chunk by chunk) so the
+// loading screen can track progress. Call after initGraphics, await before
+// spawning the player.
+export function loadWorld(onProgress) {
+  return buildGoudaWorld(scene, onProgress);
 }
 
 function setupPostProcessing() {
@@ -176,8 +175,8 @@ function setupPostProcessing() {
         vec3 col = texture2D(tDiffuse, uv).rgb;
 
         float lum = dot(col, vec3(0.299, 0.587, 0.114));
-        col = mix(col, vec3(lum), 0.22);
-        col *= vec3(0.74, 0.94, 1.07);
+        col = mix(col, vec3(lum), 0.18);
+        col *= vec3(0.82, 1.02, 0.90); // murky green grade
 
         float d = distance(vUv, vec2(0.5));
         col *= smoothstep(0.88, 0.32, d);
@@ -325,117 +324,7 @@ function createVolumetricLight({ length, endRadius, tint, strength }) {
 }
 
 // --- World -----------------------------------------------------------------
-
-function createTerrain() {
-  const segments = 170;
-  const geometry = new THREE.PlaneGeometry(
-    TERRAIN_SIZE,
-    TERRAIN_SIZE,
-    segments,
-    segments,
-  );
-  geometry.rotateX(-Math.PI / 2);
-
-  const pos = geometry.attributes.position;
-  for (let i = 0; i < pos.count; i++) {
-    pos.setY(i, terrainHeight(pos.getX(i), pos.getZ(i)));
-  }
-  geometry.computeVertexNormals();
-
-  const terrain = new THREE.Mesh(
-    geometry,
-    new THREE.MeshStandardMaterial({
-      color: 0x14252e,
-      roughness: 0.95,
-      metalness: 0.02,
-    }),
-  );
-  terrain.receiveShadow = true;
-  scene.add(terrain);
-}
-
-function scatterRocks() {
-  const material = new THREE.MeshStandardMaterial({
-    color: 0x1b2a33,
-    roughness: 1,
-  });
-  for (let i = 0; i < 70; i++) {
-    const size = 0.4 + Math.random() * 2.6;
-    const rock = new THREE.Mesh(
-      new THREE.DodecahedronGeometry(size, 0),
-      material,
-    );
-    const x = (Math.random() - 0.5) * 220;
-    const z = (Math.random() - 0.5) * 220;
-    rock.position.set(x, terrainHeight(x, z) + size * 0.25, z);
-    rock.rotation.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
-    rock.scale.y = 0.45 + Math.random() * 0.6;
-    rock.castShadow = true;
-    rock.receiveShadow = true;
-    scene.add(rock);
-  }
-}
-
-function createDivingBell() {
-  const group = new THREE.Group();
-  const metal = new THREE.MeshStandardMaterial({
-    color: 0x232b30,
-    roughness: 0.55,
-    metalness: 0.75,
-  });
-
-  const dome = new THREE.Mesh(
-    new THREE.SphereGeometry(1.6, 24, 16, 0, Math.PI * 2, 0, Math.PI / 2),
-    metal,
-  );
-  dome.position.y = 3.4;
-  dome.castShadow = true;
-  group.add(dome);
-
-  const cage = new THREE.Mesh(
-    new THREE.CylinderGeometry(1.7, 1.9, 3.2, 10, 1, true),
-    new THREE.MeshStandardMaterial({
-      color: 0x232b30,
-      roughness: 0.6,
-      metalness: 0.7,
-      wireframe: true,
-    }),
-  );
-  cage.position.y = 1.8;
-  group.add(cage);
-
-  const base = new THREE.Mesh(
-    new THREE.CylinderGeometry(2.1, 2.3, 0.35, 12),
-    metal,
-  );
-  base.position.y = 0.15;
-  base.castShadow = true;
-  group.add(base);
-
-  const bulbMat = new THREE.MeshStandardMaterial({
-    color: 0xcfe8ff,
-    emissive: 0xbfe0ff,
-    emissiveIntensity: 3,
-  });
-  for (let i = 0; i < 4; i++) {
-    const a = (i / 4) * Math.PI * 2;
-    const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.09, 8, 8), bulbMat);
-    bulb.position.set(Math.cos(a) * 1.55, 3.1, Math.sin(a) * 1.55);
-    group.add(bulb);
-    const light = new THREE.PointLight(0xbfe0ff, 14, 24, 1.9);
-    light.position.copy(bulb.position);
-    group.add(light);
-    const halo = createHalo(1.6, 0.3);
-    halo.position.copy(bulb.position);
-    group.add(halo);
-    if (i === 2) bellLight = { light, bulb: bulb, halo, mat: bulbMat };
-  }
-
-  const x = 0;
-  const z = -14;
-  group.position.set(x, terrainHeight(x, z) + 0.2, z);
-  scene.add(group);
-}
+// The gouda labyrinth itself lives in gouda.js (buildGoudaWorld).
 
 function createFlashlight() {
   const group = new THREE.Group();
@@ -477,7 +366,11 @@ function createFlashlight() {
   spot.shadow.mapSize.set(1024, 1024);
   spot.shadow.camera.near = 0.3;
   spot.shadow.camera.far = 65;
-  spot.shadow.bias = -0.0003;
+  spot.shadow.bias = -0.0002;
+  // Organic marching-cubes surfaces self-shadow badly with a pure depth
+  // bias (shimmering acne). normalBias pushes samples along the normal —
+  // the standard fix for curved geometry.
+  spot.shadow.normalBias = 0.08;
   group.add(spot);
   group.add(spot.target);
 
@@ -701,11 +594,13 @@ function createBursts() {
 }
 
 function respawnBurst(state) {
+  // A pocket of gas escaping the cheese somewhere below/around the diver.
   const angle = Math.random() * Math.PI * 2;
   const dist = 5 + Math.random() * 13;
   const x = camera.position.x + Math.cos(angle) * dist;
   const z = camera.position.z + Math.sin(angle) * dist;
-  state.origin.set(x, terrainHeight(x, z) + 0.3, z);
+  const y = camera.position.y - (4 + Math.random() * 10);
+  state.origin.set(x, y, z);
   state.age = -(3 + Math.random() * 9);
   state.duration = 3.2 + Math.random() * 1.6;
 }
@@ -824,7 +719,8 @@ export function addPlayer(id, color) {
   spot.target.position.set(0, 0.05, -20);
   spot.castShadow = true;
   spot.shadow.mapSize.set(512, 512);
-  spot.shadow.bias = -0.0003;
+  spot.shadow.bias = -0.0002;
+  spot.shadow.normalBias = 0.08;
   pivot.add(spot);
   pivot.add(spot.target);
 
@@ -1099,20 +995,6 @@ export function updateCamera(playerPos, yaw, pitch, speed = 0) {
   moveFactor += (speed - moveFactor) * 0.05;
 }
 
-// The dying bell lamp: a slow, smooth pulse (never a sudden dip/strobe) —
-// all other lights stay perfectly steady.
-function updateBellLight(delta) {
-  if (!bellLight) return;
-  const t = elapsed;
-  const pulse = 0.82 + 0.18 * Math.sin(t * 0.35) + 0.06 * Math.sin(t * 0.13);
-  const target = 14 * pulse;
-  bellLight.light.intensity +=
-    (target - bellLight.light.intensity) * Math.min(delta * 2, 1);
-  const lit = bellLight.light.intensity / 14;
-  bellLight.mat.emissiveIntensity = 3 * lit;
-  bellLight.halo.material.opacity = 0.3 * lit;
-}
-
 function animateFlashlight() {
   if (!flashlight) return;
   const t = elapsed;
@@ -1183,18 +1065,15 @@ export function renderLoop(onFrame) {
     updateBursts(delta);
 
     animateFlashlight();
-    updateBellLight(delta);
 
     if (onFrame) onFrame(delta);
 
-    // After game logic moved players/camera: animate rigs (torch follows the
-    // moved wrist), then feed the beam poses to the snow shader.
+    // After game logic moved players/camera: bioluminescent pulse + distance
+    // culling, rig animation (torch follows the moved wrist), then feed the
+    // beam poses to the snow shader.
+    updateGouda(elapsed, camera.position);
     for (const player of players.values()) updateDiverRig(player, delta);
     updateSnowLightUniforms();
-    if (elapsed >= nextShadowUpdate) {
-      renderer.shadowMap.needsUpdate = true;
-      nextShadowUpdate = elapsed + 1 / 30;
-    }
     composer.render();
   });
 }

@@ -8,8 +8,15 @@ import {
   renderLoop,
   toggleFlashlight,
   setPlayerLight,
-  terrainHeight,
+  loadWorld,
 } from "./graphics.js";
+import {
+  resolveCollision,
+  findOpenSpot,
+  getSpawnPoint,
+  WORLD_R,
+  HEART_POS,
+} from "./gouda.js";
 import {
   hostGame,
   joinGame,
@@ -44,10 +51,10 @@ import {
 const MAX_SPEED = 4.5; // units per second
 const WATER_INERTIA = 4; // how quickly velocity reaches its target
 const NETWORK_RATE = 1 / 30; // send state 30x per second
-const SURFACE_Y = 30; // conceptual waterline, for the depth readout
-const EYE_CLEARANCE = 1.0; // min height above the terrain
+const ABYSS_DEPTH = 612; // flavor: depth readout at y = 0
+const PLAYER_RADIUS = 0.6; // collision clearance against the cheese
+const WORLD_LIMIT = WORLD_R + 70; // soft leash: don't drift into the void
 
-const MAP_RANGE = 75; // scatter teleports stay within ±this
 const SCATTER_MIN = 20; // min/max distance between the two divers
 const SCATTER_MAX = 34;
 
@@ -65,14 +72,16 @@ const miniCopyLinkBtn = document.getElementById("mini-copy-link-btn");
 const hud = document.getElementById("hud");
 const compassCanvas = document.getElementById("compass");
 const depthText = document.getElementById("depth");
+const goldText = document.getElementById("gold-indicator");
 const voiceText = document.getElementById("voice-indicator");
 const scatterBtn = document.getElementById("scatter-btn");
 const eventCenter = document.getElementById("event-center");
 
-const localPosition = { x: 0, y: 2, z: 8 };
+const localPosition = { x: 0, y: 5, z: WORLD_R + 30 };
 const velocity = { x: 0, y: 0, z: 0 };
 let networkTimer = 0;
 let flashlightOn = true;
+let worldReady = false;
 
 const remoteBuffers = new Map(); // peerId -> SnapshotBuffer
 
@@ -81,6 +90,25 @@ const canvas = initGraphics(document.getElementById("scene-container"));
 initInput();
 initMouseLook(canvas);
 
+// --- World generation, with a loading screen ---
+const loaderEl = document.getElementById("loader");
+const loaderFill = document.getElementById("loader-fill");
+const loaderLabel = document.getElementById("loader-label");
+
+loadWorld((done, total, label) => {
+  loaderFill.style.width = `${Math.round((done / total) * 100)}%`;
+  loaderLabel.textContent = `carving ${label} · ${done}/${total}`;
+}).then(() => {
+  // Spawn in open water at the labyrinth's edge, facing the maze (-Z).
+  const spawn = getSpawnPoint();
+  localPosition.x = spawn.x;
+  localPosition.y = spawn.y;
+  localPosition.z = spawn.z;
+  worldReady = true;
+  loaderEl.classList.add("done");
+  setTimeout(() => loaderEl.remove(), 700); // after the fade-out
+});
+
 // --- UI handlers ---
 hostBtn.addEventListener("click", async () => {
   showStatus("Creating game…");
@@ -88,9 +116,7 @@ hostBtn.addEventListener("click", async () => {
     const id = await hostGame();
     hostedId = id;
     initVoice(getPeer());
-    showStatus(
-      `Waiting for a diver to join (signaling: ${getSignalingMode()}). Share this ID or link:`,
-    );
+    showStatus("Invite a diver:");
     peerIdText.textContent = id;
     peerIdText.classList.remove("hidden");
     copyLinkBtn.classList.remove("hidden");
@@ -187,34 +213,27 @@ window.addEventListener("keydown", (e) => {
   }
 });
 
-// --- Scatter teleport: throw both divers to random spots, 20-34 units apart.
+// --- Scatter teleport: throw both divers into random open pockets of the
+// labyrinth, 20-34 units apart.
 function scatter() {
   if (!isConnected()) {
     showStatus("No diver connected yet.");
     return;
   }
-  const a = {
-    x: (Math.random() - 0.5) * 2 * MAP_RANGE,
-    z: (Math.random() - 0.5) * 2 * MAP_RANGE,
-  };
-  const angle = Math.random() * Math.PI * 2;
-  const dist = SCATTER_MIN + Math.random() * (SCATTER_MAX - SCATTER_MIN);
-  const b = {
-    x: clamp(a.x + Math.cos(angle) * dist, -MAP_RANGE, MAP_RANGE),
-    z: clamp(a.z + Math.sin(angle) * dist, -MAP_RANGE, MAP_RANGE),
-  };
+  const a = findOpenSpot();
+  const b = findOpenSpot(a, SCATTER_MIN, SCATTER_MAX);
 
-  teleportLocal(a.x, a.z);
-  sendEvent({ kind: "tp", x: b.x, z: b.z });
+  teleportLocal(a.x, a.y, a.z);
+  sendEvent({ kind: "tp", x: b.x, y: b.y, z: b.z });
   showEvent(
     "⨨ Scattered! Find your teammate — look for their light, listen for their voice.",
   );
 }
 
-function teleportLocal(x, z) {
+function teleportLocal(x, y, z) {
   localPosition.x = x;
+  localPosition.y = y;
   localPosition.z = z;
-  localPosition.y = terrainHeight(x, z) + 2 + Math.random() * 4;
   velocity.x = velocity.y = velocity.z = 0;
   // Forget remote history so interpolation doesn't sweep across the map.
   for (const buffer of remoteBuffers.values()) buffer.reset();
@@ -256,7 +275,7 @@ onStateReceived((peerId, { x, y, z, yaw, pitch, light }) => {
 
 onEventReceived((peerId, data) => {
   if (data.kind === "tp") {
-    teleportLocal(data.x, data.z);
+    teleportLocal(data.x, data.y ?? 5, data.z);
     showEvent(
       "⨨ Scattered! Find your teammate — look for their light, listen for their voice.",
     );
@@ -278,6 +297,8 @@ onVoiceStatus((state) => {
 
 // --- Game loop ---
 renderLoop((delta) => {
+  if (!worldReady) return; // still carving the labyrinth
+
   // 1. Smooth the camera look toward the mouse target.
   updateLook(delta);
   const yaw = getYaw();
@@ -309,9 +330,31 @@ renderLoop((delta) => {
   localPosition.y += velocity.y * delta;
   localPosition.z += velocity.z * delta;
 
-  // Terrain collision + ceiling.
-  const minY = terrainHeight(localPosition.x, localPosition.z) + EYE_CLEARANCE;
-  localPosition.y = clamp(localPosition.y, minY, SURFACE_Y - 2);
+  // Cheese collision: the SDF pushes the diver out of the walls, then the
+  // velocity component pointing into the wall is removed so you slide along
+  // tunnel walls instead of bouncing.
+  const hit = resolveCollision(localPosition, PLAYER_RADIUS);
+  if (hit) {
+    const into = velocity.x * hit.x + velocity.y * hit.y + velocity.z * hit.z;
+    if (into < 0) {
+      velocity.x -= hit.x * into;
+      velocity.y -= hit.y * into;
+      velocity.z -= hit.z * into;
+    }
+  }
+
+  // Soft leash: past the edge of the field, the current pushes you back.
+  const distFromCenter = Math.hypot(
+    localPosition.x,
+    localPosition.y,
+    localPosition.z,
+  );
+  if (distFromCenter > WORLD_LIMIT) {
+    const pull = (distFromCenter - WORLD_LIMIT) * 0.8 * delta;
+    localPosition.x -= (localPosition.x / distFromCenter) * pull;
+    localPosition.y -= (localPosition.y / distFromCenter) * pull;
+    localPosition.z -= (localPosition.z / distFromCenter) * pull;
+  }
 
   // 4. First-person camera (speed drives the flashlight bob).
   const speed = Math.hypot(velocity.x, velocity.y, velocity.z) / MAX_SPEED;
@@ -345,7 +388,16 @@ renderLoop((delta) => {
 
   // 8. HUD.
   drawCompass(yaw);
-  depthText.textContent = `▼ ${Math.max(0, Math.round(SURFACE_Y - localPosition.y))} m`;
+  depthText.textContent = `▼ ${Math.max(0, Math.round(ABYSS_DEPTH - localPosition.y))} m`;
+
+  // Gold tracker: distance + a vertical hint (the compass strip only gives
+  // the horizontal bearing).
+  const gdx = HEART_POS.x - localPosition.x;
+  const gdy = HEART_POS.y - localPosition.y;
+  const gdz = HEART_POS.z - localPosition.z;
+  const goldDist = Math.round(Math.hypot(gdx, gdy, gdz));
+  const vert = gdy > 8 ? " ↑" : gdy < -8 ? " ↓" : "";
+  goldText.textContent = `◆ GOLD ${goldDist} m${vert}`;
 });
 
 // --- Compass strip (canvas, like a dive HUD) ---
@@ -394,6 +446,29 @@ function drawCompass(yaw) {
 
   // Center marker.
   ctx.fillRect(w / 2 - 1, h - 12, 2, 12);
+
+  // Gold marker: bearing toward the heart of the maze. Clamped to the strip's
+  // edge (dimmed) when the gold is behind you.
+  const bearing =
+    ((Math.atan2(
+      HEART_POS.x - localPosition.x,
+      -(HEART_POS.z - localPosition.z),
+    ) *
+      180) /
+      Math.PI +
+      360) %
+    360;
+  const rel = ((((bearing - heading + 540) % 360) + 360) % 360) - 180;
+  const onStrip = rel >= -60 && rel <= 60;
+  const gx = w / 2 + Math.max(-60, Math.min(60, rel)) * pxPerDeg;
+  ctx.fillStyle = onStrip ? "#ffc23d" : "rgba(255, 194, 61, 0.35)";
+  ctx.beginPath();
+  ctx.moveTo(gx, 1);
+  ctx.lineTo(gx + 4.5, 7.5);
+  ctx.lineTo(gx, 14);
+  ctx.lineTo(gx - 4.5, 7.5);
+  ctx.closePath();
+  ctx.fill();
 }
 
 function showStatus(text) {

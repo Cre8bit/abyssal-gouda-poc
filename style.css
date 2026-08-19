@@ -88,9 +88,27 @@ button:active {
 #status {
   position: fixed;
   top: 1rem;
-  left: 50%;
-  transform: translateX(-50%);
-  padding: 0.75rem 1.25rem;
+  left: 1rem;
+  transform: none;
+  padding: 0.5rem 0.75rem;
+  text-align: left;
+  font-size: 0.8rem;
+  max-width: 220px;
+}
+
+#status-text {
+  font-size: 0.8rem;
+}
+
+#status .peer-id {
+  font-size: 0.8rem;
+}
+
+#status .copy-link-btn,
+#status #copy-link-btn {
+  margin-top: 0.4rem;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.75rem;
 }
 
 .peer-id {
@@ -133,6 +151,63 @@ button:active {
 }
 
 /* --- Dive HUD --- */
+/* --- World generation loading screen --- */
+#loader {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 0.9rem;
+  background: #020806;
+  font-family: monospace;
+  color: #d8f4ff;
+  transition: opacity 0.6s ease;
+}
+
+#loader.done {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.loader-title {
+  font-size: 1.6rem;
+  letter-spacing: 0.5em;
+  text-indent: 0.5em;
+  color: #ffc23d;
+  text-shadow: 0 0 18px rgba(255, 194, 61, 0.4);
+}
+
+.loader-sub {
+  font-size: 0.8rem;
+  letter-spacing: 0.15em;
+  color: #7fae8e;
+}
+
+.loader-bar {
+  width: min(340px, 70vw);
+  height: 6px;
+  border: 1px solid rgba(255, 194, 61, 0.35);
+  border-radius: 3px;
+  overflow: hidden;
+  background: rgba(255, 194, 61, 0.06);
+}
+
+#loader-fill {
+  width: 0%;
+  height: 100%;
+  background: linear-gradient(90deg, #8a6a1c, #ffc23d);
+  transition: width 0.25s ease;
+}
+
+#loader-label {
+  font-size: 0.72rem;
+  letter-spacing: 0.1em;
+  color: rgba(216, 244, 255, 0.55);
+}
+
 #hud {
   position: fixed;
   inset: 0;
@@ -156,6 +231,19 @@ button:active {
   font-size: 1.4rem;
   letter-spacing: 0.1em;
   text-shadow: 0 0 8px rgba(0, 20, 40, 0.9);
+}
+
+/* Distance to the gouda gold, under the compass strip. */
+#gold-indicator {
+  position: absolute;
+  top: 3.4rem;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.8rem;
+  letter-spacing: 0.14em;
+  color: #ffc23d;
+  text-shadow: 0 0 10px rgba(255, 194, 61, 0.5);
+  opacity: 0.9;
 }
 
 #voice-indicator {
