@@ -37,10 +37,12 @@ export const HEART_POS = { x: 0, y: 0, z: 0 }; // the gouda gold
 
 const HEART_S = 62;
 const HEART_RES = 96;
-const BULWARK_R = 120;
+const BULWARK_R = 120; // the crust wall: dense shell, sealed except tunnels
+const BULWARK_N = 40; // many parts, spaced ⇒ crusts fuse into one wall
 const HOLLOW_COUNT = 12;
-const SCREE_COUNT = 40;
-const DRIFT_COUNT = 9;
+const WARREN_COUNT = 6; // speleology chunks: long tangled narrow tunnels
+const SCREE_COUNT = 24;
+const DRIFT_COUNT = 8;
 const DEBRIS_COUNT = 300;
 
 const RES_BIG = 72;
@@ -218,25 +220,36 @@ function chunkSdf(c, x, y, z) {
 const _dir = new THREE.Vector3();
 const _dir2 = new THREE.Vector3();
 
-// A tunnel from a to b. Wheels get winding 2-segment tunnels (maze feel);
-// blocks get straight bores.
-function addTunnel(c, rng, a, b, r, wind) {
-  if (wind) {
-    const mx = (a.x + b.x) / 2,
-      my = (a.y + b.y) / 2,
-      mz = (a.z + b.z) / 2;
-    const len = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
-    randDir(rng, _dir2);
-    const bend = len * (0.15 + rng() * 0.2);
-    const mid = {
-      x: mx + _dir2.x * bend,
-      y: my + _dir2.y * bend,
-      z: mz + _dir2.z * bend,
-    };
-    c.tunnels.push({ ax: a.x, ay: a.y, az: a.z, bx: mid.x, by: mid.y, bz: mid.z, r });
-    c.tunnels.push({ ax: mid.x, ay: mid.y, az: mid.z, bx: b.x, by: b.y, bz: b.z, r });
-  } else {
+// A tunnel from a to b as a bent polyline. bends=0: straight bore;
+// bends=1: winding maze tunnel; bends=2+: long snaking speleology passage.
+function addTunnel(c, rng, a, b, r, bends) {
+  if (!bends) {
     c.tunnels.push({ ax: a.x, ay: a.y, az: a.z, bx: b.x, by: b.y, bz: b.z, r });
+    return;
+  }
+  const len = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+  const pts = [a];
+  for (let i = 1; i <= bends; i++) {
+    const t = i / (bends + 1);
+    randDir(rng, _dir2);
+    const bend = len * (0.12 + rng() * 0.16);
+    pts.push({
+      x: a.x + (b.x - a.x) * t + _dir2.x * bend,
+      y: a.y + (b.y - a.y) * t + _dir2.y * bend,
+      z: a.z + (b.z - a.z) * t + _dir2.z * bend,
+    });
+  }
+  pts.push(b);
+  for (let i = 0; i < pts.length - 1; i++) {
+    c.tunnels.push({
+      ax: pts[i].x,
+      ay: pts[i].y,
+      az: pts[i].z,
+      bx: pts[i + 1].x,
+      by: pts[i + 1].y,
+      bz: pts[i + 1].z,
+      r,
+    });
   }
 }
 
@@ -247,10 +260,14 @@ function addTunnel(c, rng, a, b, r, wind) {
 //  axis: radial through-route (bulwark)
 function makeChunkData(rng, center, s, res, opts) {
   const cell = 2 / res;
-  const minTunnelR = 2.6 * cell;
+  // narrow (warrens): allow tunnels near the grid limit — occasional pinch
+  // points and squeezes are the point (speleology).
+  const minTunnelR = (opts.narrow ? 2.2 : 2.6) * cell;
   const tunnelScale = [1.15, 1.0, 0.85][difficulty - 1] ?? 1.0;
   const tr = (base) => Math.max(minTunnelR, base * tunnelScale);
-  const wind = opts.kind !== "block";
+  // Straight bores for blocks, winding for wheels/hunks, long snaking
+  // passages for the warrens.
+  const bends = opts.narrow ? 2 : opts.kind !== "block" ? 1 : 0;
 
   // Base proportions: wheels are flattened rounds; hunks stay chunky;
   // blocks start chunky and get their identity from the plane cuts.
@@ -358,8 +375,24 @@ function makeChunkData(rng, center, s, res, opts) {
         second = j;
       }
     }
-    const j = i > 2 && rng() < 0.3 ? second : best;
-    addTunnel(c, rng, eyes[i], eyes[j], tr(0.055 + 0.04 * rng()), wind);
+    // tangle (warrens): often attach to a RANDOM earlier chamber instead of
+    // the nearest — long intertwined passages that cross each other, easy to
+    // descend into, hard to retrace.
+    const j = opts.tangle
+      ? i > 1 && rng() < 0.5
+        ? Math.floor(rng() * i)
+        : best
+      : i > 2 && rng() < 0.3
+        ? second
+        : best;
+    addTunnel(
+      c,
+      rng,
+      eyes[i],
+      eyes[j],
+      tr(opts.narrow ? 0.038 + 0.022 * rng() : 0.055 + 0.04 * rng()),
+      bends,
+    );
   }
   // Extra loops: multiple paths through the maze.
   const loops = 2 + Math.floor(eyes.length / 6);
@@ -367,7 +400,14 @@ function makeChunkData(rng, center, s, res, opts) {
     const a = eyes[Math.floor(rng() * eyes.length)];
     const b = eyes[Math.floor(rng() * eyes.length)];
     if (a === b) continue;
-    addTunnel(c, rng, a, b, tr(0.05 + 0.035 * rng()), wind);
+    addTunnel(
+      c,
+      rng,
+      a,
+      b,
+      tr(opts.narrow ? 0.035 + 0.02 * rng() : 0.05 + 0.035 * rng()),
+      bends,
+    );
   }
 
   // Exit tunnels from the outermost eyes to open water.
@@ -443,7 +483,7 @@ function makeChunkData(rng, center, s, res, opts) {
     );
     if (el > R0 - chR * 0.8) continue;
     c.holes.push(ch);
-    addTunnel(c, rng, start, ch, tr(0.045 + 0.03 * rng()), wind);
+    addTunnel(c, rng, start, ch, tr(0.045 + 0.03 * rng()), bends);
     // Blast point: middle of the thin wall, in world space.
     const bx = target.x + _dir.x * (target.r + wall / 2);
     const by = target.y + _dir.y * (target.r + wall / 2);
@@ -588,40 +628,49 @@ function createGoudaMaterial({ color, rough, vein, veinStrength }) {
 }
 
 function createZoneMaterials() {
+  // All-yellow family — recognizably gouda everywhere; only the VEIN glow
+  // shifts with depth to mark the biomes.
   return {
-    // pale, cold, faint — the dead outer reef
+    // pale aged rind, faint warm shimmer
     drift: createGoudaMaterial({
-      color: 0xcdb877,
+      color: 0xd6bc55,
       rough: 0.58,
-      vein: [0.25, 0.5, 0.55],
+      vein: [0.55, 0.52, 0.2],
       veinStrength: 0.4,
     }),
-    // classic green murk glow
+    // bright young gouda, yellow-green glow
     scree: createGoudaMaterial({
-      color: 0xcf9c30,
+      color: 0xdcaa2e,
       rough: 0.52,
-      vein: [0.42, 0.6, 0.1],
+      vein: [0.6, 0.62, 0.12],
       veinStrength: 0.5,
+    }),
+    // the warrens: sickly green-gold — something lives in these
+    warrens: createGoudaMaterial({
+      color: 0xd9a52c,
+      rough: 0.5,
+      vein: [0.5, 0.72, 0.12],
+      veinStrength: 0.55,
     }),
     // amber, strong — the wall is alive
     bulwark: createGoudaMaterial({
-      color: 0xc9962e,
+      color: 0xdda434,
       rough: 0.48,
-      vein: [0.85, 0.55, 0.1],
+      vein: [0.95, 0.62, 0.12],
       veinStrength: 0.6,
     }),
     // deep red pulse — too close to the heart
     hollows: createGoudaMaterial({
-      color: 0xb97b24,
+      color: 0xcc9226,
       rough: 0.45,
-      vein: [0.9, 0.22, 0.08],
+      vein: [0.95, 0.28, 0.08],
       veinStrength: 0.65,
     }),
     // gold
     heart: createGoudaMaterial({
-      color: 0xcf9a2a,
+      color: 0xdda838,
       rough: 0.4,
-      vein: [1.0, 0.75, 0.2],
+      vein: [1.0, 0.8, 0.22],
       veinStrength: 0.85,
     }),
   };
@@ -874,12 +923,27 @@ function placeChunks(rng) {
     exits: 2,
   };
 
-  // THE HOLLOWS
-  for (let i = 0; i < HOLLOW_COUNT; i++)
-    tryBand("hollows", 60, 88, 16 + rng() * 8, RES_MED, "the hollows", hollowOpts, 0.55);
+  const warrenOpts = {
+    kind: "hunk",
+    eyesMin: 18,
+    eyesMax: 26,
+    eyeRBase: 0.05,
+    eyeRVar: 0.05,
+    exits: 2,
+    deadEnds: 2,
+    narrow: true,
+    tangle: true,
+  };
 
-  // THE BULWARK: fibonacci shell of giant fused wheels + radial through-routes.
-  const bulwarkN = 34 + (difficulty - 1) * 4;
+  // THE HOLLOWS: cavernous wheels — some properly big.
+  for (let i = 0; i < HOLLOW_COUNT; i++)
+    tryBand("hollows", 60, 90, 18 + rng() * 14, RES_MED, "the hollows", hollowOpts, 0.5);
+
+  // THE CRUST WALL: many giant hunks on a dense fibonacci shell. Spaced so
+  // neighbouring crusts fuse hard — with 40 wheels the spacing (~67) is well
+  // under the combined reach (~100): effectively no way around, only through
+  // the radial tunnel routes. Every 13th piece is EXTRA colossal.
+  const bulwarkN = BULWARK_N + (difficulty - 1) * 4;
   const GOLDEN = 2.399963229728653;
   for (let i = 0; i < bulwarkN; i++) {
     const y = 1 - (2 * (i + 0.5)) / bulwarkN;
@@ -891,23 +955,29 @@ function placeChunks(rng) {
       Math.sin(th) * r + (rng() - 0.5) * 0.08,
     ).normalize();
     const rad = BULWARK_R + (rng() - 0.5) * 4;
+    const colossal = i % 13 === 0;
     specs.push({
       center: axis.clone().multiplyScalar(rad),
-      s: 57 + rng() * 11,
-      res: RES_BULWARK,
-      label: "the bulwark",
+      s: colossal ? 76 + rng() * 10 : 57 + rng() * 11,
+      res: colossal ? RES_BULWARK : 56,
+      label: colossal ? "a colossal wheel" : "the crust wall",
       zone: "bulwark",
       opts: { ...bulwarkOpts, axis: { x: axis.x, y: axis.y, z: axis.z } },
     });
   }
 
-  // THE SCREE: dense belt of small cut blocks.
+  // THE WARRENS: speleology chunks nestled against the crust's outer face,
+  // plugging gaps — long tangled narrow tunnels you sink into.
+  for (let i = 0; i < WARREN_COUNT; i++)
+    tryBand("warrens", 150, 172, 28 + rng() * 8, RES_BULWARK, "the warrens", warrenOpts, 0.55);
+
+  // THE SCREE: small cut blocks littered over the crust's surface.
   for (let i = 0; i < SCREE_COUNT; i++)
-    tryBand("scree", 150, 192, 9 + rng() * 7, RES_SMALL, "the scree", smallOpts, 0.65);
+    tryBand("scree", 155, 188, 10 + rng() * 6, RES_SMALL, "the scree", smallOpts, 0.65);
 
   // THE DRIFT: sparse pale blocks at the very edge.
   for (let i = 0; i < DRIFT_COUNT; i++)
-    tryBand("drift", 196, WORLD_R, 10 + rng() * 7, RES_SMALL, "the drift", smallOpts, 1.3);
+    tryBand("drift", 192, WORLD_R, 10 + rng() * 7, RES_SMALL, "the drift", smallOpts, 1.3);
 
   return specs;
 }

@@ -49,7 +49,7 @@ import {
   toggleMute,
 } from "./voice.js";
 
-const MAX_SPEED = 4.5; // units per second
+const MAX_SPEED = 10.0; // units per second — brisk fins
 const WATER_INERTIA = 4; // how quickly velocity reaches its target
 const NETWORK_RATE = 1 / 30; // send state 30x per second
 const ABYSS_DEPTH = 612; // flavor: depth readout at y = 0

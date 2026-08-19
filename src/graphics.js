@@ -35,11 +35,11 @@ const ABYSS_COLOR = 0x020806; // murky green-black
 const FOG_BANDS = [
   [0, 0.05], // the heart: ~60 m visibility
   [46, 0.046],
-  [95, 0.034], // the hollows
-  [150, 0.022], // the bulwark approach
-  [195, 0.012], // the scree
-  [215, 0.006], // the drift: ~500 m — see the whole ball
-  [600, 0.005],
+  [90, 0.036], // the hollows
+  [130, 0.026], // inside the crust wall
+  [168, 0.016], // the warrens / scree, hugging the crust
+  [195, 0.008], // the drift: water clears fast
+  [600, 0.0055], // spawn: see the whole glowing ball
 ];
 const FOG_DENSITY = FOG_BANDS[FOG_BANDS.length - 1][1]; // initial (spawn is outside)
 
@@ -131,8 +131,8 @@ export function initGraphics(container) {
   // Natural deep-water base light: faint sickly green murk, near-black below.
   // Slightly stronger than realistic so the ball's silhouette reads from the
   // drift; the per-zone bioluminescent veins do the rest of the storytelling.
-  scene.add(new THREE.HemisphereLight(0x14382e, 0x020604, 0.22));
-  const gloom = new THREE.DirectionalLight(0x11402f, 0.1);
+  scene.add(new THREE.HemisphereLight(0x33401c, 0x040502, 0.22));
+  const gloom = new THREE.DirectionalLight(0x3a4418, 0.1);
   gloom.position.set(2, 40, 1);
   scene.add(gloom);
 
@@ -223,8 +223,8 @@ function setupPostProcessing() {
         vec3 col = texture2D(tDiffuse, uv).rgb;
 
         float lum = dot(col, vec3(0.299, 0.587, 0.114));
-        col = mix(col, vec3(lum), 0.18);
-        col *= vec3(0.82, 1.02, 0.90); // murky green grade
+        col = mix(col, vec3(lum), 0.10);
+        col *= vec3(1.02, 1.0, 0.80); // warm gouda grade — kill the blue
 
         float d = distance(vUv, vec2(0.5));
         col *= smoothstep(0.88, 0.32, d);
@@ -315,10 +315,10 @@ function getHaloTexture() {
   canvas.width = canvas.height = size;
   const ctx = canvas.getContext("2d");
   const grad = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
-  grad.addColorStop(0, "rgba(255,255,255,0.9)");
-  grad.addColorStop(0.25, "rgba(220,240,255,0.35)");
-  grad.addColorStop(0.6, "rgba(180,220,255,0.08)");
-  grad.addColorStop(1, "rgba(150,200,255,0)");
+  grad.addColorStop(0, "rgba(255,252,240,0.9)");
+  grad.addColorStop(0.25, "rgba(255,238,200,0.35)");
+  grad.addColorStop(0.6, "rgba(235,210,150,0.08)");
+  grad.addColorStop(1, "rgba(215,185,120,0)");
   ctx.fillStyle = grad;
   ctx.fillRect(0, 0, size, size);
   haloTexture = new THREE.CanvasTexture(canvas);
@@ -326,7 +326,7 @@ function getHaloTexture() {
 }
 
 // Soft scatter glow around a lamp — light bleeding into the murk.
-function createHalo(size, opacity, color = 0xcfe6ff) {
+function createHalo(size, opacity, color = 0xf2e6c2) {
   const sprite = new THREE.Sprite(
     new THREE.SpriteMaterial({
       map: getHaloTexture(),
@@ -392,16 +392,16 @@ function createFlashlight() {
     new THREE.CircleGeometry(0.036, 16),
     new THREE.MeshStandardMaterial({
       color: 0xffffff,
-      emissive: 0xe8f4ff,
+      emissive: 0xfff3d0,
       emissiveIntensity: 6,
     }),
   );
   lens.position.z = -0.135;
   group.add(lens);
 
-  // Hot core: tight, shadow-casting.
+  // Hot core: tight, shadow-casting. Warm dive-torch tint.
   const spot = new THREE.SpotLight(
-    0xe8f2ff,
+    0xfff1cd,
     FLASHLIGHT_INTENSITY,
     65,
     0.3,
@@ -424,7 +424,7 @@ function createFlashlight() {
 
   // Wide soft spill — real torches leak a corona around the hotspot.
   const spill = new THREE.SpotLight(
-    0xbcd8ee,
+    0xe6d8ab,
     SPILL_INTENSITY,
     30,
     0.85,
@@ -440,7 +440,7 @@ function createFlashlight() {
   const beam = createVolumetricLight({
     length: 24,
     endRadius: 3.6,
-    tint: 0x8fc6ee,
+    tint: 0xd9c684,
     strength: 0.22,
   }).group;
   beam.position.z = -0.12;
@@ -546,7 +546,7 @@ function createSnow() {
         float lit = min(vLit, 1.2);
         // Barely visible in the dark; blazing motes inside a beam.
         float a = smoothstep(0.5, 0.08, d) * vAlpha * (0.10 + lit * 0.9);
-        vec3 col = mix(vec3(0.45, 0.55, 0.62), vec3(0.95, 0.98, 1.0), lit);
+        vec3 col = mix(vec3(0.5, 0.52, 0.42), vec3(1.0, 0.95, 0.8), lit);
         gl_FragColor = vec4(col * (1.0 + lit * 2.0), a);
       }
     `,
@@ -567,7 +567,7 @@ function createBubbles() {
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
 
   const material = new THREE.PointsMaterial({
-    color: 0x9fdcff,
+    color: 0xc9e6d4,
     size: 0.07,
     transparent: true,
     opacity: 0.28,
@@ -621,7 +621,7 @@ function createBursts() {
       void main() {
         float d = distance(gl_PointCoord, vec2(0.5));
         float ring = smoothstep(0.5, 0.30, d) - smoothstep(0.28, 0.05, d) * 0.55;
-        gl_FragColor = vec4(0.75, 0.90, 1.0, ring * vAlpha * 0.6);
+        gl_FragColor = vec4(0.92, 0.88, 0.68, ring * vAlpha * 0.6);
       }
     `,
   });
@@ -756,7 +756,7 @@ export function addPlayer(id, color) {
   // Headlamp rig — initially mounted on the pivot; reparented into the
   // hand-held torch once the model loads.
   const spot = new THREE.SpotLight(
-    0xdcecff,
+    0xffeec9,
     REMOTE_LAMP_INTENSITY,
     50,
     0.42,
@@ -775,7 +775,7 @@ export function addPlayer(id, color) {
   const beam = createVolumetricLight({
     length: 20,
     endRadius: 3.2,
-    tint: 0x9fd0f2,
+    tint: 0xd9c684,
     strength: 0.3,
   }).group;
   beam.position.set(0, 0.05, -0.6);
@@ -885,7 +885,7 @@ export function addPlayer(id, color) {
         new THREE.CircleGeometry(0.05, 12),
         new THREE.MeshStandardMaterial({
           color: 0xffffff,
-          emissive: 0xe8f4ff,
+          emissive: 0xfff3d0,
           emissiveIntensity: 5,
         }),
       );
