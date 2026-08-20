@@ -5,8 +5,8 @@ let peer = null;
 let connections = []; // active DataConnections (host may have several)
 
 const callbacks = {
-  onStateReceived: null, // (peerId, {x, y, z, yaw, pitch}) => void
-  onEventReceived: null, // (peerId, data) => void  (tp, etc.)
+  onStateReceived: null, // (peerId, {x, y, z, yaw, pitch, light, att}) => void
+  onEventReceived: null, // (peerId, data) => void  (drop, restart)
   onPeerConnected: null, // (peerId) => void
   onPeerDisconnected: null, // (peerId) => void
 };
@@ -184,15 +184,23 @@ function setupConnection(conn, { alreadyOpen = false } = {}) {
   });
 }
 
-// Send the local player's position, facing, and flashlight state.
-export function broadcastState(x, y, z, yaw = 0, pitch = 0, light = true) {
-  const payload = { type: "state", x, y, z, yaw, pitch, light };
+// Send the local player's position, facing, flashlight and bell-attach state.
+export function broadcastState(
+  x,
+  y,
+  z,
+  yaw = 0,
+  pitch = 0,
+  light = true,
+  att = false,
+) {
+  const payload = { type: "state", x, y, z, yaw, pitch, light, att };
   for (const conn of connections) {
     if (conn.open) conn.send(payload);
   }
 }
 
-// Send a one-off gameplay event (e.g. { kind: 'tp', x, z }).
+// Send a one-off gameplay event (e.g. { kind: 'drop', level: 2 }).
 export function sendEvent(data) {
   const payload = { type: "event", ...data };
   for (const conn of connections) {

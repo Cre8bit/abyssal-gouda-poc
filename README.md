@@ -2,6 +2,20 @@
 
 Minimal 3D underwater multiplayer prototype. 100% static frontend, hosted on GitHub Pages.
 
+## The Bell Descent
+
+No seafloor — pure open water. Everyone starts hooked onto the **diving bell**.
+Once every diver is attached, the bell falls **100 m**, stops dead, and shakes
+the crew off at random bearings around it. Swim back, press **E** to hook on
+again, and the bell drops another level. The water clouds over as you go: clear
+at the surface, murky at level 1, black from level 2 down. Depth is continuous —
+nothing loads or unloads between levels.
+
+The host owns the bell: it decides when everyone is aboard and broadcasts each
+drop (`src/bell.js` holds the state machine, `src/main.js` drives it). Ejection
+positions are drawn independently on each client, so no positions cross the wire
+beyond the normal 30 Hz state stream.
+
 ## Stack
 
 - **Vite** — bundling & dev server
@@ -19,7 +33,7 @@ npm run dev
 
 1. Player 1 clicks **Host Game**, then **Copy invite link** (or shares the ID).
 2. Player 2 opens the invite link (auto-joins), or clicks **Join Game** and enters the ID.
-3. Swim with **ZQSD/WASD** (layout-agnostic), look with the mouse, **Space/Shift** to rise/sink, **F** flashlight, **T** scatter, **V** mute voice.
+3. Swim with **ZQSD/WASD** (layout-agnostic), look with the mouse, **Space/Shift** to rise/sink, **F** flashlight, **E** hook on / release the bell, **R** restart the dive, **V** mute voice.
 
 ## Testing locally (two windows)
 

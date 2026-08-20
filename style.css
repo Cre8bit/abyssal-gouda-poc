@@ -168,7 +168,7 @@ button:active {
   opacity: 0.75;
 }
 
-/* Event feed: transient torch/scatter notifications stacked on the side,
+/* Event feed: transient torch/bell notifications stacked on the side,
    like a chat log (fades on its own, unlike the connection #status panel
    which stays until dismissed). */
 #event-center {
@@ -201,7 +201,17 @@ button:active {
   transform: translateX(0);
 }
 
-#scatter-btn {
+#bell-prompt {
+  position: absolute;
+  bottom: 4rem;
+  left: 50%;
+  transform: translateX(-50%);
+  font-size: 0.9rem;
+  letter-spacing: 0.05em;
+  text-shadow: 0 0 8px rgba(0, 20, 40, 0.9);
+}
+
+#restart-btn {
   position: absolute;
   bottom: 1.25rem;
   right: 1.5rem;

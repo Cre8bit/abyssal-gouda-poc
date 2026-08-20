@@ -17,10 +17,11 @@
     <!-- Dive HUD -->
     <div id="hud" class="hidden">
       <canvas id="compass" width="420" height="26"></canvas>
-      <div id="depth">▼ 0 m</div>
+      <div id="depth">LVL 0 · ▼ 0 m</div>
+      <div id="bell-prompt"></div>
       <div id="voice-indicator">VOICE · off</div>
       <div id="event-center"></div>
-      <button id="scatter-btn" class="hidden">⤨ Scatter (T)</button>
+      <button id="restart-btn">⟲ Restart (R)</button>
       <button id="mini-copy-link-btn" class="hidden" title="Copy invite link">
         📋
       </button>
@@ -30,13 +31,13 @@
     <div id="ui-overlay">
       <div id="menu" class="panel">
         <h1>Abyssal</h1>
-        <p class="subtitle">Underwater P2P prototype</p>
+        <p class="subtitle">The bell descent — underwater P2P prototype</p>
         <button id="host-btn">Host Game</button>
         <button id="join-btn">Join Game</button>
         <p class="hint">
           Click the scene to look around · ZQSD/WASD to swim<br />Space / Shift
-          to rise & sink · F flashlight · T scatter · V mute<br />Esc to release
-          the mouse
+          to rise & sink · F flashlight · V mute<br />E hook on / release the
+          bell · R restart the dive<br />Esc to release the mouse
         </p>
       </div>
 

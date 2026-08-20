@@ -22,10 +22,18 @@ import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPa
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
 
-const ABYSS_COLOR = 0x00070a;
-const FOG_DENSITY = 0.05;
+// Water clarity per bell level: clear, medium dark, then dark forever after.
+// `ambient` scales the base deep-water lights.
+const WATER_LOOKS = [
+  { fog: 0.014, color: 0x0a3348, ambient: 2.4 },
+  { fog: 0.038, color: 0x03141d, ambient: 1.0 },
+  { fog: 0.075, color: 0x00070a, ambient: 0.35 },
+];
+const WATER_FADE = 0.8; // per-second lerp toward the current level's look
 
-const TERRAIN_SIZE = 340;
+const HEMI_BASE = 0.16;
+const GLOOM_BASE = 0.08;
+
 const SNOW_COUNT = 1500;
 const SNOW_RADIUS = 30;
 const BUBBLE_COUNT = 160;
@@ -50,11 +58,21 @@ let snow;
 let bubbles;
 let bursts; // { points, states: [{origin, age, duration, delay}] }
 let flashlight; // { group, spot, spill, beam, lens, halo, on }
+let bellGroup;
 let bellLight;
+let bellBeacon;
+let hemiLight;
+let gloomLight;
 let elapsed = 0;
 let moveFactor = 0;
 let resizeFrame = null;
 let nextShadowUpdate = 0;
+
+let waterTarget = WATER_LOOKS[0];
+const waterCurrent = {
+  fog: WATER_LOOKS[0].fog,
+  ambient: WATER_LOOKS[0].ambient,
+};
 
 const players = new Map();
 const noise = new ImprovedNoise();
@@ -62,6 +80,7 @@ const beamMaterials = []; // all volumetric beam materials (share uTime)
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
 const _v3 = new THREE.Vector3();
+const _c1 = new THREE.Color();
 const _q1 = new THREE.Quaternion();
 const _q2 = new THREE.Quaternion();
 const _q3 = new THREE.Quaternion();
@@ -79,18 +98,10 @@ function renderPixelRatio() {
   return Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO);
 }
 
-export function terrainHeight(x, z) {
-  let h = 0;
-  h += noise.noise(x * 0.011, z * 0.011, 0.5) * 10;
-  h += noise.noise(x * 0.045, z * 0.045, 17.7) * 2.4;
-  h += noise.noise(x * 0.16, z * 0.16, 31.4) * 0.5;
-  return h - 4;
-}
-
 export function initGraphics(container) {
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(ABYSS_COLOR);
-  scene.fog = new THREE.FogExp2(ABYSS_COLOR, FOG_DENSITY);
+  scene.background = new THREE.Color(WATER_LOOKS[0].color);
+  scene.fog = new THREE.FogExp2(WATER_LOOKS[0].color, WATER_LOOKS[0].fog);
 
   camera = new THREE.PerspectiveCamera(
     72,
@@ -118,14 +129,14 @@ export function initGraphics(container) {
 
   setupPostProcessing();
 
-  // Natural deep-water base light: faint cool sky vs dead-black floor.
-  scene.add(new THREE.HemisphereLight(0x0e2b42, 0x010407, 0.16));
-  const gloom = new THREE.DirectionalLight(0x0e3149, 0.08);
-  gloom.position.set(2, 40, 1);
-  scene.add(gloom);
+  // Natural deep-water base light: faint cool sky vs dead-black below.
+  hemiLight = new THREE.HemisphereLight(0x0e2b42, 0x010407, HEMI_BASE);
+  scene.add(hemiLight);
+  gloomLight = new THREE.DirectionalLight(0x0e3149, GLOOM_BASE);
+  gloomLight.position.set(2, 40, 1);
+  scene.add(gloomLight);
+  applyWaterLook();
 
-  createTerrain();
-  scatterRocks();
   createDivingBell();
   createFlashlight();
   createSnow();
@@ -326,56 +337,6 @@ function createVolumetricLight({ length, endRadius, tint, strength }) {
 
 // --- World -----------------------------------------------------------------
 
-function createTerrain() {
-  const segments = 170;
-  const geometry = new THREE.PlaneGeometry(
-    TERRAIN_SIZE,
-    TERRAIN_SIZE,
-    segments,
-    segments,
-  );
-  geometry.rotateX(-Math.PI / 2);
-
-  const pos = geometry.attributes.position;
-  for (let i = 0; i < pos.count; i++) {
-    pos.setY(i, terrainHeight(pos.getX(i), pos.getZ(i)));
-  }
-  geometry.computeVertexNormals();
-
-  const terrain = new THREE.Mesh(
-    geometry,
-    new THREE.MeshStandardMaterial({
-      color: 0x14252e,
-      roughness: 0.95,
-      metalness: 0.02,
-    }),
-  );
-  terrain.receiveShadow = true;
-  scene.add(terrain);
-}
-
-function scatterRocks() {
-  const material = new THREE.MeshStandardMaterial({
-    color: 0x1b2a33,
-    roughness: 1,
-  });
-  for (let i = 0; i < 70; i++) {
-    const size = 0.4 + Math.random() * 2.6;
-    const rock = new THREE.Mesh(
-      new THREE.DodecahedronGeometry(size, 0),
-      material,
-    );
-    const x = (Math.random() - 0.5) * 220;
-    const z = (Math.random() - 0.5) * 220;
-    rock.position.set(x, terrainHeight(x, z) + size * 0.25, z);
-    rock.rotation.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
-    rock.scale.y = 0.45 + Math.random() * 0.6;
-    rock.castShadow = true;
-    rock.receiveShadow = true;
-    scene.add(rock);
-  }
-}
-
 function createDivingBell() {
   const group = new THREE.Group();
   const metal = new THREE.MeshStandardMaterial({
@@ -431,10 +392,39 @@ function createDivingBell() {
     if (i === 2) bellLight = { light, bulb: bulb, halo, mat: bulbMat };
   }
 
-  const x = 0;
-  const z = -14;
-  group.position.set(x, terrainHeight(x, z) + 0.2, z);
+  // Fog is disabled on the beacon so the bell stays findable from the dark.
+  bellBeacon = createHalo(1.5, 0.85);
+  bellBeacon.material.fog = false;
+  bellBeacon.position.y = 3.6;
+  group.add(bellBeacon);
+
+  group.position.set(0, 0, 0);
   scene.add(group);
+  bellGroup = group;
+}
+
+export function setBellY(y) {
+  bellGroup.position.y = y;
+}
+
+export function setWaterLevel(level) {
+  waterTarget = WATER_LOOKS[Math.min(level, WATER_LOOKS.length - 1)];
+}
+
+function applyWaterLook() {
+  scene.fog.density = waterCurrent.fog;
+  hemiLight.intensity = HEMI_BASE * waterCurrent.ambient;
+  gloomLight.intensity = GLOOM_BASE * waterCurrent.ambient;
+}
+
+// Eased so a level change reads as the water thickening around you, not a cut.
+function updateWater(delta) {
+  const k = Math.min(delta * WATER_FADE, 1);
+  waterCurrent.fog += (waterTarget.fog - waterCurrent.fog) * k;
+  waterCurrent.ambient += (waterTarget.ambient - waterCurrent.ambient) * k;
+  scene.fog.color.lerp(_c1.set(waterTarget.color), k);
+  scene.background.copy(scene.fog.color);
+  applyWaterLook();
 }
 
 function createFlashlight() {
@@ -703,9 +693,11 @@ function createBursts() {
 function respawnBurst(state) {
   const angle = Math.random() * Math.PI * 2;
   const dist = 5 + Math.random() * 13;
-  const x = camera.position.x + Math.cos(angle) * dist;
-  const z = camera.position.z + Math.sin(angle) * dist;
-  state.origin.set(x, terrainHeight(x, z) + 0.3, z);
+  state.origin.set(
+    camera.position.x + Math.cos(angle) * dist,
+    camera.position.y - (6 + Math.random() * 10),
+    camera.position.z + Math.sin(angle) * dist,
+  );
   state.age = -(3 + Math.random() * 9);
   state.duration = 3.2 + Math.random() * 1.6;
 }
@@ -1111,6 +1103,7 @@ function updateBellLight(delta) {
   const lit = bellLight.light.intensity / 14;
   bellLight.mat.emissiveIntensity = 3 * lit;
   bellLight.halo.material.opacity = 0.3 * lit;
+  bellBeacon.material.opacity = 0.55 + 0.3 * lit;
 }
 
 function animateFlashlight() {
@@ -1184,6 +1177,7 @@ export function renderLoop(onFrame) {
 
     animateFlashlight();
     updateBellLight(delta);
+    updateWater(delta);
 
     if (onFrame) onFrame(delta);
 
