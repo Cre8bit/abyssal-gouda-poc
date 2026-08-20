@@ -10,6 +10,9 @@ import {
   setPlayerLight,
   setBellY,
   setWaterLevel,
+  setDread,
+  setPlankton,
+  flashBellAlarm,
 } from "./graphics.js";
 import {
   hostGame,
@@ -45,7 +48,17 @@ import {
   distanceToBell,
   ATTACH_RADIUS,
   SETTLE_DELAY,
+  ALARM_PERIOD,
+  DROP_DURATION,
 } from "./bell.js";
+import { planktonDensity } from "./plankton.js";
+import {
+  initSonar,
+  playPing,
+  playDescent,
+  playCreak,
+  setDroneDepth,
+} from "./sonar.js";
 import {
   initVoice,
   callPeer,
@@ -89,6 +102,8 @@ let attached = true;
 let mySlot = slotOffset("solo");
 let isHost = false;
 let settleTimer = -1; // counts down between the bell's stop and the ejection
+let alarmTimer = ALARM_PERIOD;
+let creakTimer = 12;
 
 const remoteBuffers = new Map(); // peerId -> SnapshotBuffer
 const remoteAttached = new Map(); // peerId -> bool
@@ -97,6 +112,11 @@ const remoteAttached = new Map(); // peerId -> bool
 const canvas = initGraphics(document.getElementById("scene-container"));
 initInput();
 initMouseLook(canvas);
+
+// Browsers block audio until the page has been interacted with.
+const startAudio = () => initSonar();
+window.addEventListener("pointerdown", startAudio, { once: true });
+window.addEventListener("keydown", startAudio, { once: true });
 
 // --- UI handlers ---
 hostBtn.addEventListener("click", async () => {
@@ -289,6 +309,7 @@ onStateReceived((peerId, { x, y, z, yaw, pitch, light, att }) => {
 onEventReceived((peerId, data) => {
   if (data.kind === "drop") {
     startDrop(data.level);
+    playDescent(DROP_DURATION);
     showEvent(`▼ The bell drops to level ${data.level}…`);
   } else if (data.kind === "sync") {
     snapToLevel(data.level);
@@ -338,6 +359,7 @@ renderLoop((delta) => {
   if (isHost && settleTimer < 0 && readyToDrop(delta, hooked, crew)) {
     const level = bell.level + 1;
     startDrop(level);
+    playDescent(DROP_DURATION);
     sendEvent({ kind: "drop", level });
     showEvent(`▼ The bell drops to level ${level}…`);
   }
@@ -381,17 +403,51 @@ renderLoop((delta) => {
   const speed = Math.hypot(velocity.x, velocity.y, velocity.z) / MAX_SPEED;
   updateCamera(localPosition, yaw, pitch, Math.min(speed, 1));
 
-  // 7. Spatial audio listener follows the camera.
+  // 7. The abyss gets heavier from the second ejection depth down, and blooms
+  //    thicken the water wherever you happen to be swimming.
+  const dread = clamp((bell.level - 1) / 2, 0, 1);
+  setDread(dread);
+  setDroneDepth(dread);
+  setPlankton(
+    planktonDensity(
+      localPosition.x,
+      localPosition.y,
+      localPosition.z,
+      bell.level,
+    ),
+  );
+
+  // 8. The bell's alarm: red flash on the hull, and a ping panned toward it.
+  const bellDist = distanceToBell(localPosition);
+  alarmTimer -= delta;
+  if (alarmTimer <= 0) {
+    alarmTimer = ALARM_PERIOD;
+    const span = Math.hypot(localPosition.x, localPosition.z) || 1;
+    const pan =
+      (-localPosition.x * Math.cos(yaw) + localPosition.z * Math.sin(yaw)) /
+      span;
+    flashBellAlarm();
+    playPing(bellDist, pan);
+  }
+
+  // Something shifting out in the dark, on no schedule you can learn.
+  creakTimer -= delta;
+  if (creakTimer <= 0) {
+    creakTimer = 9 + Math.random() * 22;
+    playCreak();
+  }
+
+  // 9. Spatial audio listener follows the camera.
   setListenerPose(localPosition, yaw, pitch);
 
-  // 8. Broadcast local state, throttled.
+  // 10. Broadcast local state, throttled.
   networkTimer += delta;
   if (networkTimer >= NETWORK_RATE) {
     networkTimer = 0;
     broadcastNow();
   }
 
-  // 9. Smooth remote players from interpolation buffers + move their voices.
+  // 11. Smooth remote players from interpolation buffers + move their voices.
   for (const [peerId, buffer] of remoteBuffers) {
     const s = buffer.sample();
     if (s) {
@@ -400,9 +456,8 @@ renderLoop((delta) => {
     }
   }
 
-  // 10. HUD.
-  const bellDist = distanceToBell(localPosition);
-  drawCompass(yaw, Math.atan2(-localPosition.x, localPosition.z));
+  // 12. HUD.
+  drawCompass(yaw);
   depthText.textContent = `LVL ${bell.level} · ▼ ${Math.max(0, Math.round(-localPosition.y))} m`;
   bellPrompt.textContent = attached
     ? `⚓ Hooked on — ${hooked}/${crew} aboard · E to release`
@@ -424,7 +479,7 @@ const CARDINALS = {
   315: "NW",
 };
 
-function drawCompass(yaw, bellBearing) {
+function drawCompass(yaw) {
   const w = compassCanvas.width;
   const h = compassCanvas.height;
   const ctx = compassCtx;
@@ -455,21 +510,7 @@ function drawCompass(yaw, bellBearing) {
     }
   }
 
-  // Bell marker, pinned to the strip edge when it is behind you, so the arrow
-  // always says which way to turn.
-  const bellDeg = (bellBearing * 180) / Math.PI;
-  const rel = ((((bellDeg - heading + 540) % 360) + 360) % 360) - 180;
-  const bx = w / 2 + clamp(rel, -60, 60) * pxPerDeg;
-  ctx.fillStyle = "rgba(255, 205, 130, 0.95)";
-  ctx.beginPath();
-  ctx.moveTo(bx, 10);
-  ctx.lineTo(bx - 5, 1);
-  ctx.lineTo(bx + 5, 1);
-  ctx.closePath();
-  ctx.fill();
-
   // Center marker.
-  ctx.fillStyle = "rgba(210, 235, 250, 0.85)";
   ctx.fillRect(w / 2 - 1, h - 12, 2, 12);
 }
 

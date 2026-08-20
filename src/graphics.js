@@ -22,14 +22,19 @@ import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPa
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
 
-// Water clarity per bell level: clear, medium dark, then dark forever after.
-// `ambient` scales the base deep-water lights.
+// Water look per level: the backdrop colour and how much base light survives.
+// There is no distance fog — the bell has to stay visible from anywhere.
 const WATER_LOOKS = [
-  { fog: 0.014, color: 0x0a3348, ambient: 2.4 },
-  { fog: 0.038, color: 0x03141d, ambient: 1.0 },
-  { fog: 0.075, color: 0x00070a, ambient: 0.35 },
+  { color: 0x0b2c3a, ambient: 1.8 },
+  { color: 0x05161e, ambient: 0.7 },
+  { color: 0x000406, ambient: 0.18 },
 ];
 const WATER_FADE = 0.8; // per-second lerp toward the current level's look
+const ALARM_FLASH = 1.1; // seconds for the red flash to bleed out
+
+// Plankton blooms: a visible veil that drowns out light, but never visibility.
+const PLANKTON_COUNT = 2400;
+const PLANKTON_RADIUS = 26;
 
 const HEMI_BASE = 0.16;
 const GLOOM_BASE = 0.08;
@@ -56,23 +61,26 @@ let composer;
 let horrorPass;
 let snow;
 let bubbles;
+let plankton;
 let bursts; // { points, states: [{origin, age, duration, delay}] }
 let flashlight; // { group, spot, spill, beam, lens, halo, on }
 let bellGroup;
 let bellLight;
 let bellBeacon;
+let bellAlarm; // { light, halo, mat, t, strength }
 let hemiLight;
 let gloomLight;
+let volumetric; // the local flashlight's beam materials, for the failing-lamp flicker
+let dread = 0; // 0 near the surface, 1 in the dark — drives every horror effect
+let murk = 0; // plankton density where the camera is
 let elapsed = 0;
 let moveFactor = 0;
 let resizeFrame = null;
 let nextShadowUpdate = 0;
 
 let waterTarget = WATER_LOOKS[0];
-const waterCurrent = {
-  fog: WATER_LOOKS[0].fog,
-  ambient: WATER_LOOKS[0].ambient,
-};
+const waterColor = new THREE.Color(WATER_LOOKS[0].color);
+const waterCurrent = { ambient: WATER_LOOKS[0].ambient };
 
 const players = new Map();
 const noise = new ImprovedNoise();
@@ -101,13 +109,12 @@ function renderPixelRatio() {
 export function initGraphics(container) {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(WATER_LOOKS[0].color);
-  scene.fog = new THREE.FogExp2(WATER_LOOKS[0].color, WATER_LOOKS[0].fog);
 
   camera = new THREE.PerspectiveCamera(
     72,
     window.innerWidth / window.innerHeight,
     0.1,
-    150,
+    1200,
   );
   camera.rotation.order = "YXZ";
   camera.position.set(0, 2, 8);
@@ -140,6 +147,7 @@ export function initGraphics(container) {
   createDivingBell();
   createFlashlight();
   createSnow();
+  createPlankton();
   createBubbles();
   createBursts();
 
@@ -164,6 +172,8 @@ function setupPostProcessing() {
     uniforms: {
       tDiffuse: { value: null },
       uTime: { value: 0 },
+      uDread: { value: 0 },
+      uMurk: { value: 0 },
     },
     vertexShader: /* glsl */ `
       varying vec2 vUv;
@@ -175,23 +185,83 @@ function setupPostProcessing() {
     fragmentShader: /* glsl */ `
       uniform sampler2D tDiffuse;
       uniform float uTime;
+      uniform float uDread;
+      uniform float uMurk;
       varying vec2 vUv;
 
+      float hash(vec2 p) {
+        return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+      }
+
+      float vnoise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        vec2 u = f * f * (3.0 - 2.0 * f);
+        return mix(
+          mix(hash(i), hash(i + vec2(1.0, 0.0)), u.x),
+          mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), u.x),
+          u.y
+        );
+      }
+
       void main() {
-        vec2 uv = vUv;
-        uv += vec2(
-          sin(uv.y * 18.0 + uTime * 0.35),
-          cos(uv.x * 15.0 - uTime * 0.28)
-        ) * 0.00035;
+        vec2 c = vUv - 0.5;
+        float r2 = dot(c, c);
 
-        vec3 col = texture2D(tDiffuse, uv).rgb;
+        // The faceplate swells with your breathing, harder the deeper you are.
+        float breath = 1.0 + sin(uTime * 0.55) * 0.0018 * (1.0 + uDread * 2.5);
+        vec2 uv = c * breath + 0.5;
 
+        // Water crawling over the glass: two octaves, so it never reads as a sine.
+        vec2 flow = vec2(
+          vnoise(uv * 6.0 + vec2(uTime * 0.09, uTime * 0.05)),
+          vnoise(uv * 6.0 + vec2(11.3 - uTime * 0.07, 4.1 + uTime * 0.06))
+        ) - 0.5;
+        flow += (vec2(
+          vnoise(uv * 17.0 - uTime * 0.13),
+          vnoise(uv * 17.0 + 7.7 + uTime * 0.11)
+        ) - 0.5) * 0.45;
+        uv += flow * (0.0016 + uDread * 0.0022 + uMurk * 0.004);
+
+        // Curved glass: colour splits toward the rim...
+        float ab = (0.0016 + uDread * 0.005) * r2 * 4.0;
+        vec3 col;
+        col.r = texture2D(tDiffuse, uv + c * ab).r;
+        col.g = texture2D(tDiffuse, uv).g;
+        col.b = texture2D(tDiffuse, uv - c * ab).b;
+
+        // ...and smears radially, sharp in the middle, soft at the edges.
+        float smear = r2 * (0.045 + uDread * 0.05);
+        col += texture2D(tDiffuse, uv - c * smear).rgb * 0.35;
+        col += texture2D(tDiffuse, uv - c * smear * 2.0).rgb * 0.18;
+        col /= 1.53;
+
+        // Salt and grease baked onto the visor — it only shows when lit.
+        float smudge = vnoise(vUv * vec2(9.0, 22.0)) * vnoise(vUv * 31.0 + 3.0);
+        col += smudge * dot(col, vec3(0.299, 0.587, 0.114)) * 0.5;
+
+        // Grade: colour drains, shadows go cold, blacks crush to nothing.
         float lum = dot(col, vec3(0.299, 0.587, 0.114));
-        col = mix(col, vec3(lum), 0.22);
-        col *= vec3(0.74, 0.94, 1.07);
+        col = mix(col, vec3(lum), 0.24 + uDread * 0.34 + uMurk * 0.20);
+        col *= vec3(0.70, 0.94, 1.02);
+        col += vec3(0.0, 0.020, 0.016) * (1.0 - smoothstep(0.0, 0.35, lum));
+        col = max(col - (0.010 + uDread * 0.012), 0.0);
+        col = pow(col, vec3(1.0 + uDread * 0.16));
 
-        float d = distance(vUv, vec2(0.5));
-        col *= smoothstep(0.88, 0.32, d);
+        // Inside a bloom the water itself turns sickly and green.
+        col = mix(
+          col,
+          col * vec3(0.55, 0.82, 0.62) + vec3(0.012, 0.030, 0.020),
+          uMurk * 0.75
+        );
+
+        // The dark closes in with depth, and faster inside a bloom.
+        float d = length(c);
+        col *= smoothstep(0.92 - uDread * 0.32 - uMurk * 0.16, 0.30 - uDread * 0.10, d);
+
+        // Sensor grain — worst where there is no light for it to work with.
+        float grain = hash(vUv * 900.0 + fract(uTime) * 91.0) - 0.5;
+        col += grain * (0.012 + uDread * 0.045 + uMurk * 0.020);
 
         gl_FragColor = vec4(col, 1.0);
       }
@@ -392,15 +462,75 @@ function createDivingBell() {
     if (i === 2) bellLight = { light, bulb: bulb, halo, mat: bulbMat };
   }
 
-  // Fog is disabled on the beacon so the bell stays findable from the dark.
+  // Always-on marker: this is what guarantees the bell is never lost.
   bellBeacon = createHalo(1.5, 0.85);
-  bellBeacon.material.fog = false;
   bellBeacon.position.y = 3.6;
   group.add(bellBeacon);
+
+  // Suspension cable running up out of sight — the only way home.
+  const cable = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.08, 0.08, 120, 6),
+    new THREE.MeshStandardMaterial({
+      color: 0x090e11,
+      roughness: 0.95,
+      metalness: 0.3,
+    }),
+  );
+  cable.position.y = 64.6;
+  cable.frustumCulled = false;
+  group.add(cable);
+
+  // Red alarm lamp: dark until it fires, then it floods the water around it.
+  const alarmMat = new THREE.MeshStandardMaterial({
+    color: 0x220404,
+    emissive: 0xff1c08,
+    emissiveIntensity: 0,
+  });
+  const alarmBulb = new THREE.Mesh(
+    new THREE.SphereGeometry(0.17, 10, 10),
+    alarmMat,
+  );
+  alarmBulb.position.set(0, 4.85, 0);
+  group.add(alarmBulb);
+  const alarmLight = new THREE.PointLight(0xff2a10, 0, 90, 1.5);
+  alarmLight.position.copy(alarmBulb.position);
+  group.add(alarmLight);
+  const alarmHalo = createHalo(3.4, 0, 0xff3418);
+  alarmHalo.position.copy(alarmBulb.position);
+  group.add(alarmHalo);
+  bellAlarm = { light: alarmLight, halo: alarmHalo, mat: alarmMat, t: 1, strength: 1 };
 
   group.position.set(0, 0, 0);
   scene.add(group);
   bellGroup = group;
+}
+
+// `strength` is unused now that the flash lives entirely on the bell.
+export function flashBellAlarm() {
+  bellAlarm.t = 0;
+}
+
+// 0 near the surface, 1 in the dark. Drives the shader, the lamp and the water.
+export function setDread(value) {
+  dread = value;
+  horrorPass.uniforms.uDread.value = value;
+}
+
+// Plankton density (0..1) where the diver is standing.
+export function setPlankton(value) {
+  murk = value;
+  plankton.material.uniforms.uDensity.value = value;
+  plankton.visible = value > 0.001;
+  horrorPass.uniforms.uMurk.value = value;
+}
+
+function updateAlarm(delta) {
+  if (bellAlarm.t >= 1) return;
+  bellAlarm.t = Math.min(bellAlarm.t + delta / ALARM_FLASH, 1);
+  const fade = Math.pow(1 - bellAlarm.t, 2.2);
+  bellAlarm.light.intensity = 420 * fade;
+  bellAlarm.mat.emissiveIntensity = 7 * fade;
+  bellAlarm.halo.material.opacity = 0.8 * fade;
 }
 
 export function setBellY(y) {
@@ -408,22 +538,22 @@ export function setBellY(y) {
 }
 
 export function setWaterLevel(level) {
-  waterTarget = WATER_LOOKS[Math.min(level, WATER_LOOKS.length - 1)];
+  // Level 1 is the first depth you get thrown out at, and it is the clear one.
+  const i = Math.min(Math.max(level - 1, 0), WATER_LOOKS.length - 1);
+  waterTarget = WATER_LOOKS[i];
 }
 
 function applyWaterLook() {
-  scene.fog.density = waterCurrent.fog;
   hemiLight.intensity = HEMI_BASE * waterCurrent.ambient;
   gloomLight.intensity = GLOOM_BASE * waterCurrent.ambient;
 }
 
-// Eased so a level change reads as the water thickening around you, not a cut.
+// Eased so a level change reads as the light dying around you, not a cut.
 function updateWater(delta) {
   const k = Math.min(delta * WATER_FADE, 1);
-  waterCurrent.fog += (waterTarget.fog - waterCurrent.fog) * k;
   waterCurrent.ambient += (waterTarget.ambient - waterCurrent.ambient) * k;
-  scene.fog.color.lerp(_c1.set(waterTarget.color), k);
-  scene.background.copy(scene.fog.color);
+  waterColor.lerp(_c1.set(waterTarget.color), k);
+  scene.background.copy(waterColor);
   applyWaterLook();
 }
 
@@ -486,12 +616,13 @@ function createFlashlight() {
 
   // Long volumetric beam — core + haze + dispersal halos, visible even
   // with no floor in sight.
-  const beam = createVolumetricLight({
+  volumetric = createVolumetricLight({
     length: 24,
     endRadius: 3.6,
     tint: 0x8fc6ee,
     strength: 0.22,
-  }).group;
+  });
+  const beam = volumetric.group;
   beam.position.z = -0.12;
   group.add(beam);
 
@@ -603,6 +734,66 @@ function createSnow() {
 
   snow = new THREE.Points(geometry, material);
   scene.add(snow);
+}
+
+// A dense mote veil that materialises inside a bloom — purely something to
+// look at and to drown the lamps in, since nothing here costs you visibility.
+function createPlankton() {
+  const positions = new Float32Array(PLANKTON_COUNT * 3);
+  const scales = new Float32Array(PLANKTON_COUNT);
+  const offsets = new Float32Array(PLANKTON_COUNT);
+
+  for (let i = 0; i < PLANKTON_COUNT; i++) {
+    positions[i * 3] = (Math.random() - 0.5) * 2 * PLANKTON_RADIUS;
+    positions[i * 3 + 1] = (Math.random() - 0.5) * 2 * PLANKTON_RADIUS;
+    positions[i * 3 + 2] = (Math.random() - 0.5) * 2 * PLANKTON_RADIUS;
+    scales[i] = 0.4 + Math.random() * 1.4;
+    offsets[i] = Math.random() * 100;
+  }
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("aScale", new THREE.BufferAttribute(scales, 1));
+  geometry.setAttribute("aOffset", new THREE.BufferAttribute(offsets, 1));
+
+  const material = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    uniforms: {
+      uTime: { value: 0 },
+      uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
+      uDensity: { value: 0 },
+    },
+    vertexShader: /* glsl */ `
+      uniform float uTime;
+      uniform float uPixelRatio;
+      attribute float aScale;
+      attribute float aOffset;
+      varying float vAlpha;
+      void main() {
+        vec3 p = position;
+        p.x += sin(uTime * 0.5 + aOffset) * 0.35;
+        p.y += cos(uTime * 0.4 + aOffset * 1.3) * 0.25;
+        p.z += cos(uTime * 0.45 + aOffset * 1.7) * 0.35;
+        vec4 mv = modelViewMatrix * vec4(p, 1.0);
+        gl_PointSize = aScale * uPixelRatio * (34.0 / -mv.z);
+        vAlpha = smoothstep(26.0, 1.5, -mv.z);
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      uniform float uDensity;
+      varying float vAlpha;
+      void main() {
+        float d = distance(gl_PointCoord, vec2(0.5));
+        float a = smoothstep(0.5, 0.10, d) * vAlpha * uDensity * 0.55;
+        gl_FragColor = vec4(0.40, 0.55, 0.43, a);
+      }
+    `,
+  });
+
+  plankton = new THREE.Points(geometry, material);
+  scene.add(plankton);
 }
 
 function createBubbles() {
@@ -1088,6 +1279,10 @@ export function updateCamera(playerPos, yaw, pitch, speed = 0) {
   camera.position.set(playerPos.x, playerPos.y, playerPos.z);
   camera.rotation.y = yaw;
   camera.rotation.x = pitch;
+  // Breathing roll — a body hanging in water is never perfectly level.
+  camera.rotation.z =
+    Math.sin(elapsed * 0.62) * 0.013 * (1 + dread * 1.6) +
+    Math.sin(elapsed * 0.21) * 0.006;
   moveFactor += (speed - moveFactor) * 0.05;
 }
 
@@ -1103,7 +1298,12 @@ function updateBellLight(delta) {
   const lit = bellLight.light.intensity / 14;
   bellLight.mat.emissiveIntensity = 3 * lit;
   bellLight.halo.material.opacity = 0.3 * lit;
+
+  // The beacon grows with range so the bell never shrinks below a visible
+  // point, however far you drift — nothing is allowed to hide it.
   bellBeacon.material.opacity = 0.55 + 0.3 * lit;
+  const range = camera.position.distanceTo(bellGroup.position);
+  bellBeacon.scale.setScalar(Math.max(1.5, range * 0.03));
 }
 
 function animateFlashlight() {
@@ -1115,6 +1315,21 @@ function animateFlashlight() {
     -0.28 + Math.sin(t * 2.3) * 0.008 + Math.sin(t * 3.7) * 0.005 * moveFactor;
   flashlight.group.rotation.z = Math.sin(t * 0.9) * 0.01 * bob;
   flashlight.group.rotation.x = 0.03 + Math.sin(t * 1.7) * 0.008 * bob;
+
+  // Failing lamp: stutters and throws shorter the deeper you go, and blooms
+  // scatter what is left of it back into your face.
+  const wobble = Math.max(0, noise.noise(t * 7.0, 3.3, 0));
+  const dropout = noise.noise(t * 1.3, 71.0, 0) > 0.45 ? 0.72 : 0;
+  const choke = 1 - murk * 0.72;
+  const stutter =
+    Math.max(0.08, 1 - dread * (0.6 * wobble * wobble + dropout)) * choke;
+  flashlight.spot.intensity = FLASHLIGHT_INTENSITY * stutter;
+  flashlight.spill.intensity = SPILL_INTENSITY * stutter;
+  flashlight.spot.distance = 65 * (1 - dread * 0.35) * (1 - murk * 0.6);
+  flashlight.lens.material.emissiveIntensity = flashlight.on ? 6 * stutter : 0.05;
+  flashlight.halo.material.opacity = 0.28 * stutter;
+  volumetric.beam.material.uniforms.uIntensity.value = stutter;
+  volumetric.haze.material.uniforms.uIntensity.value = stutter;
 }
 
 // Feed the snow shader the two beam poses (local + first remote).
@@ -1167,16 +1382,21 @@ export function renderLoop(onFrame) {
     elapsed = clock.elapsedTime;
 
     snow.material.uniforms.uTime.value = elapsed;
+    plankton.material.uniforms.uTime.value = elapsed;
     horrorPass.uniforms.uTime.value = elapsed;
     for (const mat of beamMaterials) mat.uniforms.uTime.value = elapsed;
 
     const drift = currentDrift();
     wrapAroundCamera(snow, SNOW_RADIUS, -0.22, delta, drift);
+    if (plankton.visible) {
+      wrapAroundCamera(plankton, PLANKTON_RADIUS, -0.06, delta, drift);
+    }
     wrapAroundCamera(bubbles, BUBBLE_RADIUS, 0.85, delta, drift);
     updateBursts(delta);
 
     animateFlashlight();
     updateBellLight(delta);
+    updateAlarm(delta);
     updateWater(delta);
 
     if (onFrame) onFrame(delta);

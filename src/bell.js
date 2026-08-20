@@ -4,9 +4,10 @@
 export const LEVEL_DROP = 100; // metres between levels
 export const DROP_DURATION = 2.2;
 export const ATTACH_RADIUS = 7;
-export const EJECT_MIN = 18;
-export const EJECT_MAX = 34;
+export const EJECT_MIN = 55;
+export const EJECT_MAX = 85;
 export const SETTLE_DELAY = 0.4;
+export const ALARM_PERIOD = 5; // seconds between the bell's red flash + ping
 
 const SLOT_COUNT = 8;
 const SLOT_RADIUS = 2.8;
