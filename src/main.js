@@ -10,8 +10,12 @@ import {
   setPlayerLight,
   setBellY,
   setWaterLevel,
+  setFixedStep,
   setDread,
-  setPlankton,
+  setDepthLevel,
+  fireFlare,
+  setSwimSpeed,
+  summonLeviathan,
   flashBellAlarm,
 } from "./graphics.js";
 import {
@@ -34,6 +38,8 @@ import {
   getMovement,
   getYaw,
   getPitch,
+  setLook,
+  isSprinting,
 } from "./input.js";
 import { SnapshotBuffer } from "./interpolation.js";
 import {
@@ -51,7 +57,7 @@ import {
   ALARM_PERIOD,
   DROP_DURATION,
 } from "./bell.js";
-import { planktonDensity } from "./plankton.js";
+import { getShot, captureErrors } from "./shots.js";
 import {
   initSonar,
   playPing,
@@ -69,6 +75,7 @@ import {
 } from "./voice.js";
 
 const MAX_SPEED = 4.5; // units per second
+const SPRINT_MULT = 2; // hold Shift to bolt for the bell
 const WATER_INERTIA = 4; // how quickly velocity reaches its target
 const NETWORK_RATE = 1 / 30; // send state 30x per second
 const CEILING_Y = 4; // you cannot swim back above the start line
@@ -104,6 +111,7 @@ let isHost = false;
 let settleTimer = -1; // counts down between the bell's stop and the ejection
 let alarmTimer = ALARM_PERIOD;
 let creakTimer = 12;
+let flareCooldown = 0; // the flare is the one thing that buys you a look
 
 const remoteBuffers = new Map(); // peerId -> SnapshotBuffer
 const remoteAttached = new Map(); // peerId -> bool
@@ -112,6 +120,22 @@ const remoteAttached = new Map(); // peerId -> bool
 const canvas = initGraphics(document.getElementById("scene-container"));
 initInput();
 initMouseLook(canvas);
+
+// Screenshot mode (?shot=<name>): hold one vantage point and freeze the sim.
+captureErrors();
+const shot = getShot();
+if (shot) {
+  menu.classList.add("hidden");
+  attached = false;
+  snapToLevel(shot.level);
+  localPosition.x = shot.x;
+  localPosition.y = shot.y;
+  localPosition.z = shot.z;
+  setLook(shot.yaw, shot.pitch);
+  if (!shot.torch) flashlightOn = toggleFlashlight();
+  setFixedStep(true);
+}
+let shotFrame = 0;
 
 // Browsers block audio until the page has been interacted with.
 const startAudio = () => initSonar();
@@ -216,6 +240,8 @@ window.addEventListener("keydown", (e) => {
     broadcastNow();
   } else if (e.code === "KeyV") {
     toggleMute();
+  } else if (e.code === "KeyG") {
+    throwFlare();
   } else if (e.code === "KeyE") {
     toggleAttach();
   } else if (e.code === "KeyR") {
@@ -223,6 +249,25 @@ window.addEventListener("keydown", (e) => {
     sendEvent({ kind: "restart" });
   }
 });
+
+const FLARE_RELOAD = 5; // seconds
+
+function throwFlare() {
+  if (flareCooldown > 0) {
+    showEvent(`Flare charging — ${flareCooldown.toFixed(1)}s`);
+    return;
+  }
+  const yaw = getYaw();
+  const pitch = getPitch();
+  const cosP = Math.cos(pitch);
+  fireFlare(localPosition, {
+    x: -Math.sin(yaw) * cosP,
+    y: Math.sin(pitch),
+    z: -Math.cos(yaw) * cosP,
+  });
+  flareCooldown = FLARE_RELOAD;
+  showEvent("✷ Flare away.");
+}
 
 function broadcastNow() {
   if (!isConnected()) return;
@@ -356,7 +401,7 @@ renderLoop((delta) => {
   const crew = 1 + remoteAttached.size;
 
   // 3. The host alone decides when the bell falls, and tells everyone.
-  if (isHost && settleTimer < 0 && readyToDrop(delta, hooked, crew)) {
+  if (!shot && isHost && settleTimer < 0 && readyToDrop(delta, hooked, crew)) {
     const level = bell.level + 1;
     startDrop(level);
     playDescent(DROP_DURATION);
@@ -364,7 +409,19 @@ renderLoop((delta) => {
     showEvent(`▼ The bell drops to level ${level}…`);
   }
 
-  if (attached) {
+  if (shot) {
+    // Held pose: no input, no drift, and the alarm fires on a fixed frame.
+    shotFrame++;
+    if (shot.flash && shotFrame === 20) flashBellAlarm();
+    if (shot.flare && shotFrame === 6) throwFlare();
+    // Frame 4, not 1: the camera is not moved to the shot position until later
+    // in the frame, so summoning any sooner places it around the world origin.
+    if (shot.leviathan && shotFrame === 4) {
+      // Aim the pass down the camera's own bearing so the shot catches it.
+      summonLeviathan(0.5, Math.atan2(-Math.cos(shot.yaw), -Math.sin(shot.yaw)));
+    }
+    velocity.x = velocity.y = velocity.z = 0;
+  } else if (attached) {
     // Riding the bell: the slot owns your position, swimming is disabled.
     localPosition.x = mySlot.x;
     localPosition.y = bell.y + mySlot.y;
@@ -381,10 +438,11 @@ renderLoop((delta) => {
     };
     const right = { x: Math.cos(yaw), z: -Math.sin(yaw) };
 
+    const top = MAX_SPEED * (isSprinting() ? SPRINT_MULT : 1);
     const target = {
-      x: (fwd.x * move.z + right.x * move.x) * MAX_SPEED,
-      y: (fwd.y * move.z + move.y) * MAX_SPEED,
-      z: (fwd.z * move.z + right.z * move.x) * MAX_SPEED,
+      x: (fwd.x * move.z + right.x * move.x) * top,
+      y: (fwd.y * move.z + move.y) * top,
+      z: (fwd.z * move.z + right.z * move.x) * top,
     };
 
     // 5. Water inertia.
@@ -400,26 +458,22 @@ renderLoop((delta) => {
   }
 
   // 6. First-person camera (speed drives the flashlight bob).
-  const speed = Math.hypot(velocity.x, velocity.y, velocity.z) / MAX_SPEED;
+  const speed =
+    Math.hypot(velocity.x, velocity.y, velocity.z) /
+    (MAX_SPEED * (isSprinting() ? SPRINT_MULT : 1));
   updateCamera(localPosition, yaw, pitch, Math.min(speed, 1));
+  setSwimSpeed(shot?.wake ? 1 : Math.min(speed, 1));
 
   // 7. The abyss gets heavier from the second ejection depth down, and blooms
   //    thicken the water wherever you happen to be swimming.
   const dread = clamp((bell.level - 1) / 2, 0, 1);
   setDread(dread);
   setDroneDepth(dread);
-  setPlankton(
-    planktonDensity(
-      localPosition.x,
-      localPosition.y,
-      localPosition.z,
-      bell.level,
-    ),
-  );
+  setDepthLevel(bell.level);
 
   // 8. The bell's alarm: red flash on the hull, and a ping panned toward it.
   const bellDist = distanceToBell(localPosition);
-  alarmTimer -= delta;
+  alarmTimer -= shot ? 0 : delta;
   if (alarmTimer <= 0) {
     alarmTimer = ALARM_PERIOD;
     const span = Math.hypot(localPosition.x, localPosition.z) || 1;
@@ -431,7 +485,8 @@ renderLoop((delta) => {
   }
 
   // Something shifting out in the dark, on no schedule you can learn.
-  creakTimer -= delta;
+  if (flareCooldown > 0) flareCooldown = Math.max(0, flareCooldown - delta);
+  creakTimer -= shot ? 0 : delta;
   if (creakTimer <= 0) {
     creakTimer = 9 + Math.random() * 22;
     playCreak();
@@ -441,7 +496,7 @@ renderLoop((delta) => {
   setListenerPose(localPosition, yaw, pitch);
 
   // 10. Broadcast local state, throttled.
-  networkTimer += delta;
+  networkTimer += shot ? 0 : delta;
   if (networkTimer >= NETWORK_RATE) {
     networkTimer = 0;
     broadcastNow();

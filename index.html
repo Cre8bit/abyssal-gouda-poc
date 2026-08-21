@@ -10,8 +10,26 @@
     <!-- Three.js canvas container -->
     <div id="scene-container"></div>
 
-    <!-- Underwater vignette + crosshair -->
-    <div id="vignette"></div>
+    <!-- Diving helmet: static frame so the player reads as a diver in a suit -->
+    <div id="helmet">
+      <div id="helmet-glass"></div>
+      <!-- Two impact cracks in the faceplate, drawn once and never animated. -->
+      <svg id="helmet-cracks" viewBox="0 0 1600 900" preserveAspectRatio="none">
+        <g
+          fill="none"
+          stroke="rgba(208,232,245,0.16)"
+          stroke-width="1.1"
+          stroke-linecap="round"
+        >
+          <path d="M232 214 l34 46 l-13 29 l41 26 l-6 34" />
+          <path d="M266 260 l-38 12 M307 315 l31 -9 M301 349 l-26 26" />
+          <circle cx="232" cy="214" r="2.6" fill="rgba(208,232,245,0.22)" />
+          <path d="M1372 646 l-40 -31 l7 -27 l-35 -18" />
+          <path d="M1332 615 l24 -22 M1304 570 l-27 6" />
+          <circle cx="1372" cy="646" r="2.2" fill="rgba(208,232,245,0.20)" />
+        </g>
+      </svg>
+    </div>
     <div id="crosshair"></div>
 
     <!-- Dive HUD -->
@@ -35,9 +53,9 @@
         <button id="host-btn">Host Game</button>
         <button id="join-btn">Join Game</button>
         <p class="hint">
-          Click the scene to look around · ZQSD/WASD to swim<br />Space / Shift
-          to rise & sink · F flashlight · V mute<br />E hook on / release the
-          bell · R restart the dive<br />Esc to release the mouse
+          Click the scene to look around · ZQSD/WASD to swim<br />Space rise ·
+          Ctrl sink · Shift sprint · F flashlight · V mute<br />G flare · E hook
+          on / release the bell · R restart<br />Esc to release the mouse
         </p>
       </div>
 

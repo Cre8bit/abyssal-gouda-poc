@@ -29,6 +29,7 @@ body {
 #ui-overlay {
   position: fixed;
   inset: 0;
+  z-index: 7;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -108,19 +109,69 @@ button:active {
   color: #6aa8c4;
 }
 
-/* Diver-mask vignette: darkens the edges of the view. */
-#vignette {
+/* --- Diving helmet ---
+   Always on screen, deliberately understated: it should register at the edge
+   of attention without being something you look at. */
+#helmet {
   position: fixed;
   inset: 0;
+  z-index: 4;
   pointer-events: none;
+}
+
+/* A hard-edged round port: a defined rim, not a gradient wash. The opening
+   stays large so it never gets in the player's way. */
+#helmet::before {
+  content: "";
+  position: absolute;
+  inset: -1px;
   background: radial-gradient(
-    ellipse at center,
-    transparent 55%,
-    rgba(0, 5, 10, 0.55) 100%
+    ellipse 66% 88% at 50% 50%,
+    transparent 0 82%,
+    rgba(6, 12, 16, 0.55) 82.4% 84%,
+    rgba(2, 6, 9, 0.97) 85% 100%
   );
 }
 
+/* A thin lit edge where the glass meets the collar. */
+#helmet::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    ellipse 66% 88% at 50% 50%,
+    transparent 0 81.4%,
+    rgba(150, 190, 210, 0.09) 81.8% 82.6%,
+    transparent 83%
+  );
+}
+
+#helmet-cracks {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+/* Curved glass catching the lamp: two faint arcs, opposite corners. */
+#helmet-glass {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(
+      ellipse 32% 19% at 25% 16%,
+      rgba(150, 200, 235, 0.055),
+      transparent 72%
+    ),
+    radial-gradient(
+      ellipse 20% 11% at 76% 84%,
+      rgba(120, 175, 210, 0.035),
+      transparent 70%
+    );
+}
+
 #crosshair {
+  z-index: 6;
   position: fixed;
   top: 50%;
   left: 50%;
@@ -136,6 +187,7 @@ button:active {
 #hud {
   position: fixed;
   inset: 0;
+  z-index: 6;
   pointer-events: none;
   font-family: monospace;
   color: rgba(210, 235, 250, 0.85);

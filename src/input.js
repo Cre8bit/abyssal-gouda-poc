@@ -10,11 +10,13 @@ const KEY_MAP = {
   KeyA: "left", // Q on AZERTY
   KeyD: "right",
   Space: "up",
-  ShiftLeft: "down",
-  ShiftRight: "down",
+  ControlLeft: "down",
+  ControlRight: "down",
+  ShiftLeft: "sprint",
+  ShiftRight: "sprint",
 };
 
-const MOUSE_SENSITIVITY = 0.0022;
+const MOUSE_SENSITIVITY = 0.0018;
 const LOOK_SMOOTHING = 14; // higher = snappier
 const PITCH_LIMIT = Math.PI / 2 - 0.08;
 
@@ -62,8 +64,18 @@ export function updateLook(delta) {
   pitch += (targetPitch - pitch) * k;
 }
 
+export function isSprinting() {
+  return keys.has("sprint");
+}
+
 export function getYaw() {
   return yaw;
+}
+
+// Pin the view, for screenshot mode.
+export function setLook(y, p) {
+  yaw = targetYaw = y;
+  pitch = targetPitch = p;
 }
 
 export function getPitch() {

@@ -14,6 +14,8 @@
 //  - Slow current drift on particles + occasional rising bubble bursts
 import * as THREE from "three";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
+import { buildForest, forestFor } from "./kelp.js";
+import { createFauna } from "./fauna.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
@@ -25,28 +27,26 @@ import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
 // Water look per level: the backdrop colour and how much base light survives.
 // There is no distance fog — the bell has to stay visible from anywhere.
 const WATER_LOOKS = [
-  { color: 0x0b2c3a, ambient: 1.8 },
-  { color: 0x05161e, ambient: 0.7 },
-  { color: 0x000406, ambient: 0.18 },
+  { color: 0x0b2836, fog: 0.0075, ambient: 2.6 },
+  { color: 0x04141e, fog: 0.017, ambient: 0.95 },
+  { color: 0x00070c, fog: 0.031, ambient: 0.22 },
 ];
 const WATER_FADE = 0.8; // per-second lerp toward the current level's look
 const ALARM_FLASH = 1.1; // seconds for the red flash to bleed out
 
 // Plankton blooms: a visible veil that drowns out light, but never visibility.
-const PLANKTON_COUNT = 2400;
-const PLANKTON_RADIUS = 26;
 
 const HEMI_BASE = 0.16;
 const GLOOM_BASE = 0.08;
 
-const SNOW_COUNT = 1500;
-const SNOW_RADIUS = 30;
-const BUBBLE_COUNT = 160;
+const SNOW_COUNT = 9000;
+const SNOW_RADIUS = 42;
+const BUBBLE_COUNT = 460;
 const BUBBLE_RADIUS = 22;
 const BURSTS = 5;
 const BURST_PARTICLES = 24;
 
-const FLASHLIGHT_INTENSITY = 650;
+const FLASHLIGHT_INTENSITY = 260;
 const SPILL_INTENSITY = 90;
 const REMOTE_LAMP_INTENSITY = 420;
 const MAX_PIXEL_RATIO = 1.5;
@@ -61,8 +61,14 @@ let composer;
 let horrorPass;
 let snow;
 let bubbles;
-let plankton;
+let kelpForest;
+const kelpTime = { value: 0 };
+let kelpLevel = -1;
 let bursts; // { points, states: [{origin, age, duration, delay}] }
+let fauna;
+let sparks; // { points, ages, head } — bioluminescence you stir up moving fast
+let swimSpeed = 0;
+let flare; // { group, light, core, halo, dir, travelled, alive }
 let flashlight; // { group, spot, spill, beam, lens, halo, on }
 let bellGroup;
 let bellLight;
@@ -72,15 +78,16 @@ let hemiLight;
 let gloomLight;
 let volumetric; // the local flashlight's beam materials, for the failing-lamp flicker
 let dread = 0; // 0 near the surface, 1 in the dark — drives every horror effect
-let murk = 0; // plankton density where the camera is
 let elapsed = 0;
+let fixedStep = false; // screenshot mode: a deterministic clock
+let stepFrame = 0;
 let moveFactor = 0;
 let resizeFrame = null;
 let nextShadowUpdate = 0;
 
 let waterTarget = WATER_LOOKS[0];
 const waterColor = new THREE.Color(WATER_LOOKS[0].color);
-const waterCurrent = { ambient: WATER_LOOKS[0].ambient };
+const waterCurrent = { ambient: WATER_LOOKS[0].ambient, fog: WATER_LOOKS[0].fog };
 
 const players = new Map();
 const noise = new ImprovedNoise();
@@ -109,6 +116,7 @@ function renderPixelRatio() {
 export function initGraphics(container) {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(WATER_LOOKS[0].color);
+  scene.fog = new THREE.FogExp2(WATER_LOOKS[0].color, WATER_LOOKS[0].fog);
 
   camera = new THREE.PerspectiveCamera(
     72,
@@ -128,13 +136,17 @@ export function initGraphics(container) {
   renderer.setPixelRatio(renderPixelRatio());
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.15;
+  renderer.toneMappingExposure = 1.0;
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.shadowMap.autoUpdate = false;
   container.appendChild(renderer.domElement);
 
   setupPostProcessing();
+  horrorPass.uniforms.uResolution.value.set(
+    window.innerWidth,
+    window.innerHeight,
+  );
 
   // Natural deep-water base light: faint cool sky vs dead-black below.
   hemiLight = new THREE.HemisphereLight(0x0e2b42, 0x010407, HEMI_BASE);
@@ -147,9 +159,12 @@ export function initGraphics(container) {
   createDivingBell();
   createFlashlight();
   createSnow();
-  createPlankton();
+  createKelpForest();
   createBubbles();
   createBursts();
+  createFlare();
+  createSparks();
+  fauna = createFauna(scene, noise, createHalo);
 
   window.addEventListener("resize", onResize);
 
@@ -162,9 +177,9 @@ function setupPostProcessing() {
 
   const bloom = new UnrealBloomPass(
     new THREE.Vector2(window.innerWidth, window.innerHeight),
-    0.55,
-    0.8,
-    0.7,
+    0.3, // strength: lamps should stay hot POINTS, not glowing balls
+    0.5, // radius
+    0.82, // threshold
   );
   composer.addPass(bloom);
 
@@ -173,7 +188,8 @@ function setupPostProcessing() {
       tDiffuse: { value: null },
       uTime: { value: 0 },
       uDread: { value: 0 },
-      uMurk: { value: 0 },
+      uResolution: { value: new THREE.Vector2(1, 1) },
+      uPixel: { value: 2.4 }, // screen pixels per rendered pixel
     },
     vertexShader: /* glsl */ `
       varying vec2 vUv;
@@ -186,11 +202,22 @@ function setupPostProcessing() {
       uniform sampler2D tDiffuse;
       uniform float uTime;
       uniform float uDread;
-      uniform float uMurk;
+      uniform vec2 uResolution;
+      uniform float uPixel;
       varying vec2 vUv;
 
       float hash(vec2 p) {
         return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+      }
+
+      // Ordered dithering, computed arithmetically — GLSL ES 1.0 cannot index a
+      // matrix array with a varying index.
+      float bayer2(vec2 a) {
+        a = floor(a);
+        return fract(a.x / 2.0 + a.y * a.y * 0.75);
+      }
+      float bayer4(vec2 a) {
+        return bayer2(0.5 * a) * 0.25 + bayer2(a);
       }
 
       float vnoise(vec2 p) {
@@ -205,7 +232,12 @@ function setupPostProcessing() {
       }
 
       void main() {
-        vec2 c = vUv - 0.5;
+        // Snap to a coarser grid before anything else, so the whole image is
+        // built out of chunky pixels rather than being blurred afterwards.
+        vec2 grid = max(uResolution / uPixel, vec2(1.0));
+        vec2 vUvP = (floor(vUv * grid) + 0.5) / grid;
+
+        vec2 c = vUvP - 0.5;
         float r2 = dot(c, c);
 
         // The faceplate swells with your breathing, harder the deeper you are.
@@ -221,7 +253,7 @@ function setupPostProcessing() {
           vnoise(uv * 17.0 - uTime * 0.13),
           vnoise(uv * 17.0 + 7.7 + uTime * 0.11)
         ) - 0.5) * 0.45;
-        uv += flow * (0.0016 + uDread * 0.0022 + uMurk * 0.004);
+        uv += flow * (0.0016 + uDread * 0.0022);
 
         // Curved glass: colour splits toward the rim...
         float ab = (0.0016 + uDread * 0.005) * r2 * 4.0;
@@ -237,31 +269,31 @@ function setupPostProcessing() {
         col /= 1.53;
 
         // Salt and grease baked onto the visor — it only shows when lit.
-        float smudge = vnoise(vUv * vec2(9.0, 22.0)) * vnoise(vUv * 31.0 + 3.0);
+        float smudge = vnoise(vUvP * vec2(9.0, 22.0)) * vnoise(vUvP * 31.0 + 3.0);
         col += smudge * dot(col, vec3(0.299, 0.587, 0.114)) * 0.5;
 
         // Grade: colour drains, shadows go cold, blacks crush to nothing.
         float lum = dot(col, vec3(0.299, 0.587, 0.114));
-        col = mix(col, vec3(lum), 0.24 + uDread * 0.34 + uMurk * 0.20);
+        col = mix(col, vec3(lum), 0.24 + uDread * 0.34);
         col *= vec3(0.70, 0.94, 1.02);
         col += vec3(0.0, 0.020, 0.016) * (1.0 - smoothstep(0.0, 0.35, lum));
         col = max(col - (0.010 + uDread * 0.012), 0.0);
         col = pow(col, vec3(1.0 + uDread * 0.16));
 
         // Inside a bloom the water itself turns sickly and green.
-        col = mix(
-          col,
-          col * vec3(0.55, 0.82, 0.62) + vec3(0.012, 0.030, 0.020),
-          uMurk * 0.75
-        );
 
         // The dark closes in with depth, and faster inside a bloom.
         float d = length(c);
-        col *= smoothstep(0.92 - uDread * 0.32 - uMurk * 0.16, 0.30 - uDread * 0.10, d);
+        col *= smoothstep(0.92 - uDread * 0.32, 0.30 - uDread * 0.10, d);
 
         // Sensor grain — worst where there is no light for it to work with.
-        float grain = hash(vUv * 900.0 + fract(uTime) * 91.0) - 0.5;
-        col += grain * (0.012 + uDread * 0.045 + uMurk * 0.020);
+        float grain = hash(vUvP * 900.0 + fract(uTime) * 91.0) - 0.5;
+        col += grain * (0.010 + uDread * 0.018);
+
+        // Crush the palette and dither the banding. This is what gives cheap
+        // geometry a filmic, oppressive texture rather than clean gradients.
+        float steps = 52.0 - uDread * 14.0;
+        col = floor(col * steps + bayer4(gl_FragCoord.xy)) / steps;
 
         gl_FragColor = vec4(col, 1.0);
       }
@@ -456,7 +488,7 @@ function createDivingBell() {
     const light = new THREE.PointLight(0xbfe0ff, 14, 24, 1.9);
     light.position.copy(bulb.position);
     group.add(light);
-    const halo = createHalo(1.6, 0.3);
+    const halo = createHalo(0.9, 0.22);
     halo.position.copy(bulb.position);
     group.add(halo);
     if (i === 2) bellLight = { light, bulb: bulb, halo, mat: bulbMat };
@@ -464,6 +496,7 @@ function createDivingBell() {
 
   // Always-on marker: this is what guarantees the bell is never lost.
   bellBeacon = createHalo(1.5, 0.85);
+  bellBeacon.material.fog = false; // haze must never hide the way home
   bellBeacon.position.y = 3.6;
   group.add(bellBeacon);
 
@@ -517,11 +550,62 @@ export function setDread(value) {
 }
 
 // Plankton density (0..1) where the diver is standing.
-export function setPlankton(value) {
-  murk = value;
-  plankton.material.uniforms.uDensity.value = value;
-  plankton.visible = value > 0.001;
-  horrorPass.uniforms.uMurk.value = value;
+// Kelp is real lit geometry, so the torch catches nearby blades while distant
+// ones fall to silhouette — that contrast is what sells the depth of a forest.
+function createKelpForest() {
+  const material = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    vertexColors: true,
+    roughness: 0.92,
+    metalness: 0,
+    emissive: 0x0c1811,
+    emissiveIntensity: 0.55,
+    side: THREE.DoubleSide,
+  });
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = kelpTime;
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        "#include <common>",
+        `#include <common>
+         uniform float uTime;
+         attribute float aSway;
+         attribute float aPhase;`,
+      )
+      .replace(
+        "#include <begin_vertex>",
+        `#include <begin_vertex>
+         float bend = abs(aSway - 0.5) * 2.0;
+         transformed.x += sin(uTime * 0.4 + aPhase) * 1.5 * bend;
+         transformed.z += cos(uTime * 0.33 + aPhase * 1.4) * 1.2 * bend;`,
+      );
+  };
+
+  kelpForest = new THREE.Mesh(new THREE.BufferGeometry(), material);
+  kelpForest.frustumCulled = false;
+  kelpForest.visible = false;
+  scene.add(kelpForest);
+}
+
+function rebuildKelp(level) {
+  const forest = forestFor(level);
+  const d = buildForest(forest.seed, (hex) => _c1.setHex(hex));
+  const g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.Float32BufferAttribute(d.position, 3));
+  g.setAttribute("normal", new THREE.Float32BufferAttribute(d.normal, 3));
+  g.setAttribute("color", new THREE.Float32BufferAttribute(d.color, 3));
+  g.setAttribute("aSway", new THREE.Float32BufferAttribute(d.sway, 1));
+  g.setAttribute("aPhase", new THREE.Float32BufferAttribute(d.phase, 1));
+  g.setIndex(d.index);
+  kelpForest.geometry.dispose();
+  kelpForest.geometry = g;
+  kelpForest.position.set(forest.x, forest.y, forest.z);
+  kelpForest.visible = true;
+  kelpLevel = level;
+}
+
+export function setDepthLevel(level) {
+  if (level !== kelpLevel && level >= 0) rebuildKelp(level);
 }
 
 function updateAlarm(delta) {
@@ -544,6 +628,7 @@ export function setWaterLevel(level) {
 }
 
 function applyWaterLook() {
+  scene.fog.density = waterCurrent.fog;
   hemiLight.intensity = HEMI_BASE * waterCurrent.ambient;
   gloomLight.intensity = GLOOM_BASE * waterCurrent.ambient;
 }
@@ -552,8 +637,10 @@ function applyWaterLook() {
 function updateWater(delta) {
   const k = Math.min(delta * WATER_FADE, 1);
   waterCurrent.ambient += (waterTarget.ambient - waterCurrent.ambient) * k;
+  waterCurrent.fog += (waterTarget.fog - waterCurrent.fog) * k;
   waterColor.lerp(_c1.set(waterTarget.color), k);
   scene.background.copy(waterColor);
+  scene.fog.color.copy(waterColor);
   applyWaterLook();
 }
 
@@ -588,8 +675,8 @@ function createFlashlight() {
     FLASHLIGHT_INTENSITY,
     65,
     0.3,
-    0.5,
-    1.7,
+    0.55,
+    1.25,
   );
   spot.position.set(0, 0, -0.1);
   spot.target.position.set(-0.34, 0.28, -29.5);
@@ -629,7 +716,7 @@ function createFlashlight() {
   // Scatter halo at the lens. Small — this sits ~0.5 units from the camera,
   // so a "world-size" halo tuned for a distant remote light would look like
   // a giant glowing balloon this close up.
-  const halo = createHalo(0.3, 0.28);
+  const halo = createHalo(0.16, 0.2);
   halo.position.z = -0.18;
   group.add(halo);
 
@@ -662,7 +749,7 @@ function createSnow() {
     positions[i * 3] = (Math.random() - 0.5) * 2 * SNOW_RADIUS;
     positions[i * 3 + 1] = (Math.random() - 0.5) * 2 * SNOW_RADIUS;
     positions[i * 3 + 2] = (Math.random() - 0.5) * 2 * SNOW_RADIUS;
-    scales[i] = 0.5 + Math.random() * 1.5;
+    scales[i] = 0.75 + Math.pow(Math.random(), 2.4) * 1.7;
     offsets[i] = Math.random() * 100;
   }
 
@@ -713,8 +800,9 @@ function createSnow() {
              + beamFactor(p, uLightPos[1], uLightDir[1], uLightOn[1]);
 
         vec4 mv = modelViewMatrix * vec4(p, 1.0);
-        gl_PointSize = aScale * uPixelRatio * (26.0 / -mv.z);
-        vAlpha = smoothstep(30.0, 3.0, -mv.z);
+        // Clamped: a mote right at the lens must not balloon into a disc.
+        gl_PointSize = min(aScale * uPixelRatio * (34.0 / -mv.z), 6.0);
+        vAlpha = smoothstep(42.0, 1.0, -mv.z);
         gl_Position = projectionMatrix * mv;
       }
     `,
@@ -725,75 +813,160 @@ function createSnow() {
         float d = distance(gl_PointCoord, vec2(0.5));
         float lit = min(vLit, 1.2);
         // Barely visible in the dark; blazing motes inside a beam.
-        float a = smoothstep(0.5, 0.08, d) * vAlpha * (0.10 + lit * 0.9);
-        vec3 col = mix(vec3(0.45, 0.55, 0.62), vec3(0.95, 0.98, 1.0), lit);
+        float a = smoothstep(0.5, 0.14, d) * vAlpha * (0.70 + lit * 0.9);
+        vec3 col = mix(vec3(0.74, 0.83, 0.90), vec3(0.97, 0.99, 1.0), lit);
         gl_FragColor = vec4(col * (1.0 + lit * 2.0), a);
       }
     `,
   });
 
   snow = new THREE.Points(geometry, material);
+  snow.frustumCulled = false;
   scene.add(snow);
 }
 
-// A dense mote veil that materialises inside a bloom — purely something to
-// look at and to drown the lamps in, since nothing here costs you visibility.
-function createPlankton() {
-  const positions = new Float32Array(PLANKTON_COUNT * 3);
-  const scales = new Float32Array(PLANKTON_COUNT);
-  const offsets = new Float32Array(PLANKTON_COUNT);
+const SPARK_COUNT = 500;
+const SPARK_LIFE = 2.4;
 
-  for (let i = 0; i < PLANKTON_COUNT; i++) {
-    positions[i * 3] = (Math.random() - 0.5) * 2 * PLANKTON_RADIUS;
-    positions[i * 3 + 1] = (Math.random() - 0.5) * 2 * PLANKTON_RADIUS;
-    positions[i * 3 + 2] = (Math.random() - 0.5) * 2 * PLANKTON_RADIUS;
-    scales[i] = 0.4 + Math.random() * 1.4;
-    offsets[i] = Math.random() * 100;
-  }
-
+// Disturbed plankton: swimming hard lights you up, which is its own punishment.
+function createSparks() {
+  const positions = new Float32Array(SPARK_COUNT * 3);
+  const ages = new Float32Array(SPARK_COUNT).fill(SPARK_LIFE + 1);
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute("aScale", new THREE.BufferAttribute(scales, 1));
-  geometry.setAttribute("aOffset", new THREE.BufferAttribute(offsets, 1));
+  geometry.setAttribute("aAge", new THREE.BufferAttribute(ages, 1));
 
   const material = new THREE.ShaderMaterial({
     transparent: true,
     depthWrite: false,
+    blending: THREE.AdditiveBlending,
     uniforms: {
-      uTime: { value: 0 },
       uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
-      uDensity: { value: 0 },
+      uLife: { value: SPARK_LIFE },
     },
     vertexShader: /* glsl */ `
-      uniform float uTime;
       uniform float uPixelRatio;
-      attribute float aScale;
-      attribute float aOffset;
-      varying float vAlpha;
+      uniform float uLife;
+      attribute float aAge;
+      varying float vFade;
       void main() {
-        vec3 p = position;
-        p.x += sin(uTime * 0.5 + aOffset) * 0.35;
-        p.y += cos(uTime * 0.4 + aOffset * 1.3) * 0.25;
-        p.z += cos(uTime * 0.45 + aOffset * 1.7) * 0.35;
-        vec4 mv = modelViewMatrix * vec4(p, 1.0);
-        gl_PointSize = aScale * uPixelRatio * (34.0 / -mv.z);
-        vAlpha = smoothstep(26.0, 1.5, -mv.z);
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        float life = clamp(1.0 - aAge / uLife, 0.0, 1.0);
+        vFade = life * life;
+        gl_PointSize = min((1.0 + life * 2.5) * uPixelRatio * (30.0 / -mv.z), 7.0);
         gl_Position = projectionMatrix * mv;
       }
     `,
     fragmentShader: /* glsl */ `
-      uniform float uDensity;
-      varying float vAlpha;
+      varying float vFade;
       void main() {
         float d = distance(gl_PointCoord, vec2(0.5));
-        float a = smoothstep(0.5, 0.10, d) * vAlpha * uDensity * 0.55;
-        gl_FragColor = vec4(0.40, 0.55, 0.43, a);
+        float a = smoothstep(0.5, 0.05, d) * vFade;
+        gl_FragColor = vec4(0.42, 0.78, 1.0, a);
       }
     `,
   });
 
-  plankton = new THREE.Points(geometry, material);
-  scene.add(plankton);
+  const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+  scene.add(points);
+  sparks = { points, ages, head: 0, debt: 0 };
+}
+
+// `speed` is 0..1 of top pace; only real effort wakes the water up.
+export function setSwimSpeed(speed) {
+  swimSpeed = speed;
+}
+
+function updateSparks(delta) {
+  const ages = sparks.ages;
+  const pos = sparks.points.geometry.attributes.position;
+
+  for (let i = 0; i < SPARK_COUNT; i++) ages[i] += delta;
+
+  const trigger = Math.max(0, swimSpeed - 0.45) / 0.55;
+  sparks.debt += trigger * trigger * 110 * delta;
+  while (sparks.debt >= 1) {
+    sparks.debt -= 1;
+    const i = sparks.head;
+    sparks.head = (sparks.head + 1) % SPARK_COUNT;
+    // Behind and around you, not in front of your own face.
+    _v1.set(
+      (Math.random() - 0.5) * 2.4,
+      (Math.random() - 0.5) * 2.0,
+      (Math.random() - 0.5) * 2.4,
+    );
+    pos.setXYZ(
+      i,
+      camera.position.x + _v1.x,
+      camera.position.y + _v1.y,
+      camera.position.z + _v1.z,
+    );
+    ages[i] = 0;
+  }
+
+  pos.needsUpdate = true;
+  sparks.points.geometry.attributes.aAge.needsUpdate = true;
+}
+
+export function summonLeviathan(at = 0, bearing = null) {
+  fauna.summonLeviathan(camera, at, bearing);
+}
+
+const FLARE_SPEED = 20; // metres per second
+const FLARE_RANGE = 95;
+
+function createFlare() {
+  const group = new THREE.Group();
+  const light = new THREE.PointLight(0xcfe4ff, 0, 70, 1.35);
+  group.add(light);
+  const core = new THREE.Mesh(
+    new THREE.SphereGeometry(0.09, 10, 8),
+    new THREE.MeshBasicMaterial({ color: 0xecf6ff }),
+  );
+  group.add(core);
+  const halo = createHalo(1.5, 0.55, 0xd8ecff);
+  halo.material.fog = false;
+  group.add(halo);
+  group.visible = false;
+  scene.add(group);
+  flare = { group, light, core, halo, dir: new THREE.Vector3(), travelled: 0, alive: false };
+}
+
+// Launch from a position along a direction; it drifts outward and dies.
+export function fireFlare(pos, dir) {
+  flare.group.position.set(pos.x, pos.y, pos.z);
+  flare.dir.set(dir.x, dir.y, dir.z).normalize();
+  flare.travelled = 0;
+  flare.alive = true;
+  flare.group.visible = true;
+}
+
+export function flareActive() {
+  return flare.alive;
+}
+
+function updateFlare(delta) {
+  if (!flare.alive) return;
+  const step = FLARE_SPEED * delta;
+  flare.travelled += step;
+  flare.group.position.addScaledVector(flare.dir, step);
+
+  const life = flare.travelled / FLARE_RANGE;
+  if (life >= 1) {
+    flare.alive = false;
+    flare.group.visible = false;
+    return;
+  }
+  // Swells as it goes, then dies — brightest out where you cannot see.
+  const swell = Math.sin(Math.PI * Math.min(life * 1.15, 1)) ** 0.7;
+  // The point of a flare is what it reveals, so the light carries it and the
+  // sprite stays a small hot spark.
+  flare.light.intensity = 620 * swell;
+  flare.light.distance = 55 + 55 * life;
+  flare.halo.material.opacity = 0.5 * swell;
+  flare.halo.scale.setScalar(1.5 + life * 2.2);
+  flare.core.scale.setScalar(0.8 + swell * 0.4);
 }
 
 function createBubbles() {
@@ -815,6 +988,7 @@ function createBubbles() {
   });
 
   bubbles = new THREE.Points(geometry, material);
+  bubbles.frustumCulled = false;
   scene.add(bubbles);
 }
 
@@ -942,14 +1116,20 @@ function currentDrift() {
   };
 }
 
-function wrapAroundCamera(points, radius, fall, delta, drift) {
+function wrapAroundCamera(points, radius, fall, delta, drift, sheets = 0) {
   const positions = points.geometry.attributes.position;
   const c = camera.position;
   const size = radius * 2;
   for (let i = 0; i < positions.count; i++) {
-    let x = positions.getX(i) + drift.x * delta;
+    // Current sheets: horizontal bands where the water runs much harder, so
+    // the ocean has structure and direction instead of being uniform soup.
+    const band =
+      sheets > 0
+        ? 1 + sheets * Math.pow(Math.max(0, Math.sin(positions.getY(i) * 0.055)), 6)
+        : 1;
+    let x = positions.getX(i) + drift.x * delta * band;
     let y = positions.getY(i) + fall * delta * (0.7 + (i % 5) * 0.12);
-    let z = positions.getZ(i) + drift.z * delta;
+    let z = positions.getZ(i) + drift.z * delta * band;
 
     if (x - c.x > radius) x -= size;
     else if (x - c.x < -radius) x += size;
@@ -1320,12 +1500,11 @@ function animateFlashlight() {
   // scatter what is left of it back into your face.
   const wobble = Math.max(0, noise.noise(t * 7.0, 3.3, 0));
   const dropout = noise.noise(t * 1.3, 71.0, 0) > 0.45 ? 0.72 : 0;
-  const choke = 1 - murk * 0.72;
   const stutter =
-    Math.max(0.08, 1 - dread * (0.6 * wobble * wobble + dropout)) * choke;
+    Math.max(0.08, 1 - dread * (0.6 * wobble * wobble + dropout));
   flashlight.spot.intensity = FLASHLIGHT_INTENSITY * stutter;
   flashlight.spill.intensity = SPILL_INTENSITY * stutter;
-  flashlight.spot.distance = 65 * (1 - dread * 0.35) * (1 - murk * 0.6);
+  flashlight.spot.distance = 65;
   flashlight.lens.material.emissiveIntensity = flashlight.on ? 6 * stutter : 0.05;
   flashlight.halo.material.opacity = 0.28 * stutter;
   volumetric.beam.material.uniforms.uIntensity.value = stutter;
@@ -1359,6 +1538,7 @@ function applyResize() {
   const height = window.innerHeight;
   const pixelRatio = renderPixelRatio();
 
+  horrorPass.uniforms.uResolution.value.set(width, height);
   camera.aspect = width / height;
   camera.updateProjectionMatrix();
   if (renderer.getPixelRatio() !== pixelRatio) {
@@ -1374,26 +1554,41 @@ function onResize() {
   resizeFrame = requestAnimationFrame(applyResize);
 }
 
+// Screenshot mode: advance by an exact 1/60 s for SHOT_FREEZE_FRAMES, then
+// hold. Rendering continues, so Chrome grabs the same frame every run.
+export const SHOT_FREEZE_FRAMES = 90;
+
+export function setFixedStep(on) {
+  fixedStep = on;
+}
+
 export function renderLoop(onFrame) {
   const clock = new THREE.Clock();
 
   renderer.setAnimationLoop(() => {
-    const delta = Math.min(clock.getDelta(), 0.1);
+    let delta = Math.min(clock.getDelta(), 0.1);
     elapsed = clock.elapsedTime;
 
+    if (fixedStep) {
+      stepFrame++;
+      const held = Math.min(stepFrame, SHOT_FREEZE_FRAMES);
+      delta = stepFrame <= SHOT_FREEZE_FRAMES ? 1 / 60 : 0;
+      elapsed = held / 60;
+    }
+
     snow.material.uniforms.uTime.value = elapsed;
-    plankton.material.uniforms.uTime.value = elapsed;
     horrorPass.uniforms.uTime.value = elapsed;
     for (const mat of beamMaterials) mat.uniforms.uTime.value = elapsed;
 
     const drift = currentDrift();
-    wrapAroundCamera(snow, SNOW_RADIUS, -0.22, delta, drift);
-    if (plankton.visible) {
-      wrapAroundCamera(plankton, PLANKTON_RADIUS, -0.06, delta, drift);
-    }
+    wrapAroundCamera(snow, SNOW_RADIUS, -0.22, delta, drift, 7);
     wrapAroundCamera(bubbles, BUBBLE_RADIUS, 0.85, delta, drift);
     updateBursts(delta);
+    updateFlare(delta);
+    updateSparks(delta);
+    fauna.update(camera, elapsed, delta);
 
+    kelpTime.value = elapsed;
     animateFlashlight();
     updateBellLight(delta);
     updateAlarm(delta);
