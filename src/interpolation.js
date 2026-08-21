@@ -51,6 +51,9 @@ export class SnapshotBuffer {
           z: lerp(a.z, b.z, alpha),
           yaw: lerpAngle(a.yaw ?? 0, b.yaw ?? 0, alpha),
           pitch: lerp(a.pitch ?? 0, b.pitch ?? 0, alpha),
+          // Lazy body orientation (may be absent from older peers).
+          sy: lerpAngle(a.sy ?? a.yaw ?? 0, b.sy ?? b.yaw ?? 0, alpha),
+          sp: lerp(a.sp ?? a.pitch ?? 0, b.sp ?? b.pitch ?? 0, alpha),
         };
       }
     }

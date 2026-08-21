@@ -39,15 +39,17 @@ const LEAN = 1.0; // prone swimming lean (rad) — body pitches under the head
 const REF_SPEED = 10; // world speed that maps to a full-effort kick
 
 // First-person body cheat: shift the body slightly forward of the true eye
-// anchor so the idle hands PEEK at the bottom edge of the screen (~0.75-0.8
-// of the half-FOV; edge is 0.727) without the shoulders crowding the view —
-// strokes and a small look-down bring them fully into frame.
-const FP_OFFSET = new THREE.Vector3(0, 0.02, -0.21);
+// anchor so at idle only the TOPS of the hands graze the bottom edge of the
+// screen — looking down (the body stays level, see updateLocalBody) brings
+// the arms fully into frame.
+const FP_OFFSET = new THREE.Vector3(0, -0.04, -0.18);
 
 // Base arm poses (template-space angles), numerically solved per view:
 // the FP pose reaches further forward-down so your own hands stay in frame.
 const ARM_POSE_THIRD = { uy: 1.45, ux: -0.45, fy: 0.25, fx: -0.15 };
-const ARM_POSE_FP = { uy: 1.5, ux: -0.6, fy: 0.5, fx: -0.15 };
+// FP arms hang low and stay ALMOST out of sight at idle — a subtle anchor
+// (future tools / wrist watch), fully visible only when looking down.
+const ARM_POSE_FP = { uy: 1.5, ux: -1.05, fy: 0.5, fx: -0.15 };
 
 // Only these bones are ever posed (twist helpers excluded = simplified rig).
 const ANIMATED = [
@@ -136,27 +138,64 @@ function buildFpGeometry(scene) {
     if (/Head|NeckTwist/.test(b.name)) headSet.add(i);
     else if (/Hand|Forearm|Upperarm/.test(b.name)) armSet.add(i);
   });
-  const bad = (i) => {
+  // The FP rig renders ONLY arms + legs. The torso is dropped entirely: it
+  // was the sole source of near-camera glitches (clip cuts, open shells),
+  // and prone you can barely see your own chest anyway. With no torso there
+  // is nothing to clip and nothing for the arms to intersect.
+  const legSet = new Set();
+  const armSplit = new Set();
+  mesh.skeleton.bones.forEach((b, i) => {
+    if (/Thigh|Calf|Foot|Toe|Pelvis/.test(b.name)) legSet.add(i);
+    if (/Hand|Forearm|Upperarm/.test(b.name)) armSplit.add(i);
+  });
+  const weights = (i) => {
     let headW = 0;
     let armW = 0;
+    let legW = 0;
     for (let k = 0; k < 4; k++) {
       const w = sw.getComponent(i, k);
       const j = sj.getComponent(i, k);
       if (headSet.has(j)) headW += w;
       else if (armSet.has(j)) armW += w;
+      if (legSet.has(j)) legW += w;
     }
+    return { headW, armW, legW };
+  };
+  const bad = (i) => {
+    const { headW, armW } = weights(i);
     return headW > 0.5 || (pos.getY(i) > 0.54 && armW < 0.4);
   };
-  const index = geo.index.array;
-  const keep = [];
-  for (let t = 0; t < index.length; t += 3) {
-    if (!(bad(index[t]) || bad(index[t + 1]) || bad(index[t + 2]))) {
-      keep.push(index[t], index[t + 1], index[t + 2]);
+  const armV = (i) => {
+    let w = 0;
+    for (let k = 0; k < 4; k++) {
+      if (armSplit.has(sj.getComponent(i, k))) w += sw.getComponent(i, k);
     }
+    return w;
+  };
+  const index = geo.index.array;
+  const legKeep = [];
+  const armKeep = [];
+  for (let t = 0; t < index.length; t += 3) {
+    const a = index[t];
+    const b = index[t + 1];
+    const c = index[t + 2];
+    if (bad(a) || bad(b) || bad(c)) continue;
+    if (armV(a) > 0.5 && armV(b) > 0.5 && armV(c) > 0.5) {
+      armKeep.push(a, b, c);
+    } else if (
+      weights(a).legW > 0.4 &&
+      weights(b).legW > 0.4 &&
+      weights(c).legW > 0.4
+    ) {
+      legKeep.push(a, b, c);
+    }
+    // everything else (torso/waist/shoulders) is simply not rendered in FP
   }
-  const fp = geo.clone();
-  fp.setIndex(keep);
-  return fp;
+  const legs = geo.clone();
+  legs.setIndex(legKeep);
+  const arms = geo.clone();
+  arms.setIndex(armKeep);
+  return { legs, arms };
 }
 
 // Build one rig instance. Returns { root, ... } — mount `root` under a
@@ -177,11 +216,24 @@ export function createDiverRig(template, { firstPerson = false } = {}) {
   });
 
   if (firstPerson) {
-    // Swap in the head-less geometry (see buildFpGeometry) so your own
-    // helmet simply doesn't exist — nothing to clip, collapse, or clone.
+    // FP renders ONLY legs + arms (see buildFpGeometry) — no torso, no head,
+    // so there is nothing near the camera to clip, slice, or intersect.
+    let fpMesh = null;
     model.traverse((o) => {
-      if (o.isSkinnedMesh) o.geometry = template.fpGeometry;
+      if (o.isSkinnedMesh) fpMesh ??= o;
     });
+    fpMesh.geometry = template.fpGeometry.legs;
+    const armMesh = new THREE.SkinnedMesh(
+      template.fpGeometry.arms,
+      fpMesh.material,
+    );
+    armMesh.castShadow = true;
+    armMesh.frustumCulled = false;
+    armMesh.position.copy(fpMesh.position);
+    armMesh.quaternion.copy(fpMesh.quaternion);
+    armMesh.scale.copy(fpMesh.scale);
+    armMesh.bind(fpMesh.skeleton, fpMesh.bindMatrix);
+    fpMesh.parent.add(armMesh);
   }
 
   // Head rest position, template space → rig space (rotY(π) flips x/z).
@@ -207,6 +259,7 @@ export function createDiverRig(template, { firstPerson = false } = {}) {
     speedSm: 0,
     leanAdj: 0,
     roll: 0,
+    strafeSm: 0,
     // Outputs (world space) — the helmet torch + glow follow these.
     headPos: new THREE.Vector3(),
     headQuat: new THREE.Quaternion(),
@@ -263,6 +316,7 @@ export function updateDiverRig(
 
   let leanTarget = 0;
   let rollTarget = 0;
+  let strafeTarget = 0;
   if (speed > 0.25) {
     _v2.copy(_v1).applyQuaternion(_q2.copy(_q1).invert()); // body-local dir
     const strafe = _v2.x / speed;
@@ -271,41 +325,51 @@ export function updateDiverRig(
     );
     const w = Math.min(1, speed / 3);
     // Nose toward the actual travel direction (residual vs body pitch).
-    leanTarget = Math.max(-0.6, Math.min(0.6, travelPitch - bodyPitch)) * w;
+    // Heavily damped in first person: big body rotations while swimming
+    // up/down would sweep the arm shells across the camera.
+    const fp = rig.firstPerson ? 0.3 : 1;
+    leanTarget = Math.max(-0.6, Math.min(0.6, travelPitch - bodyPitch)) * w * fp;
     // Bank into strafes, like the camera does.
-    rollTarget = -strafe * 0.3 * w;
+    rollTarget = -strafe * 0.35 * w * fp;
+    strafeTarget = strafe * w;
   }
   // Slow easing — direction changes (especially strafes) read as the body
   // lazily rolling through the water, never snapping.
   rig.leanAdj += (leanTarget - rig.leanAdj) * Math.min(1, dt * 1.5);
   rig.roll += (rollTarget - rig.roll) * Math.min(1, dt * 1.5);
+  rig.strafeSm += (strafeTarget - rig.strafeSm) * Math.min(1, dt * 2);
 
-  // --- Swim cycle: rate and amplitude scale with effort --------------------
-  rig.cycle += dt * (2.0 + 7.0 * effort);
+  // --- Swim cycle: rate and amplitude scale hard with effort ---------------
+  // Idle is a languid ~0.25 Hz wallow; full sprint kicks ~1.8 Hz — the
+  // contrast between resting and swimming reads immediately.
+  rig.cycle += dt * (1.6 + 9.5 * effort);
   const c = rig.cycle;
   const s = Math.sin;
-  const kick = 0.17 + 0.5 * effort;
+  const kick = 0.15 + 0.75 * effort;
 
   // Idle water-sway: the body never sits dead still — a slow two-axis
-  // wallow that fades as real swimming takes over.
-  const sway = 1 - 0.6 * effort;
+  // wallow that fades as real swimming takes over. Mostly damped in first
+  // person: it would translate straight into hands bobbing on screen.
+  const sway = (1 - 0.6 * effort) * (rig.firstPerson ? 0.3 : 1);
   applyRootPose(
     rig,
-    0.035 * s(c * 0.33 + 1.2) * sway,
-    0.04 * s(c * 0.41) * sway,
+    0.05 * s(c * 0.33 + 1.2) * sway,
+    0.06 * s(c * 0.41) * sway,
   );
 
   // Flutter kick: thighs anti-phase, knees lag, feet trail like fins.
   pose(rig, "L_Thigh", "aX", kick * s(c));
   pose(rig, "R_Thigh", "aX", kick * s(c + Math.PI));
-  const knee = 0.25 + 0.15 * effort;
+  const knee = 0.2 + 0.35 * effort;
   pose(rig, "L_Calf", "aX", knee + kick * 0.7 * s(c - 0.9));
   pose(rig, "R_Calf", "aX", knee + kick * 0.7 * s(c - 0.9 + Math.PI));
   pose(rig, "L_Foot", "aX", 0.55 - kick * 0.5 * s(c - 1.3));
   pose(rig, "R_Foot", "aX", 0.55 - kick * 0.5 * s(c - 1.3 + Math.PI));
 
-  // Gentle undulation rippling up the spine toward the head.
-  const und = 0.05 + 0.05 * effort;
+  // Undulation rippling up the spine — grows strongly with speed so the
+  // whole body works while sprinting (heavily damped in first person: it
+  // rocks the shoulders and therefore the hands).
+  const und = (0.04 + 0.12 * effort) * (rig.firstPerson ? 0.2 : 1);
   pose(rig, "Waist", "aX", und * s(c * 0.5));
   pose(rig, "Spine01", "aX", und * s(c * 0.5 - 0.6));
   pose(rig, "Spine02", "aX", und * 0.8 * s(c * 0.5 - 1.2));
@@ -313,37 +377,56 @@ export function updateDiverRig(
   // Arms: held forward (this is what the local player sees looking down),
   // stroking breaststroke-style at half the kick rate. Never fully still:
   // even at idle they slowly tread the water.
-  const arm = 0.28 + 0.5 * effort;
+  // First person keeps the arms NEARLY STATIC — just a faint drift so they
+  // feel alive. They're a stable anchor (think: future tools, a wrist
+  // watch), not an animation showcase; the full strokes are for the
+  // third-person view only.
+  const arm = (0.25 + 0.85 * effort) * (rig.firstPerson ? 0.06 : 1);
   const sw = s(c * 0.5);
   const sw2 = s(c * 0.5 - 0.9);
   const ap = rig.armPose; // numerically solved base pose (FP reaches further)
+  // Strafing: both arms sweep toward the travel side — the diver visibly
+  // pulls itself sideways with its arms (third person only).
+  const sOff = rig.firstPerson ? 0 : rig.strafeSm * 0.5;
   // (Signs validated numerically: hands settle below-forward of the eyes,
   // elbows slightly out — a relaxed prone glide.)
-  pose(rig, "L_Upperarm", "aY", -ap.uy + arm * 0.7 * sw);
+  pose(rig, "L_Upperarm", "aY", -ap.uy + arm * 0.7 * sw + sOff);
   poseAdd(rig, "L_Upperarm", "aX", ap.ux + arm * 0.4 * sw2);
-  pose(rig, "R_Upperarm", "aY", ap.uy - arm * 0.7 * sw);
+  pose(rig, "R_Upperarm", "aY", ap.uy - arm * 0.7 * sw + sOff);
   poseAdd(rig, "R_Upperarm", "aX", ap.ux + arm * 0.4 * sw2);
-  pose(rig, "L_Forearm", "aY", -ap.fy - arm * 0.6 * Math.max(0, sw2));
+  pose(rig, "L_Forearm", "aY", -ap.fy - arm * 0.6 * Math.max(0, sw2) + sOff * 0.6);
   poseAdd(rig, "L_Forearm", "aX", ap.fx);
-  pose(rig, "R_Forearm", "aY", ap.fy + arm * 0.6 * Math.max(0, sw2));
+  pose(rig, "R_Forearm", "aY", ap.fy + arm * 0.6 * Math.max(0, sw2) + sOff * 0.6);
   poseAdd(rig, "R_Forearm", "aX", ap.fx);
-  pose(rig, "L_Hand", "aX", 0.18 + 0.16 * sw);
-  pose(rig, "R_Hand", "aX", 0.18 + 0.16 * sw);
+  const handWiggle = rig.firstPerson ? 0.04 : 0.16;
+  pose(rig, "L_Hand", "aX", 0.18 + handWiggle * sw);
+  pose(rig, "R_Hand", "aX", 0.18 + handWiggle * sw);
 
   // First person: the head is collapsed/invisible and the local torch is
   // camera-mounted — skip the whole look solve.
   if (rig.firstPerson) return;
 
   // --- Head look: EXACT camera sync (the helmet torch mounts here) --------
-  // Necks take a soft share of the pitch difference so the head doesn't
-  // owl-crane on its own; the head bone then gets solved exactly, so the
-  // torch beam always leaves along the true look direction.
+  // The body may face somewhere else (lazy swim orientation), so the head
+  // visibly TURNS on the shoulders toward the true look. Relative yaw is
+  // clamped so a big transient look-vs-body gap never owl-cranes the neck;
+  // necks take a soft share of both axes, then the head bone gets solved
+  // exactly so the torch beam leaves along the (clamped) look direction.
+  let relYaw = Math.atan2(
+    Math.sin(lookYaw - bodyYaw),
+    Math.cos(lookYaw - bodyYaw),
+  );
+  relYaw = Math.max(-1.2, Math.min(1.2, relYaw));
+  const yawEff = bodyYaw + relYaw;
   const diff = lookPitch - bodyPitch + LEAN * 0.85 - rig.leanAdj;
   const neck = -Math.max(-0.7, Math.min(0.7, diff * 0.3));
+  const neckYaw = relYaw * 0.28;
   pose(rig, "NeckTwist01", "aX", neck);
+  poseAdd(rig, "NeckTwist01", "aY", neckYaw);
   pose(rig, "NeckTwist02", "aX", neck);
+  poseAdd(rig, "NeckTwist02", "aY", neckYaw);
 
-  rig.lookQuat.setFromEuler(_e1.set(lookPitch, lookYaw, 0, "YXZ"));
+  rig.lookQuat.setFromEuler(_e1.set(lookPitch, yawEff, 0, "YXZ"));
   rig.headQuat.copy(rig.lookQuat).multiply(rig.headFix);
 
   if (rig.head) {

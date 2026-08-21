@@ -231,6 +231,8 @@ window.addEventListener("keydown", (e) => {
         getYaw(),
         getPitch(),
         flashlightOn,
+        getSwimYaw(),
+        getSwimPitch(),
       );
     }
   } else if (e.code === "KeyV") {
@@ -304,6 +306,8 @@ function teleportLocal(x, y, z) {
       getYaw(),
       getPitch(),
       flashlightOn,
+      getSwimYaw(),
+      getSwimPitch(),
     );
   }
 }
@@ -329,8 +333,8 @@ onPeerDisconnected((peerId) => {
 
 // Buffer remote state for interpolation — never applied directly.
 // (Flashlight state is applied instantly: lights don't interpolate.)
-onStateReceived((peerId, { x, y, z, yaw, pitch, light }) => {
-  remoteBuffers.get(peerId)?.push({ x, y, z, yaw, pitch });
+onStateReceived((peerId, { x, y, z, yaw, pitch, light, sy, sp }) => {
+  remoteBuffers.get(peerId)?.push({ x, y, z, yaw, pitch, sy, sp });
   setPlayerLight(peerId, light !== false);
 });
 
@@ -455,6 +459,8 @@ renderLoop((delta) => {
       yaw,
       pitch,
       flashlightOn,
+      swimYaw,
+      swimPitch,
     );
   }
 
@@ -462,7 +468,7 @@ renderLoop((delta) => {
   for (const [peerId, buffer] of remoteBuffers) {
     const s = buffer.sample();
     if (s) {
-      updatePlayerPosition(peerId, s.x, s.y, s.z, s.yaw, s.pitch);
+      updatePlayerPosition(peerId, s.x, s.y, s.z, s.yaw, s.pitch, s.sy, s.sp);
       setVoicePosition(peerId, s.x, s.y, s.z);
     }
   }

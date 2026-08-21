@@ -182,8 +182,30 @@ function setupConnection(conn, { alreadyOpen = false } = {}) {
 }
 
 // Send the local player's position, facing, and flashlight state.
-export function broadcastState(x, y, z, yaw = 0, pitch = 0, light = true) {
-  const payload = { type: "state", x, y, z, yaw, pitch, light };
+// yaw/pitch = where the player LOOKS (head + torch); swimYaw/swimPitch =
+// the lazy body orientation, so remote peers can render the head turning
+// independently of the body.
+export function broadcastState(
+  x,
+  y,
+  z,
+  yaw = 0,
+  pitch = 0,
+  light = true,
+  swimYaw = null,
+  swimPitch = null,
+) {
+  const payload = {
+    type: "state",
+    x,
+    y,
+    z,
+    yaw,
+    pitch,
+    light,
+    sy: swimYaw ?? yaw,
+    sp: swimPitch ?? pitch,
+  };
   for (const conn of connections) {
     if (conn.open) conn.send(payload);
   }

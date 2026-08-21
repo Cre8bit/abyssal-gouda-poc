@@ -64,9 +64,11 @@ const REMOTE_LAMP_INTENSITY = 420;
 const MAX_PIXEL_RATIO = 1.5;
 
 const DIVER_MODEL_URL = `${import.meta.env.BASE_URL}models/ratdiverAbyssalGouda.glb`;
-// Helmet torch mount: offset from the head joint toward the modeled torch
-// on the helmet's front-top, expressed in look-space (world units).
-const TORCH_OFFSET = new THREE.Vector3(0, 0.16, -0.18);
+// Helmet torch mount: offset from the head joint to the modeled torch box
+// on top of the helmet, expressed in look-space (world units). Measured
+// from the mesh itself: torch lens at template (0.003, 0.885, 0.175) vs the
+// head joint at (0.009, 0.634, 0.079), flipped and scaled.
+const TORCH_OFFSET = new THREE.Vector3(0, 0.35, -0.14);
 
 let scene;
 let camera;
@@ -113,6 +115,9 @@ const localState = {
   vel: new THREE.Vector3(),
 };
 
+// No clip planes anywhere anymore: the FP rig renders only legs + arms
+// (diverRig.js drops the torso/head triangles at prep time), so nothing can
+// ever be sliced open near the camera.
 function createLocalBody() {
   loadDiverTemplate().then((template) => {
     if (!template) return;
@@ -120,6 +125,14 @@ function createLocalBody() {
     const pivot = new THREE.Group();
     group.add(pivot);
     const rig = createDiverRig(template, { firstPerson: true });
+    rig.root.traverse((obj) => {
+      if (obj.isMesh) {
+        obj.material = obj.material.clone();
+        // Cull backfaces so open tube ends (shoulder/hip cuts) read as
+        // see-through instead of dark interior walls.
+        obj.material.side = THREE.FrontSide;
+      }
+    });
     pivot.add(rig.root);
     scene.add(group);
     localBody = { group, pivot, rig };
@@ -137,14 +150,31 @@ export function updateLocalPlayer(pos, yaw, pitch, swimYaw, swimPitch, vel) {
   localState.vel.set(vel.x, vel.y, vel.z);
 }
 
+let localBodyPitch = 0; // smoothed VISUAL pitch of the FP body
+
 function updateLocalBody(delta) {
   if (!localBody || !localState.active) return;
+
+  // The body's VISUAL pitch is decoupled from the camera: a prone swimmer's
+  // body stays level while the head looks around — that's what makes the
+  // arms appear when you look down. Swimming pitches the body toward the
+  // travel direction, but only mildly and ASYMMETRICALLY: nosing down tips
+  // the body away below you (fine), but nosing up would rotate the torso
+  // straight into the forward view — so upward pitch is pinned near zero.
+  const speed = localState.vel.length();
+  const align = Math.min(1, speed / 2.5);
+  const targetPitch = Math.max(
+    -0.35,
+    Math.min(0.05, localState.swimPitch * align),
+  );
+  localBodyPitch += (targetPitch - localBodyPitch) * Math.min(1, delta * 3);
+
   localBody.group.position.copy(localState.pos);
   localBody.group.rotation.y = localState.swimYaw;
-  localBody.pivot.rotation.x = localState.swimPitch;
+  localBody.pivot.rotation.x = localBodyPitch;
   updateDiverRig(localBody.rig, delta, {
     bodyYaw: localState.swimYaw,
-    bodyPitch: localState.swimPitch,
+    bodyPitch: localBodyPitch,
     lookYaw: localState.yaw,
     lookPitch: localState.pitch,
     vel: localState.vel,
@@ -437,19 +467,24 @@ function createVolumetricLight({ length, endRadius, tint, strength }) {
 // The gouda labyrinth itself lives in gouda.js (buildGoudaWorld).
 
 // The local torch is HELMET-MOUNTED now (the model carries it on the
-// helmet): parked just above the camera and parented to it, so the beam is
-// always exactly aligned with where the camera looks. No hand prop meshes —
-// you can't see your own forehead.
+// helmet): parked just above the camera and parented to it, so the light is
+// always exactly aligned with where the camera looks.
+//
+// Unlike remote divers there is NO volumetric beam mesh in your own view —
+// from a lamp on your own forehead it just reads as fog on the screen.
+// Instead: a wide soft-edged hot cone, a broad spill that washes the whole
+// view ("halo where I look"), and a short-range fill so your own hands and
+// the wall in front of your face are never pitch black.
 function createFlashlight() {
   const group = new THREE.Group();
 
-  // Hot core: tight, shadow-casting. Warm dive-torch tint.
+  // Hot core: wide and soft-edged, shadow-casting. Warm dive-torch tint.
   const spot = new THREE.SpotLight(
     0xfff1cd,
     FLASHLIGHT_INTENSITY,
     65,
-    0.3,
-    0.5,
+    0.44,
+    0.75,
     1.7,
   );
   spot.position.set(0, 0, -0.1);
@@ -466,33 +501,28 @@ function createFlashlight() {
   group.add(spot);
   group.add(spot.target);
 
-  // Wide soft spill — real torches leak a corona around the hotspot.
+  // Broad soft spill — covers most of the field of view, so wherever you
+  // look gets at least a soft wash of light.
   const spill = new THREE.SpotLight(
     0xe6d8ab,
     SPILL_INTENSITY,
-    30,
-    0.85,
-    0.9,
-    1.9,
+    35,
+    1.05,
+    1.0,
+    1.6,
   );
   spill.position.set(0, 0, -0.1);
   spill.target = spot.target;
   group.add(spill);
 
-  // Long volumetric beam — core + haze + dispersal halos, visible even
-  // with no floor in sight.
-  const beam = createVolumetricLight({
-    length: 24,
-    endRadius: 3.6,
-    tint: 0xd9c684,
-    strength: 0.22,
-  }).group;
-  beam.position.z = -0.12;
-  group.add(beam);
+  // Short-range fill: lights your own hands/arms and the wall right in
+  // front of your visor, independent of the cones. Kept dim and tight so
+  // the abyss stays scary.
+  const fill = new THREE.PointLight(0xf0e0b4, 2.2, 5, 1.8);
+  fill.position.set(0, -0.05, -0.3);
+  group.add(fill);
 
-  // Scatter halo at the lens. Small — this sits just above the camera, so a
-  // "world-size" halo tuned for a distant remote light would look like a
-  // giant glowing balloon this close up.
+  // Scatter halo at the lens — the lamp's glow bleeding into the murk.
   const halo = createHalo(0.22, 0.22);
   halo.position.z = -0.3;
   group.add(halo);
@@ -501,14 +531,14 @@ function createFlashlight() {
   group.position.set(0, 0.2, -0.12);
   camera.add(group);
 
-  flashlight = { group, spot, spill, beam, halo, on: true };
+  flashlight = { group, spot, spill, fill, halo, on: true };
 }
 
 export function toggleFlashlight() {
   flashlight.on = !flashlight.on;
   flashlight.spot.visible = flashlight.on;
   flashlight.spill.visible = flashlight.on;
-  flashlight.beam.visible = flashlight.on;
+  flashlight.fill.visible = flashlight.on;
   flashlight.halo.visible = flashlight.on;
   return flashlight.on;
 }
@@ -802,8 +832,8 @@ export function addPlayer(id, color) {
     0xffeec9,
     REMOTE_LAMP_INTENSITY,
     50,
-    0.42,
-    0.55,
+    0.5,
+    0.6,
     1.7,
   );
   spot.position.set(0, 0.05, -0.6);
@@ -815,11 +845,13 @@ export function addPlayer(id, color) {
   pivot.add(spot);
   pivot.add(spot.target);
 
+  // Fat, readable cone — a remote beam is mostly seen side-on, where a
+  // narrow cone collapses into a thin ray.
   const beam = createVolumetricLight({
-    length: 20,
-    endRadius: 3.2,
+    length: 22,
+    endRadius: 4.6,
     tint: 0xd9c684,
-    strength: 0.3,
+    strength: 0.42,
   }).group;
   beam.position.set(0, 0.05, -0.6);
   pivot.add(beam);
@@ -844,6 +876,12 @@ export function addPlayer(id, color) {
     rig: null,
     torch: null,
     headGlow: null,
+    // Look (head/torch) vs lazy body orientation, synced from the peer.
+    lookYaw: 0,
+    lookPitch: 0,
+    swimYaw: 0,
+    swimPitch: 0,
+    bodyPitchSm: 0,
     // Velocity estimated from interpolated positions — drives the remote
     // diver's kick effort and direction adaptation with no protocol change.
     velEst: new THREE.Vector3(),
@@ -905,14 +943,20 @@ function updateRemoteDiver(player, delta) {
   }
   player.lastPos.copy(p);
 
-  // Remote body and look share the same synced yaw/pitch.
-  const yaw = player.group.rotation.y;
-  const pitch = player.pivot.rotation.x;
+  // Body follows the peer's lazy swim orientation; the head (and torch)
+  // aims at their true look — so you SEE them turn their head. Like the
+  // local body, the visual pitch stays level at rest and only aligns with
+  // the swim direction as they pick up speed.
+  const align = Math.min(1, player.velEst.length() / 2.5);
+  player.bodyPitchSm +=
+    (player.swimPitch * align - player.bodyPitchSm) * Math.min(1, delta * 3);
+  player.group.rotation.y = player.swimYaw;
+  player.pivot.rotation.x = player.bodyPitchSm;
   updateDiverRig(rig, delta, {
-    bodyYaw: yaw,
-    bodyPitch: pitch,
-    lookYaw: yaw,
-    lookPitch: pitch,
+    bodyYaw: player.swimYaw,
+    bodyPitch: player.bodyPitchSm,
+    lookYaw: player.lookYaw,
+    lookPitch: player.lookPitch,
     vel: player.velEst,
   });
 
@@ -938,12 +982,25 @@ export function removePlayer(id) {
   players.delete(id);
 }
 
-export function updatePlayerPosition(id, x, y, z, yaw = null, pitch = null) {
+export function updatePlayerPosition(
+  id,
+  x,
+  y,
+  z,
+  yaw = null,
+  pitch = null,
+  swimYaw = null,
+  swimPitch = null,
+) {
   const player = players.get(id);
   if (!player) return;
   player.group.position.set(x, y, z);
-  if (yaw !== null) player.group.rotation.y = yaw;
-  if (pitch !== null) player.pivot.rotation.x = pitch;
+  // Look (head + torch) and lazy body orientation are tracked separately;
+  // updateRemoteDiver applies them so the head visibly turns on the body.
+  if (yaw !== null) player.lookYaw = yaw;
+  if (pitch !== null) player.lookPitch = pitch;
+  player.swimYaw = swimYaw ?? yaw ?? player.swimYaw;
+  player.swimPitch = swimPitch ?? pitch ?? player.swimPitch;
 }
 
 export function setPlayerLight(id, on) {
