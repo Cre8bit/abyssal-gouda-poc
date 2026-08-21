@@ -5,6 +5,7 @@ import {
   removePlayer,
   updatePlayerPosition,
   updateCamera,
+  updateLocalPlayer,
   renderLoop,
   toggleFlashlight,
   setPlayerLight,
@@ -435,6 +436,10 @@ renderLoop((delta) => {
   const rollTarget = Math.max(-0.09, Math.min(0.09, -getYawVelocity() * 0.03));
   cameraRoll += (rollTarget - cameraRoll) * Math.min(1, delta * 5);
   updateCamera(localPosition, yaw, pitch, Math.min(speed, 1), cameraRoll);
+
+  // 4b. First-person body: trails the lazy swim orientation while the head
+  // (camera) looks around freely — arms come into view when you look down.
+  updateLocalPlayer(localPosition, yaw, pitch, swimYaw, swimPitch, velocity);
 
   // 5. Spatial audio listener follows the camera.
   setListenerPose(localPosition, yaw, pitch);

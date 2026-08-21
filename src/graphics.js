@@ -18,7 +18,11 @@ import * as THREE from "three";
 import { buildGoudaWorld, disposeWorld, updateGouda } from "./gouda.js";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
-import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
+import {
+  prepareDiverTemplate,
+  createDiverRig,
+  updateDiverRig,
+} from "./diverRig.js";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
@@ -59,8 +63,10 @@ const SPILL_INTENSITY = 90;
 const REMOTE_LAMP_INTENSITY = 420;
 const MAX_PIXEL_RATIO = 1.5;
 
-const DIVER_MODEL_URL = `${import.meta.env.BASE_URL}models/diver.glb`;
-const DIVER_SCALE = 0.45; // must match the diver model's own scale below
+const DIVER_MODEL_URL = `${import.meta.env.BASE_URL}models/ratdiverAbyssalGouda.glb`;
+// Helmet torch mount: offset from the head joint toward the modeled torch
+// on the helmet's front-top, expressed in look-space (world units).
+const TORCH_OFFSET = new THREE.Vector3(0, 0.16, -0.18);
 
 let scene;
 let camera;
@@ -70,7 +76,7 @@ let horrorPass;
 let snow;
 let bubbles;
 let bursts; // { points, states: [{origin, age, duration, delay}] }
-let flashlight; // { group, spot, spill, beam, lens, halo, on }
+let flashlight; // { group, spot, spill, beam, halo, on } — helmet-mounted
 let elapsed = 0;
 let moveFactor = 0;
 let resizeFrame = null;
@@ -80,18 +86,69 @@ const noise = new ImprovedNoise();
 const beamMaterials = []; // all volumetric beam materials (share uTime)
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
-const _v3 = new THREE.Vector3();
-const _q1 = new THREE.Quaternion();
-const _q2 = new THREE.Quaternion();
-const _q3 = new THREE.Quaternion();
-const _q4 = new THREE.Quaternion();
 
-let diverModelPromise = null;
-function loadDiverModel() {
-  diverModelPromise ??= new GLTFLoader()
+// The GLB is fetched, parsed, and prepped exactly ONCE — the prepared
+// template (rest pose, per-bone axes, head fix) is shared by the local
+// first-person body and every remote diver clone.
+let diverTemplatePromise = null;
+function loadDiverTemplate() {
+  diverTemplatePromise ??= new GLTFLoader()
     .loadAsync(DIVER_MODEL_URL)
+    .then((gltf) => prepareDiverTemplate(gltf))
     .catch(() => null);
-  return diverModelPromise;
+  return diverTemplatePromise;
+}
+
+// --- Local first-person body: your own arms/torso, visible looking down. ---
+// The head is collapsed (never blocks the camera); the body trails the lazy
+// swim orientation while the camera looks around freely.
+let localBody = null; // { group, pivot, rig }
+const localState = {
+  active: false,
+  pos: new THREE.Vector3(),
+  yaw: 0,
+  pitch: 0,
+  swimYaw: 0,
+  swimPitch: 0,
+  vel: new THREE.Vector3(),
+};
+
+function createLocalBody() {
+  loadDiverTemplate().then((template) => {
+    if (!template) return;
+    const group = new THREE.Group();
+    const pivot = new THREE.Group();
+    group.add(pivot);
+    const rig = createDiverRig(template, { firstPerson: true });
+    pivot.add(rig.root);
+    scene.add(group);
+    localBody = { group, pivot, rig };
+  });
+}
+
+// Called by main.js every frame with the freshest simulation state.
+export function updateLocalPlayer(pos, yaw, pitch, swimYaw, swimPitch, vel) {
+  localState.active = true;
+  localState.pos.set(pos.x, pos.y, pos.z);
+  localState.yaw = yaw;
+  localState.pitch = pitch;
+  localState.swimYaw = swimYaw;
+  localState.swimPitch = swimPitch;
+  localState.vel.set(vel.x, vel.y, vel.z);
+}
+
+function updateLocalBody(delta) {
+  if (!localBody || !localState.active) return;
+  localBody.group.position.copy(localState.pos);
+  localBody.group.rotation.y = localState.swimYaw;
+  localBody.pivot.rotation.x = localState.swimPitch;
+  updateDiverRig(localBody.rig, delta, {
+    bodyYaw: localState.swimYaw,
+    bodyPitch: localState.swimPitch,
+    lookYaw: localState.yaw,
+    lookPitch: localState.pitch,
+    vel: localState.vel,
+  });
 }
 
 function renderPixelRatio() {
@@ -141,6 +198,7 @@ export function initGraphics(container) {
   scene.add(gloom);
 
   createFlashlight();
+  createLocalBody();
   createSnow();
   createBubbles();
   createBursts();
@@ -378,30 +436,12 @@ function createVolumetricLight({ length, endRadius, tint, strength }) {
 // --- World -----------------------------------------------------------------
 // The gouda labyrinth itself lives in gouda.js (buildGoudaWorld).
 
+// The local torch is HELMET-MOUNTED now (the model carries it on the
+// helmet): parked just above the camera and parented to it, so the beam is
+// always exactly aligned with where the camera looks. No hand prop meshes —
+// you can't see your own forehead.
 function createFlashlight() {
   const group = new THREE.Group();
-
-  const body = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.035, 0.045, 0.26, 16),
-    new THREE.MeshStandardMaterial({
-      color: 0x11181d,
-      roughness: 0.4,
-      metalness: 0.8,
-    }),
-  );
-  body.rotation.x = Math.PI / 2;
-  group.add(body);
-
-  const lens = new THREE.Mesh(
-    new THREE.CircleGeometry(0.036, 16),
-    new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      emissive: 0xfff3d0,
-      emissiveIntensity: 6,
-    }),
-  );
-  lens.position.z = -0.135;
-  group.add(lens);
 
   // Hot core: tight, shadow-casting. Warm dive-torch tint.
   const spot = new THREE.SpotLight(
@@ -413,7 +453,7 @@ function createFlashlight() {
     1.7,
   );
   spot.position.set(0, 0, -0.1);
-  spot.target.position.set(-0.34, 0.28, -29.5);
+  spot.target.position.set(0, -0.1, -29.5);
   spot.castShadow = true;
   spot.shadow.mapSize.set(1024, 1024);
   spot.shadow.camera.near = 0.3;
@@ -450,18 +490,18 @@ function createFlashlight() {
   beam.position.z = -0.12;
   group.add(beam);
 
-  // Scatter halo at the lens. Small — this sits ~0.5 units from the camera,
-  // so a "world-size" halo tuned for a distant remote light would look like
-  // a giant glowing balloon this close up.
-  const halo = createHalo(0.3, 0.28);
-  halo.position.z = -0.18;
+  // Scatter halo at the lens. Small — this sits just above the camera, so a
+  // "world-size" halo tuned for a distant remote light would look like a
+  // giant glowing balloon this close up.
+  const halo = createHalo(0.22, 0.22);
+  halo.position.z = -0.3;
   group.add(halo);
 
-  group.position.set(0.34, -0.28, -0.5);
-  group.rotation.set(0.03, -0.04, 0);
+  // Helmet position: slightly above the eyes, nudged forward.
+  group.position.set(0, 0.2, -0.12);
   camera.add(group);
 
-  flashlight = { group, spot, spill, beam, lens, halo, on: true };
+  flashlight = { group, spot, spill, beam, halo, on: true };
 }
 
 export function toggleFlashlight() {
@@ -470,7 +510,6 @@ export function toggleFlashlight() {
   flashlight.spill.visible = flashlight.on;
   flashlight.beam.visible = flashlight.on;
   flashlight.halo.visible = flashlight.on;
-  flashlight.lens.material.emissiveIntensity = flashlight.on ? 6 : 0.05;
   return flashlight.on;
 }
 
@@ -758,7 +797,7 @@ export function addPlayer(id, color) {
   pivot.add(placeholder);
 
   // Headlamp rig — initially mounted on the pivot; reparented into the
-  // hand-held torch once the model loads.
+  // helmet torch once the model loads.
   const spot = new THREE.SpotLight(
     0xffeec9,
     REMOTE_LAMP_INTENSITY,
@@ -796,218 +835,93 @@ export function addPlayer(id, color) {
   const player = {
     group,
     pivot,
-    mixer: null,
     placeholder,
     spot,
     beam,
     halo,
     glow,
     color,
-    bones: null,
+    rig: null,
     torch: null,
     headGlow: null,
-    phase: Math.random() * 10, // desync swim cycles between divers
+    // Velocity estimated from interpolated positions — drives the remote
+    // diver's kick effort and direction adaptation with no protocol change.
+    velEst: new THREE.Vector3(),
+    lastPos: new THREE.Vector3(),
+    hasLast: false,
   };
   players.set(id, player);
 
-  loadDiverModel().then((gltf) => {
-    if (!gltf || !players.has(id)) return;
+  loadDiverTemplate().then((template) => {
+    if (!template || !players.has(id)) return;
 
-    const model = SkeletonUtils.clone(gltf.scene);
-    model.traverse((obj) => {
-      if (obj.isMesh) {
-        obj.castShadow = true;
-        obj.frustumCulled = false;
-      }
-    });
-    model.scale.setScalar(DIVER_SCALE);
-    model.rotation.y = Math.PI; // face -Z (our forward)
-    model.rotation.x = -1.05; // prone swimming lean
-    model.position.set(0, -0.3, 0.15);
-    pivot.add(model);
-
+    const rig = createDiverRig(template);
+    pivot.add(rig.root);
+    player.rig = rig;
     placeholder.visible = false;
 
-    // GLTFLoader sanitizes node names ("Wrist.R" -> "WristR").
-    const bone = (...names) => {
-      for (const n of names) {
-        const b = model.getObjectByName(n);
-        if (b) return b;
-      }
-      return null;
-    };
-    player.bones = {
-      head: bone("Head"),
-      neck: bone("Neck"),
-      abdomen: bone("Abdomen"),
-      torso: bone("Torso"),
-      wristR: bone("WristR", "Wrist.R"),
-      upperArmR: bone("UpperArmR", "UpperArm.R"),
-      lowerArmR: bone("LowerArmR", "LowerArm.R"),
-      upperArmL: bone("UpperArmL", "UpperArm.L"),
-      upperLegL: bone("UpperLegL", "UpperLeg.L"),
-      upperLegR: bone("UpperLegR", "UpperLeg.R"),
-      lowerLegL: bone("LowerLegL", "LowerLeg.L"),
-      lowerLegR: bone("LowerLegR", "LowerLeg.R"),
-      footL: bone("FootL", "Foot.L"),
-      footR: bone("FootR", "Foot.R"),
-    };
-
-    // Rest-pose rotation.x for every bone the swim cycle offsets, so the
-    // cycle can be applied as an absolute value each frame instead of an
-    // ever-accumulating delta (see updateDiverRig).
-    player.restRotX = {};
-    for (const [name, b] of Object.entries(player.bones)) {
-      if (b) player.restRotX[name] = b.rotation.x;
-    }
-
-    // --- Hand-held torch: real prop following the right hand. ---
-    // IMPORTANT: never parent props into the skeleton — the rig's bones
-    // carry a ×45 world scale (armature ×100, compensated by inverse bind
-    // matrices for the skinned mesh, but inherited raw by any child).
-    // The torch lives at scene level; updateDiverRig copies the wrist's
-    // world position (and the diver's look orientation) onto it each frame.
-    if (player.bones.wristR) {
-      const torch = new THREE.Group();
-      // The torch lives at scene level (unit scale) so its physical mesh
-      // needs its own scale-down to match the shrunk diver — otherwise it
-      // renders ~2x too big relative to the hand holding it.
-      const torchProp = new THREE.Group();
-      torchProp.scale.setScalar(DIVER_SCALE);
-      torch.add(torchProp);
-      const torchBody = new THREE.Mesh(
-        new THREE.CylinderGeometry(0.045, 0.06, 0.34, 12),
-        new THREE.MeshStandardMaterial({
-          color: 0x11181d,
-          roughness: 0.4,
-          metalness: 0.8,
-        }),
-      );
-      torchBody.rotation.x = Math.PI / 2;
-      torchProp.add(torchBody);
-      const torchLens = new THREE.Mesh(
-        new THREE.CircleGeometry(0.05, 12),
-        new THREE.MeshStandardMaterial({
-          color: 0xffffff,
-          emissive: 0xfff3d0,
-          emissiveIntensity: 5,
-        }),
-      );
-      torchLens.position.z = -0.175;
-      torchProp.add(torchLens);
-
-      // Reparent the whole lamp rig into the torch (unit scale, scene level;
-      // the beam/halo stay full-size — they're environmental light, not prop).
-      torch.add(spot);
-      spot.position.set(0, 0, -0.1);
-      torch.add(spot.target);
-      spot.target.position.set(0, 0, -20);
-      torch.add(beam);
-      beam.position.set(0, 0, -0.15);
-      torch.add(halo);
-      halo.position.set(0, 0, -0.22);
-
-      scene.add(torch);
-      player.torch = torch;
-    }
+    // --- Helmet torch: the model carries it on the helmet; the LIGHT rig
+    // lives at scene level (unit scale, so beam/halo sizes stay world-true)
+    // and is snapped to the head's world pose every frame — always aligned
+    // with wherever the diver's camera looks.
+    const torch = new THREE.Group();
+    torch.add(spot);
+    spot.position.set(0, 0, 0);
+    torch.add(spot.target);
+    spot.target.position.set(0, 0, -20);
+    torch.add(beam);
+    beam.position.set(0, 0, -0.06);
+    torch.add(halo);
+    halo.position.set(0, 0, -0.1);
+    scene.add(torch);
+    player.torch = torch;
 
     // --- Colored glow following the diver's helmet (scene level too). ---
-    if (player.bones.head) {
-      const headGlow = new THREE.Group();
-      headGlow.add(createHalo(0.9, 0.55, color));
-      glow.position.set(0, 0, 0);
-      headGlow.add(glow);
-      scene.add(headGlow);
-      player.headGlow = headGlow;
-    }
-
-    // Base layer: Idle clip (breathing), procedural swim on top.
-    const clips = gltf.animations ?? [];
-    if (clips.length > 0) {
-      const clip =
-        clips.find((c) => /\|Idle$/i.test(c.name)) ??
-        clips.find((c) => /idle/i.test(c.name)) ??
-        clips[0];
-      player.mixer = new THREE.AnimationMixer(model);
-      const action = player.mixer.clipAction(clip);
-      action.timeScale = 0.5;
-      action.play();
-    }
+    const headGlow = new THREE.Group();
+    headGlow.add(createHalo(0.9, 0.55, color));
+    glow.position.set(0, 0, 0);
+    headGlow.add(glow);
+    scene.add(headGlow);
+    player.headGlow = headGlow;
   });
 
   return group;
 }
 
-// --- Procedural swim: flutter kick + body undulation + torch aimed forward.
-// Runs every frame AFTER the mixer so it layers on top of the Idle base.
-function updateDiverRig(player, delta) {
-  player.mixer?.update(delta);
-  const b = player.bones;
-  if (!b) return;
+// --- Remote diver per-frame update: estimate velocity, run the procedural
+// swim (diverRig.js), then pin the helmet torch + glow to the head.
+function updateRemoteDiver(player, delta) {
+  const rig = player.rig;
+  if (!rig) return;
 
-  const t = elapsed * 2.4 + player.phase;
-  const s = Math.sin;
-  const rest = player.restRotX;
-
-  // Flutter kick: thighs anti-phase, knees follow with a lag. Set as an
-  // absolute offset from the rest pose (not +=) — accumulating this every
-  // rendered frame would blow up to tens of radians within seconds.
-  if (b.upperLegL) b.upperLegL.rotation.x = rest.upperLegL + 0.22 * s(t);
-  if (b.upperLegR)
-    b.upperLegR.rotation.x = rest.upperLegR + 0.22 * s(t + Math.PI);
-  if (b.lowerLegL)
-    b.lowerLegL.rotation.x = rest.lowerLegL + 0.1 + 0.14 * s(t - 0.7);
-  if (b.lowerLegR)
-    b.lowerLegR.rotation.x = rest.lowerLegR + 0.1 + 0.14 * s(t + Math.PI - 0.7);
-  // Feet counter-flex opposite the calf so they trail relaxed, not splayed.
-  if (b.footL) b.footL.rotation.x = rest.footL - 0.16 * s(t - 0.7);
-  if (b.footR) b.footR.rotation.x = rest.footR - 0.16 * s(t + Math.PI - 0.7);
-
-  // Gentle body undulation rippling up the spine.
-  if (b.abdomen) b.abdomen.rotation.x = rest.abdomen + 0.05 * s(t * 0.5);
-  if (b.torso) b.torso.rotation.x = rest.torso + 0.04 * s(t * 0.5 - 0.5);
-
-  // Head up so the diver looks ahead while prone.
-  if (b.neck) b.neck.rotation.x = rest.neck - 0.35;
-  if (b.head) b.head.rotation.x = rest.head - 0.25;
-
-  // Left arm: relaxed slow sweep.
-  if (b.upperArmL) b.upperArmL.rotation.x = rest.upperArmL + 0.12 * s(t * 0.6);
-
-  // Right arm: aim it forward (corrective rotation in world space) so the
-  // torch is held out ahead of the diver.
-  if (b.upperArmR && b.lowerArmR) {
-    b.upperArmR.getWorldPosition(_v1);
-    b.lowerArmR.getWorldPosition(_v2);
-    _v2.sub(_v1).normalize(); // current upper-arm direction (world)
-
-    // Desired: mostly forward, slightly down-and-in. Forward = pivot -Z.
-    player.pivot.getWorldQuaternion(_q1);
-    _v3.set(0.15, -0.3, -0.95).applyQuaternion(_q1).normalize();
-
-    _q2.setFromUnitVectors(_v2, _v3); // world-space correction
-    b.upperArmR.parent.getWorldQuaternion(_q3);
-    _q4.copy(_q3).invert().multiply(_q2).multiply(_q3);
-    b.upperArmR.quaternion.premultiply(_q4);
+  const p = player.group.position;
+  if (!player.hasLast) {
+    player.lastPos.copy(p);
+    player.hasLast = true;
   }
-
-  // Torch: scene-level prop. Follow the wrist's world POSITION, but lock the
-  // orientation to the diver's look direction so the beam aims correctly.
-  // (Never parented to the bone — bones carry a ×45 world scale.)
-  if (player.torch && b.wristR) {
-    player.pivot.getWorldQuaternion(_q1);
-    b.wristR.getWorldPosition(_v1);
-    // Nudge from the wrist joint into the palm, in look-space.
-    _v1.add(_v2.set(0.02, -0.02, -0.1).applyQuaternion(_q1));
-    player.torch.position.copy(_v1);
-    player.torch.quaternion.copy(_q1);
+  if (delta > 1e-4) {
+    _v1.copy(p).sub(player.lastPos).divideScalar(delta);
+    player.velEst.lerp(_v1, Math.min(1, delta * 6));
   }
+  player.lastPos.copy(p);
 
-  // Helmet glow follows the head bone's world position.
-  if (player.headGlow && b.head) {
-    b.head.getWorldPosition(_v1);
-    player.headGlow.position.copy(_v1);
-  }
+  // Remote body and look share the same synced yaw/pitch.
+  const yaw = player.group.rotation.y;
+  const pitch = player.pivot.rotation.x;
+  updateDiverRig(rig, delta, {
+    bodyYaw: yaw,
+    bodyPitch: pitch,
+    lookYaw: yaw,
+    lookPitch: pitch,
+    vel: player.velEst,
+  });
+
+  // Torch beam leaves the helmet along the exact look direction.
+  _v1.copy(TORCH_OFFSET).applyQuaternion(rig.lookQuat);
+  player.torch.position.copy(rig.headPos).add(_v1);
+  player.torch.quaternion.copy(rig.lookQuat);
+
+  player.headGlow.position.copy(rig.headPos);
 }
 
 export function removePlayer(id) {
@@ -1048,15 +962,16 @@ export function updateCamera(playerPos, yaw, pitch, speed = 0, roll = 0) {
   moveFactor += (speed - moveFactor) * 0.05;
 }
 
+// Helmet-mounted = much steadier than the old hand-held sway: just a faint
+// breathing bob, growing slightly with swim speed.
 function animateFlashlight() {
   if (!flashlight) return;
   const t = elapsed;
-  const bob = 1 + moveFactor * 3;
-  flashlight.group.position.x = 0.34 + Math.sin(t * 1.1) * 0.006 * bob;
+  const bob = 1 + moveFactor * 2;
+  flashlight.group.position.x = Math.sin(t * 1.1) * 0.003 * bob;
   flashlight.group.position.y =
-    -0.28 + Math.sin(t * 2.3) * 0.008 + Math.sin(t * 3.7) * 0.005 * moveFactor;
-  flashlight.group.rotation.z = Math.sin(t * 0.9) * 0.01 * bob;
-  flashlight.group.rotation.x = 0.03 + Math.sin(t * 1.7) * 0.008 * bob;
+    0.2 + Math.sin(t * 2.3) * 0.004 + Math.sin(t * 3.7) * 0.003 * moveFactor;
+  flashlight.group.rotation.x = Math.sin(t * 1.7) * 0.004 * bob;
 }
 
 // Feed the snow shader the two beam poses (local + first remote).
@@ -1122,11 +1037,12 @@ export function renderLoop(onFrame) {
     if (onFrame) onFrame(delta);
 
     // After game logic moved players/camera: layer fog, bioluminescent pulse,
-    // fog-aware culling, rig animation (torch follows the moved wrist), then
-    // feed the beam poses to the snow shader.
+    // fog-aware culling, rig animation (helmet torch follows the moved head),
+    // then feed the beam poses to the snow shader.
     const visibility = updateAtmosphere(delta);
     updateGouda(elapsed, camera.position, visibility);
-    for (const player of players.values()) updateDiverRig(player, delta);
+    updateLocalBody(delta);
+    for (const player of players.values()) updateRemoteDiver(player, delta);
     updateSnowLightUniforms();
     composer.render();
   });
