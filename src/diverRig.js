@@ -38,18 +38,18 @@ export const DIVER_SCALE = 1.4; // template ~0.95 tall → ~1.33 world units
 const LEAN = 1.0; // prone swimming lean (rad) — body pitches under the head
 const REF_SPEED = 10; // world speed that maps to a full-effort kick
 
-// First-person body cheat: shift the body slightly forward of the true eye
-// anchor so at idle only the TOPS of the hands graze the bottom edge of the
-// screen — looking down (the body stays level, see updateLocalBody) brings
-// the arms fully into frame.
-const FP_OFFSET = new THREE.Vector3(0, -0.04, -0.18);
+// First-person body cheat: the body sits lower and barely forward of the
+// true eye anchor, so at idle the hands stay OFF screen entirely and even
+// looking straight down you mostly see forearms, not two arms filling the
+// view. (Was y -0.04 / z -0.18 — hands grazed the screen edge at idle.)
+const FP_OFFSET = new THREE.Vector3(0, -0.14, -0.06);
 
 // Base arm poses (template-space angles), numerically solved per view:
 // the FP pose reaches further forward-down so your own hands stay in frame.
 const ARM_POSE_THIRD = { uy: 1.45, ux: -0.45, fy: 0.25, fx: -0.15 };
-// FP arms hang low and stay ALMOST out of sight at idle — a subtle anchor
-// (future tools / wrist watch), fully visible only when looking down.
-const ARM_POSE_FP = { uy: 1.5, ux: -1.05, fy: 0.5, fx: -0.15 };
+// FP arms hang low, tucked toward the body, and stay out of sight at idle —
+// they only enter the frame when looking well below the horizon.
+const ARM_POSE_FP = { uy: 1.5, ux: -1.35, fy: 0.5, fx: -0.15 };
 
 // Only these bones are ever posed (twist helpers excluded = simplified rig).
 const ANIMATED = [

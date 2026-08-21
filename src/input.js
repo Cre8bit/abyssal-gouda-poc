@@ -10,8 +10,9 @@ const KEY_MAP = {
   KeyA: "left", // Q on AZERTY
   KeyD: "right",
   Space: "up",
-  ShiftLeft: "down",
-  ShiftRight: "down",
+  KeyC: "down",
+  ShiftLeft: "sprint",
+  ShiftRight: "sprint",
 };
 
 const MOUSE_SENSITIVITY = 0.0022;
@@ -109,6 +110,11 @@ export function getSwimPitch() {
 // Smoothed yaw turn rate (rad/s) — drives the camera's bank into turns.
 export function getYawVelocity() {
   return yawVelocity;
+}
+
+// Sprint: hold Shift for a burst of speed.
+export function isSprinting() {
+  return keys.has("sprint");
 }
 
 export function isPointerLocked(canvas) {

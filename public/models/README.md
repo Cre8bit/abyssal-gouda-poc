@@ -1,5 +1,21 @@
 # Models
 
+## catfish_rigged.glb (lantern-catfish mob)
+
+The anglerfish-catfish, programmatically skinned and animated from
+`catfish_with_skeletton.glb` (Tripo mesh + Rigify-style metarig, 54 bones:
+spine chain, face/jaw, whisker chains, shoulder fins, 12-bone lantern stalk
+ending at the `forehead.L.017` bulb). Blender's auto-weights failed on the
+holey shell, so weights are distance-to-bone-segment with falloff and
+Laplacian smoothing — see `tools/rig_catfish_blender.py` for the same
+algorithm as a runnable Blender script. Baked clips: `swim` (2.4 s loop),
+`bite` (1.1 s one-shot), `flicker` (1.8 s loop, bulb pulse). Driven in-game
+by `src/catfish.js`.
+
+## catfish_with_skeletton.glb (source, not loaded by the game)
+
+Raw mesh + unbound skeleton the rigged file is generated from.
+
 ## ratdiverAbyssalGouda.glb (current player model)
 
 The rat diver, Tripo-generated and rigged (41-joint skeleton with twist

@@ -43,8 +43,17 @@ import {
   getSwimYaw,
   getSwimPitch,
   getYawVelocity,
+  isSprinting,
 } from "./input.js";
 import { SnapshotBuffer } from "./interpolation.js";
+import {
+  spawnCatfish,
+  despawnCatfish,
+  updateCatfishSystem,
+  getCatfishState,
+  applyCatfishState,
+  setCatfishAuthority,
+} from "./catfish.js";
 import {
   initVoice,
   callPeer,
@@ -55,6 +64,7 @@ import {
 } from "./voice.js";
 
 const MAX_SPEED = 10.0; // units per second — brisk fins
+const SPRINT_MULT = 1.9; // hold Shift: burst of speed (descend is on C)
 const WATER_INERTIA = 4; // how quickly velocity reaches its target
 const NETWORK_RATE = 1 / 30; // send state 30x per second
 const ABYSS_DEPTH = 612; // flavor: depth readout at y = 0
@@ -89,6 +99,8 @@ const eventCenter = document.getElementById("event-center");
 const localPosition = { x: 0, y: 5, z: WORLD_R + 30 };
 const velocity = { x: 0, y: 0, z: 0 };
 let networkTimer = 0;
+let fishNetTimer = 0; // host → joiners fish-state broadcast throttle
+const remotePositions = []; // rebuilt each frame — fish hunt the nearest diver
 let flashlightOn = true;
 let worldReady = false;
 let cameraRoll = 0; // eased bank angle while turning
@@ -133,6 +145,24 @@ async function buildWorld(rebuild = false) {
   for (const buffer of remoteBuffers.values()) buffer.reset();
   worldReady = true;
   loaderEl.classList.add("done");
+
+  // Release the lantern-catfish — packs cruising the open water (plus a few
+  // in the labyrinth). Host-simulated and broadcast to joiners; solo players
+  // simulate their own.
+  despawnCatfish();
+  spawnCatfish(Math.min(16, 10 + 2 * difficulty), {
+    onBite: (fishPos) => {
+      // Shove the diver away from the snapping jaws.
+      const dx = localPosition.x - fishPos.x;
+      const dy = localPosition.y - fishPos.y;
+      const dz = localPosition.z - fishPos.z;
+      const d = Math.hypot(dx, dy, dz) || 1;
+      velocity.x += (dx / d) * 9;
+      velocity.y += (dy / d) * 9;
+      velocity.z += (dz / d) * 9;
+      showEvent("🐟 A lantern-catfish snaps at you! Swim!");
+    },
+  });
 }
 buildWorld();
 
@@ -326,6 +356,9 @@ onPeerConnected((peerId) => {
 onPeerDisconnected((peerId) => {
   removePlayer(peerId);
   remoteBuffers.delete(peerId);
+  // If our host is gone, the puppets take over their own simulation from
+  // wherever they were — the abyss never empties out.
+  if (!hostedId) setCatfishAuthority(true);
   scatterBtn.classList.add("hidden");
   miniCopyLinkBtn.classList.add("hidden");
   showStatus("Diver disconnected.");
@@ -347,6 +380,9 @@ onEventReceived((peerId, data) => {
   } else if (data.kind === "dig") {
     // Teammate dug somewhere: apply the same carve locally.
     digAt(data.x, data.y, data.z, data.r ?? DIG_RADIUS);
+  } else if (data.kind === "fish" && !hostedId) {
+    // Host's fish states: run them as interpolated puppets.
+    applyCatfishState(data.f);
   } else if (data.kind === "seed" && data.seed !== seed) {
     // Joined a host with a different map: adopt their seed and rebuild.
     seed = data.seed >>> 0;
@@ -392,10 +428,11 @@ renderLoop((delta) => {
   };
   const right = { x: Math.cos(swimYaw), z: -Math.sin(swimYaw) };
 
+  const speedCap = MAX_SPEED * (isSprinting() ? SPRINT_MULT : 1);
   const target = {
-    x: (fwd.x * move.z + right.x * move.x) * MAX_SPEED,
-    y: (fwd.y * move.z + move.y) * MAX_SPEED,
-    z: (fwd.z * move.z + right.z * move.x) * MAX_SPEED,
+    x: (fwd.x * move.z + right.x * move.x) * speedCap,
+    y: (fwd.y * move.z + move.y) * speedCap,
+    z: (fwd.z * move.z + right.z * move.x) * speedCap,
   };
 
   // 3. Water inertia.
@@ -445,6 +482,22 @@ renderLoop((delta) => {
   // (camera) looks around freely — arms come into view when you look down.
   updateLocalPlayer(localPosition, yaw, pitch, swimYaw, swimPitch, velocity);
 
+  // 4c. Lantern-catfish: host/solo simulates (hunting the nearest diver),
+  // joiners interpolate the host's puppets.
+  updateCatfishSystem(
+    delta,
+    localPosition,
+    performance.now() / 1000,
+    remotePositions,
+  );
+  if (hostedId && isConnected()) {
+    fishNetTimer += delta;
+    if (fishNetTimer >= 0.12) {
+      fishNetTimer = 0;
+      sendEvent({ kind: "fish", f: getCatfishState() });
+    }
+  }
+
   // 5. Spatial audio listener follows the camera.
   setListenerPose(localPosition, yaw, pitch);
 
@@ -465,11 +518,13 @@ renderLoop((delta) => {
   }
 
   // 7. Smooth remote players from interpolation buffers + move their voices.
+  remotePositions.length = 0;
   for (const [peerId, buffer] of remoteBuffers) {
     const s = buffer.sample();
     if (s) {
       updatePlayerPosition(peerId, s.x, s.y, s.z, s.yaw, s.pitch, s.sy, s.sp);
       setVoicePosition(peerId, s.x, s.y, s.z);
+      remotePositions.push({ x: s.x, y: s.y, z: s.z });
     }
   }
 

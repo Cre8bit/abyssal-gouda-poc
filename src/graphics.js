@@ -23,6 +23,7 @@ import {
   createDiverRig,
   updateDiverRig,
 } from "./diverRig.js";
+import { initCatfishSystem } from "./catfish.js";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
@@ -163,8 +164,10 @@ function updateLocalBody(delta) {
   // straight into the forward view — so upward pitch is pinned near zero.
   const speed = localState.vel.length();
   const align = Math.min(1, speed / 2.5);
+  // Diving down lets the body nose down further (-0.55) so the arms rotate
+  // away beneath you instead of hanging across the downward view.
   const targetPitch = Math.max(
-    -0.35,
+    -0.55,
     Math.min(0.05, localState.swimPitch * align),
   );
   localBodyPitch += (targetPitch - localBodyPitch) * Math.min(1, delta * 3);
@@ -229,6 +232,7 @@ export function initGraphics(container) {
 
   createFlashlight();
   createLocalBody();
+  initCatfishSystem(scene);
   createSnow();
   createBubbles();
   createBursts();
@@ -516,22 +520,20 @@ function createFlashlight() {
   group.add(spill);
 
   // Short-range fill: lights your own hands/arms and the wall right in
-  // front of your visor, independent of the cones. Kept dim and tight so
-  // the abyss stays scary.
-  const fill = new THREE.PointLight(0xf0e0b4, 2.2, 5, 1.8);
+  // front of your visor, independent of the cones. Kept very dim so your
+  // own body barely catches the light and the abyss stays scary.
+  const fill = new THREE.PointLight(0xf0e0b4, 0.7, 5, 1.8);
   fill.position.set(0, -0.05, -0.3);
   group.add(fill);
 
-  // Scatter halo at the lens — the lamp's glow bleeding into the murk.
-  const halo = createHalo(0.22, 0.22);
-  halo.position.z = -0.3;
-  group.add(halo);
+  // (No lens halo sprite on your own lamp: from a light on your own
+  // forehead it just reads as a glowing circle stuck to the screen.)
 
   // Helmet position: slightly above the eyes, nudged forward.
   group.position.set(0, 0.2, -0.12);
   camera.add(group);
 
-  flashlight = { group, spot, spill, fill, halo, on: true };
+  flashlight = { group, spot, spill, fill, on: true };
 }
 
 export function toggleFlashlight() {
@@ -539,7 +541,6 @@ export function toggleFlashlight() {
   flashlight.spot.visible = flashlight.on;
   flashlight.spill.visible = flashlight.on;
   flashlight.fill.visible = flashlight.on;
-  flashlight.halo.visible = flashlight.on;
   return flashlight.on;
 }
 
