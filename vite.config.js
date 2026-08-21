@@ -25,7 +25,7 @@ function localPeerServer() {
       if (peerServerInstance) return;
       try {
         const { PeerServer } = await import("peer");
-        const peerServer = PeerServer({ port: 9001, path: "/abyssal" });
+        const peerServer = PeerServer({ port: 9004, path: "/abyssal" });
         // Without this, a bind failure (e.g. EADDRINUSE from a stale
         // process left over by a previous crashed/killed dev server) is an
         // unhandled 'error' event that throws and crashes the whole Vite
@@ -35,14 +35,14 @@ function localPeerServer() {
           console.warn(
             "  ➜  Local PeerJS server error (" +
               (err.code === "EADDRINUSE"
-                ? "port 9001 already in use — is another `npm run dev` still running?"
+                ? "port 9004 already in use — is another `npm run dev` still running?"
                 : err.message) +
               ") — falling back to the public PeerJS cloud.",
           );
         });
         peerServerInstance = peerServer;
         console.log(
-          "  ➜  Local PeerJS signaling server: ws://localhost:9001/abyssal",
+          "  ➜  Local PeerJS signaling server: ws://localhost:9004/abyssal",
         );
         // Release the port on dev server shutdown/restart so it doesn't
         // linger as a zombie process blocking the next `npm run dev`.

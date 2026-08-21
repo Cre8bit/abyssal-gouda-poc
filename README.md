@@ -69,7 +69,7 @@ npm run dev
 
 Notes:
 
-- `npm run dev` also starts a **local PeerJS signaling server** (port 9001) —
+- `npm run dev` also starts a **local PeerJS signaling server** (port 9004) —
   local games don't depend on the public PeerJS cloud at all. If the local
   server can't start (e.g. `peer` not installed yet), the app falls back to
   the public cloud automatically.
