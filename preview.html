@@ -1,0 +1,316 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Lanternmaw — rig preview</title>
+    <style>
+      :root {
+        --ink: #cfe6f5;
+        --dim: #7d95a6;
+        --hot: #ffc978;
+        --panel: rgba(6, 16, 22, 0.82);
+        --line: rgba(120, 170, 200, 0.18);
+      }
+      * {
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #04101a;
+        color: var(--ink);
+        font: 12px/1.5 ui-monospace, "SF Mono", Menlo, monospace;
+      }
+      #stage {
+        position: fixed;
+        inset: 0;
+      }
+      canvas {
+        display: block;
+      }
+
+      .panel {
+        position: fixed;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 12px 14px;
+        backdrop-filter: blur(8px);
+      }
+
+      #controls {
+        top: 14px;
+        left: 14px;
+        width: 268px;
+        max-height: calc(100vh - 28px);
+        overflow-y: auto;
+      }
+
+      h1 {
+        margin: 0 0 2px;
+        font-size: 13px;
+        letter-spacing: 0.18em;
+        color: var(--hot);
+        font-weight: 600;
+      }
+      .sub {
+        margin: 0 0 12px;
+        color: var(--dim);
+        font-size: 10.5px;
+      }
+
+      h2 {
+        margin: 14px 0 7px;
+        font-size: 10px;
+        letter-spacing: 0.2em;
+        color: var(--dim);
+        font-weight: 500;
+        text-transform: uppercase;
+      }
+      h2:first-of-type {
+        margin-top: 4px;
+      }
+
+      .row {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 5px;
+      }
+      .row.two {
+        grid-template-columns: repeat(2, 1fr);
+      }
+
+      button {
+        font: inherit;
+        font-size: 10.5px;
+        padding: 6px 4px;
+        color: var(--ink);
+        background: rgba(30, 60, 78, 0.5);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        cursor: pointer;
+        transition: background 0.12s, border-color 0.12s;
+      }
+      button:hover {
+        background: rgba(50, 96, 120, 0.6);
+      }
+      button.on {
+        background: rgba(255, 170, 90, 0.2);
+        border-color: rgba(255, 190, 120, 0.6);
+        color: var(--hot);
+      }
+
+      label.slider {
+        display: block;
+        margin: 9px 0 0;
+      }
+      label.slider > span {
+        display: flex;
+        justify-content: space-between;
+        color: var(--dim);
+        font-size: 10.5px;
+        margin-bottom: 3px;
+      }
+      label.slider > span b {
+        color: var(--ink);
+        font-weight: 500;
+      }
+      input[type="range"] {
+        width: 100%;
+        height: 3px;
+        appearance: none;
+        background: rgba(120, 170, 200, 0.25);
+        border-radius: 2px;
+        outline: none;
+      }
+      input[type="range"]::-webkit-slider-thumb {
+        appearance: none;
+        width: 11px;
+        height: 11px;
+        border-radius: 50%;
+        background: var(--hot);
+        cursor: pointer;
+      }
+      input[type="range"]::-moz-range-thumb {
+        width: 11px;
+        height: 11px;
+        border: 0;
+        border-radius: 50%;
+        background: var(--hot);
+        cursor: pointer;
+      }
+
+      .toggles {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+      }
+      .toggles button {
+        flex: 1 1 auto;
+      }
+
+      #readout {
+        top: 14px;
+        right: 14px;
+        min-width: 200px;
+      }
+      #readout table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+      #readout td {
+        padding: 1px 0;
+      }
+      #readout td:first-child {
+        color: var(--dim);
+      }
+      #readout td:last-child {
+        text-align: right;
+        font-variant-numeric: tabular-nums;
+      }
+      #phase {
+        color: var(--hot);
+        letter-spacing: 0.16em;
+      }
+
+      #bars {
+        margin-top: 8px;
+        display: grid;
+        gap: 3px;
+      }
+      .bar {
+        display: grid;
+        grid-template-columns: 52px 1fr;
+        align-items: center;
+        gap: 6px;
+        color: var(--dim);
+        font-size: 10px;
+      }
+      .bar i {
+        display: block;
+        height: 3px;
+        background: rgba(120, 170, 200, 0.18);
+        border-radius: 2px;
+        overflow: hidden;
+        font-style: normal;
+      }
+      .bar i > u {
+        display: block;
+        height: 100%;
+        background: var(--hot);
+        text-decoration: none;
+      }
+
+      #hint {
+        bottom: 14px;
+        left: 14px;
+        color: var(--dim);
+        font-size: 10.5px;
+        padding: 8px 12px;
+      }
+      #hint b {
+        color: var(--ink);
+        font-weight: 500;
+      }
+
+      #loading {
+        position: fixed;
+        inset: 0;
+        display: grid;
+        place-items: center;
+        color: var(--dim);
+        letter-spacing: 0.3em;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <div id="loading">LOADING…</div>
+
+    <div id="controls" class="panel">
+      <h1>LANTERNMAW</h1>
+      <p class="sub">
+        Rig preview — every pose below is <code>src/angler.js</code> running for
+        real, not a baked clip.
+      </p>
+
+      <h2>Attack</h2>
+      <div class="row two">
+        <button id="btn-hunt" class="on">▶ Play the hunt</button>
+        <button id="btn-loop">↻ Loop lunge</button>
+      </div>
+
+      <h2>Hold a beat</h2>
+      <div class="row" id="phases"></div>
+
+      <h2>Scrub</h2>
+      <label class="slider">
+        <span>gape <b id="v-gape">0.00</b></span>
+        <input id="s-gape" type="range" min="0" max="1" step="0.01" value="0" />
+      </label>
+      <label class="slider">
+        <span>lure out <b id="v-lure">1.00</b></span>
+        <input id="s-lure" type="range" min="0" max="1" step="0.01" value="1" />
+      </label>
+      <label class="slider">
+        <span>face glow <b id="v-glow">0.00</b></span>
+        <input id="s-glow" type="range" min="0" max="1" step="0.01" value="0" />
+      </label>
+      <label class="slider">
+        <span>swim effort <b id="v-speed">0.12</b></span>
+        <input id="s-speed" type="range" min="0" max="1" step="0.01" value="0.12" />
+      </label>
+      <label class="slider">
+        <span>time scale <b id="v-rate">1.0×</b></span>
+        <input id="s-rate" type="range" min="0.1" max="2" step="0.05" value="1" />
+      </label>
+
+      <h2>Show</h2>
+      <div class="toggles">
+        <button id="t-bones">Skeleton</button>
+        <button id="t-wire">Wireframe</button>
+        <button id="t-maw">Bite volume</button>
+        <button id="t-spin" class="on">Turntable</button>
+        <button id="t-fog" class="on">Water</button>
+      </div>
+    </div>
+
+    <div id="readout" class="panel">
+      <table>
+        <tr>
+          <td>phase</td>
+          <td id="phase">—</td>
+        </tr>
+        <tr>
+          <td>jaw drop</td>
+          <td id="r-jaw">—</td>
+        </tr>
+        <tr>
+          <td>esca height</td>
+          <td id="r-esca">—</td>
+        </tr>
+        <tr>
+          <td>diver range</td>
+          <td id="r-dist">—</td>
+        </tr>
+      </table>
+      <div id="bars">
+        <div class="bar">gape<i><u id="b-gape"></u></i></div>
+        <div class="bar">lure<i><u id="b-lure"></u></i></div>
+        <div class="bar">glow<i><u id="b-glow"></u></i></div>
+        <div class="bar">pulse<i><u id="b-pulse"></u></i></div>
+      </div>
+    </div>
+
+    <div id="hint" class="panel">
+      <b>drag</b> orbit · <b>scroll</b> zoom · <b>right-drag</b> pan ·
+      <b>space</b> replay the hunt
+    </div>
+
+    <script type="module" src="/src/preview.js"></script>
+  </body>
+</html>

@@ -27,6 +27,7 @@
 // accumulated, so a dropped frame can't drift the skeleton out of shape.
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
 
 const MODEL_URL = `${import.meta.env.BASE_URL}models/headmonster_skeletton.glb`;
 
@@ -82,6 +83,8 @@ const _v2 = new THREE.Vector3();
 const _v3 = new THREE.Vector3();
 const _q = new THREE.Quaternion();
 const _e = new THREE.Euler();
+const DOWN = new THREE.Vector3(0, -1, 0);
+const UP = new THREE.Vector3(0, 1, 0);
 
 let modelPromise = null;
 function loadModel() {
@@ -193,7 +196,12 @@ export function createAngler(scene) {
 
   loadModel().then((gltf) => {
     if (!gltf) return;
-    const model = gltf.scene;
+    // The GLTF is cached and shared, so every angler needs its own skeleton:
+    // handing two instances the same bones would have them fighting over one
+    // pose, and whichever loaded second would capture the other's animated
+    // orientation as its "rest". Same reason the diver rig clones in
+    // graphics.js.
+    const model = SkeletonUtils.clone(gltf.scene);
     model.scale.setScalar(ANGLER_LENGTH);
 
     const bones = new Map();
@@ -237,29 +245,27 @@ export function createAngler(scene) {
     ].filter((n) => !bones.has(n));
     if (missing.length) console.warn("[angler] bones not found:", missing);
 
-    // Which way is "open"? The metarig's bone roll is whatever the artist left
-    // it at, so probe the jaw instead of trusting a sign: nudge it and keep
-    // whichever direction actually drops the front of the jaw in world space.
-    rig.jawSign = probeSign(model, rig.jaw[0], rig.mawFloor, -1);
-    rig.lipSign = probeSign(model, rig.lips[0][0], rig.lips[0][2] ?? rig.lips[0][0], 1);
+    // Which way is "open"? Rotating about the bone's own local X is a coin
+    // flip on a metarig — the roll is whatever the artist left it at, and the
+    // jaw here swings mostly sideways if you trust it. So solve the hinge
+    // instead: the axis that swings this bone toward straight down is
+    // perpendicular to both the bone and to down, and that is a cross product.
+    model.updateMatrixWorld(true);
+    rig.jawAxis = rig.jaw.map((b) => hingeAxis(b, DOWN));
+    rig.lipAxis = rig.lips.map((chain) => chain.map((b) => hingeAxis(b, UP)));
     state.rig = rig;
   });
 
-  // Rotate `bone` about its local X and report the sign whose effect on
-  // `tip`'s world Y matches `want` (+1 up, -1 down). Restores the pose.
-  function probeSign(root, bone, tip, want) {
-    if (!bone || !tip) return want;
-    const saved = bone.quaternion.clone();
-    const sample = (s) => {
-      bone.quaternion.copy(saved).multiply(_q.setFromEuler(_e.set(s * 0.35, 0, 0)));
-      root.updateMatrixWorld(true);
-      return tip.getWorldPosition(_v1).y;
-    };
-    const up = sample(1);
-    const down = sample(-1);
-    bone.quaternion.copy(saved);
-    root.updateMatrixWorld(true);
-    return want > 0 ? (up > down ? 1 : -1) : (up < down ? 1 : -1);
+  // The local-space axis to rotate `bone` about so its tip travels toward
+  // `worldDir`. Bones point along their own +Y, so it is +Y × (worldDir in
+  // bone space). Computed once at rest, while the group is still unrotated.
+  function hingeAxis(bone, worldDir) {
+    const axis = new THREE.Vector3(1, 0, 0);
+    if (!bone) return axis;
+    const basis = new THREE.Matrix3().setFromMatrix4(bone.matrixWorld).invert();
+    const local = worldDir.clone().applyMatrix3(basis).normalize();
+    const hinge = new THREE.Vector3(0, 1, 0).cross(local);
+    return hinge.lengthSq() < 1e-6 ? axis : hinge.normalize();
   }
 
   // --- Placement -----------------------------------------------------------
@@ -576,25 +582,39 @@ export function createAngler(scene) {
       bend(rig, rig.lure[i], bob - reel * 0.13, 0, sway + reel * 0.02);
     }
 
-    // Jaw: the probe decided which way is "down"; the gape drives the rest.
-    const jawSign = rig.jawSign ?? 1;
+    // Jaw: swing it down its solved hinge. The chain shares the load so the
+    // whole lower jaw curves open rather than snapping at one joint.
     const gape = ease(state.gape);
-    const jawAngles = [0.62, 0.2, 0.1];
+    const jawAngles = [0.78, 0.34, 0.16];
     for (let i = 0; i < rig.jaw.length; i++) {
-      const shudder = state.gape > 0.5 ? Math.sin(t * 26 + i) * 0.012 * state.gape : 0;
-      bend(rig, rig.jaw[i], jawSign * (gape * jawAngles[i] + shudder), 0, 0);
+      const shudder = state.gape > 0.5 ? Math.sin(t * 26 + i) * 0.014 * state.gape : 0;
+      hinge(rig, rig.jaw[i], rig.jawAxis?.[i], gape * jawAngles[i] + shudder);
     }
 
     // Upper lip peels back the other way — a jaw alone only ever looks like a
     // drawer opening; the maw has to widen from both sides.
-    const lipSign = rig.lipSign ?? 1;
     for (let s = 0; s < rig.lips.length; s++) {
       const mirror = s === 0 ? 1 : -1;
       const chain = rig.lips[s];
       for (let i = 0; i < chain.length; i++) {
-        bend(rig, chain[i], lipSign * gape * (0.26 - i * 0.06), 0, gape * 0.1 * mirror);
+        hinge(
+          rig,
+          chain[i],
+          rig.lipAxis?.[s]?.[i],
+          gape * (0.34 - i * 0.08),
+          gape * 0.12 * mirror, // and splayed outward, so the maw is round
+        );
       }
     }
+  }
+
+  // Write bone = rest * swing-about-hinge * optional lateral splay.
+  function hinge(rig, bone, axis, angle, splay = 0) {
+    if (!bone || !axis) return;
+    const rest = rig.rest.get(bone);
+    if (!rest) return;
+    bone.quaternion.copy(rest).multiply(_q.setFromAxisAngle(axis, angle));
+    if (splay) bone.quaternion.multiply(_q.setFromEuler(_e.set(0, 0, splay, "XYZ")));
   }
 
   // Write bone = rest * offset. Absolute every frame; never accumulates.
@@ -636,6 +656,20 @@ export function createAngler(scene) {
 
   function setAlarmPeriod(seconds) {
     alarmPeriod = seconds;
+  }
+
+  // Scrubbing hook for preview.html: drive the four animation values by hand
+  // with `frozen: true`, so a pose can be held and inspected instead of only
+  // ever flashing past inside a 0.85 s lunge. Not used by the game.
+  function setPose({ phase, gape, glow, lureOut, pulse, speed, heading, pitch } = {}) {
+    if (phase !== undefined) state.phase = phase;
+    if (gape !== undefined) state.gape = gape;
+    if (glow !== undefined) state.glow = glow;
+    if (lureOut !== undefined) state.lureOut = lureOut;
+    if (pulse !== undefined) state.pulse = pulse;
+    if (speed !== undefined) state.speed = speed;
+    if (heading !== undefined) state.heading = heading;
+    if (pitch !== undefined) state.pitch = pitch;
   }
 
   // --- Network -------------------------------------------------------------
@@ -726,6 +760,20 @@ export function createAngler(scene) {
     applyNet,
     isRemote() {
       return remote;
+    },
+    setPose,
+    // Read-only view of the four values the whole animation hangs off, for
+    // the preview's readout.
+    values() {
+      return {
+        phase: state.phase,
+        gape: state.gape,
+        glow: state.glow,
+        lureOut: state.lureOut,
+        pulse: state.pulse,
+        speed: state.speed,
+        t: state.t,
+      };
     },
   };
 }

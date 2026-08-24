@@ -39,7 +39,13 @@ Notes for anyone re-exporting it:
 - The model is **1 unit nose-to-tail** and faces **+Z**, so its scale is its
   length in metres (`ANGLER_LENGTH = 46`).
 - GLTFLoader strips dots from node names: `forehead.L.004` → `foreheadL004`.
-- `angler.js` **probes** the jaw's open direction at load rather than assuming
-  a bone roll, so a re-export with different rolls still opens downward.
+- Bone **roll is not trusted**. Rotating the jaw about its own local X swings
+  it mostly sideways on this metarig. `angler.js` solves the hinge at load
+  instead — the axis perpendicular to both the bone and world-down — so a
+  re-export with different rolls still opens the mouth downward, and by a full
+  ~5 m at the jaw tip rather than ~1.5 m.
+- The GLTF is cached and shared, so each angler `SkeletonUtils.clone()`s it.
+  Two instances on one skeleton would fight over a single pose, and the second
+  would capture the first's animated orientation as its rest pose.
 - `npm run angler` re-runs the headless rig checks against whatever GLB is in
-  this folder.
+  this folder. `/preview.html` is the same rig with a UI on it.

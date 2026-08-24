@@ -36,7 +36,25 @@ black, and the maw takes everyone still in front of it.
 
 The model ships rigged but with **zero animation clips** — the swim, the
 tentacle wave, the lure bob, the gape and the lunge are all written per-frame
-onto the skeleton. `npm run angler` runs those rig checks headlessly.
+onto the skeleton.
+
+### Previewing the rig
+
+```bash
+npm run dev        # then open http://localhost:5173/preview.html
+```
+
+A bench for the animation on its own, importing the real `createAngler()` —
+not a copy of it. Play the whole hunt, loop just the reveal→lunge→snap window,
+or freeze any single beat and scrub gape / lure / glow by hand, because 0.85 s
+of lunge is not long enough to tell whether the lip peel reads. Toggles for the
+skeleton, wireframe, the bite volume, and the water itself.
+
+`npm run angler` runs the same rig headlessly and checks the parts that are
+easy to get silently wrong: that every bone name still resolves, that the jaw
+opens *downward* by a real distance, that the bite volume tracks the animation
+instead of sitting inside the skull, that the beats fire in order, and that a
+diver on the bell is never taken.
 
 ## Stack
 

@@ -205,6 +205,84 @@ check(
   `${client.position.distanceTo(angler.position).toFixed(2)} m apart`,
 );
 
+// --- 5. The poses preview.html holds --------------------------------------
+// The bench freezes one beat at a time. Each held beat has to be a visibly
+// different rig, or the preview is showing six copies of the same fish.
+console.log("\npreview poses");
+const BEATS = {
+  lurk: { gape: 0, lureOut: 1, glow: 0, speed: 0.12 },
+  stalk: { gape: 0, lureOut: 0.45, glow: 0.12, speed: 0.4 },
+  reveal: { gape: 0.75, lureOut: 0.12, glow: 1, speed: 0.5 },
+  lunge: { gape: 1, lureOut: 0.08, glow: 1, speed: 1 },
+  snap: { gape: 0.25, lureOut: 0.08, glow: 0.7, speed: 0.6 },
+  sound: { gape: 0, lureOut: 0.6, glow: 0.15, speed: 0.3 },
+};
+const bench = createAngler(new THREE.Scene());
+await new Promise((r) => setTimeout(r, 800)); // its own async GLB load
+const escaBone = bench.group.getObjectByName("foreheadL014");
+const jawBone = bench.group.getObjectByName("chin001");
+check("bench model loaded", !!escaBone && !!jawBone);
+
+const shapes = [];
+for (const [beat, values] of Object.entries(BEATS)) {
+  bench.place({ x: 0, y: 0, z: 0 }, 0, 5, beat);
+  bench.setPose({ phase: beat, ...values });
+  // Frozen means the state machine cannot advance past the beat under test.
+  for (let i = 0; i < 20; i++) bench.update(1 / 60, 5 + i / 60, noise, { frozen: true });
+  const held = bench.values();
+  check(
+    `${beat} holds its beat`,
+    held.phase === beat && Math.abs(held.gape - values.gape) < 0.001,
+    `phase=${held.phase} gape=${held.gape.toFixed(2)}`,
+  );
+  shapes.push({
+    beat,
+    jaw: jawBone.getWorldPosition(new THREE.Vector3()).sub(bench.position),
+    esca: escaBone.getWorldPosition(new THREE.Vector3()).sub(bench.position),
+  });
+}
+
+// The lure reeling back over the skull is the tell that it has chosen you, so
+// it has to actually move between "dangled out" and "reeled in".
+const dangled = shapes.find((s) => s.beat === "lurk").esca;
+const reeled = shapes.find((s) => s.beat === "lunge").esca;
+check("the lure reels in", dangled.distanceTo(reeled) > 1, `${dangled.distanceTo(reeled).toFixed(2)} m of travel`);
+
+const shut = shapes.find((s) => s.beat === "lurk").jaw;
+const wide = shapes.find((s) => s.beat === "lunge").jaw;
+check("lunge is the widest gape", wide.y < shut.y - 2, `${shut.y.toFixed(2)} m → ${wide.y.toFixed(2)} m`);
+check(
+  "every held beat is a distinct pose",
+  new Set(shapes.map((s) => `${s.jaw.y.toFixed(2)}|${s.esca.y.toFixed(2)}`)).size === shapes.length,
+);
+
+// --- 6. Two anglers at once ------------------------------------------------
+// The GLTF is loaded once and cached, so instances must clone the skeleton.
+// Sharing it is silent and awful: the second angler captures the first one's
+// mid-animation pose as its own "rest" and never opens its mouth properly
+// again. This is the check that catches that.
+console.log("\ntwo at once");
+const twinA = createAngler(new THREE.Scene());
+const twinB = createAngler(new THREE.Scene());
+await new Promise((r) => setTimeout(r, 800));
+
+const jawA = twinA.group.getObjectByName("chin001");
+const jawB = twinB.group.getObjectByName("chin001");
+check("each instance has its own bones", !!jawA && !!jawB && jawA !== jawB);
+
+for (const [twin, gape] of [[twinA, 1], [twinB, 0]]) {
+  twin.place({ x: 0, y: 0, z: 0 }, 0, 5, "lurk");
+  twin.setPose({ gape, heading: 0, pitch: 0 });
+  for (let i = 0; i < 10; i++) twin.update(1 / 60, 5 + i / 60, noise, { frozen: true });
+}
+const wideOpen = jawA.getWorldPosition(new THREE.Vector3()).y - twinA.position.y;
+const clamped = jawB.getWorldPosition(new THREE.Vector3()).y - twinB.position.y;
+check(
+  "one can gape while the other stays shut",
+  clamped - wideOpen > 2,
+  `open ${wideOpen.toFixed(2)} m vs shut ${clamped.toFixed(2)} m`,
+);
+
 try {
   fs.rmSync(shimmed, { force: true });
 } catch {

@@ -1,4 +1,7 @@
 import { defineConfig } from "vite";
+import { fileURLToPath } from "node:url";
+
+const page = (name) => fileURLToPath(new URL(`./${name}`, import.meta.url));
 
 export default defineConfig({
   // Relative base so the build works on GitHub Pages project sites
@@ -9,6 +12,12 @@ export default defineConfig({
   },
   build: {
     target: "es2020",
+    rollupOptions: {
+      // Two pages: the game, and the Lanternmaw rig bench. Without listing
+      // preview.html here Vite would only ever build index.html and the
+      // preview would 404 on Pages.
+      input: { main: page("index.html"), preview: page("preview.html") },
+    },
   },
   plugins: [localPeerServer()],
 });
