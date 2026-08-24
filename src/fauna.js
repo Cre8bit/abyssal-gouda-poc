@@ -15,13 +15,6 @@ const LURE_MAX = 420;
 const JELLY_COUNT = 5;
 const JELLY_LEASH = 80;
 
-// The leviathan is a silhouette, never a threat. It occludes the marine snow
-// behind it, which is the only reason you notice it at all.
-const LEVI_LENGTH = 26;
-const LEVI_RANGE = 40; // inside the snow field, so it blanks the motes
-const LEVI_CROSS = 190; // total distance it travels across your view
-const LEVI_IDLE_MIN = 70; // long silences between passes: it must feel rare
-const LEVI_IDLE_MAX = 190;
 
 const _v = new THREE.Vector3();
 const _m = new THREE.Matrix4();
@@ -65,38 +58,6 @@ function makeJellyfish() {
     strands.add(line);
   }
   group.add(strands);
-  return group;
-}
-
-function makeLeviathan() {
-  // Fog-exempt and a shade lighter than the deepest water, so its bulk reads at
-  // every depth — and lit, so sweeping your torch across it finds something.
-  const skin = new THREE.MeshStandardMaterial({
-    color: 0x0d1a24,
-    roughness: 0.94,
-    metalness: 0,
-    emissive: 0x070f16,
-    emissiveIntensity: 0.6,
-    fog: false,
-  });
-  const group = new THREE.Group();
-
-  const trunk = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 14), skin);
-  trunk.scale.set(0.16, 0.2, 1).multiplyScalar(LEVI_LENGTH * 0.5);
-  group.add(trunk);
-
-  const tail = new THREE.Mesh(new THREE.ConeGeometry(1, 2.6, 4), skin);
-  tail.scale.set(LEVI_LENGTH * 0.11, LEVI_LENGTH * 0.16, LEVI_LENGTH * 0.02);
-  tail.rotation.z = Math.PI / 2;
-  tail.position.z = LEVI_LENGTH * 0.52;
-  group.add(tail);
-
-  const ridge = new THREE.Mesh(new THREE.ConeGeometry(1, 2, 3), skin);
-  ridge.scale.set(LEVI_LENGTH * 0.02, LEVI_LENGTH * 0.1, LEVI_LENGTH * 0.22);
-  ridge.position.y = LEVI_LENGTH * 0.09;
-  group.add(ridge);
-
-  group.visible = false;
   return group;
 }
 
@@ -181,36 +142,6 @@ export function createFauna(scene, noise, haloFactory) {
     });
   }
 
-  // --- The leviathan: one pass, then a long absence. ---
-  const leviathan = makeLeviathan();
-  scene.add(leviathan);
-  const levi = {
-    idle: 25 + Math.random() * 40, // first pass comes reasonably soon
-    t: 0,
-    active: false,
-    from: new THREE.Vector3(),
-    to: new THREE.Vector3(),
-  };
-
-  function startPass(camera, startAt = 0, forced = null) {
-    // Random bearing in play — you are meant to miss most passes. A screenshot
-    // can force it into view.
-    const bearing = forced ?? Math.random() * Math.PI * 2;
-    // Crosses your view broadside, well out in the dark.
-    const across = Math.cos(bearing + Math.PI / 2);
-    const acrossZ = Math.sin(bearing + Math.PI / 2);
-    const cx = camera.position.x + Math.cos(bearing) * LEVI_RANGE;
-    const cz = camera.position.z + Math.sin(bearing) * LEVI_RANGE;
-    const y = camera.position.y + (Math.random() - 0.5) * 70;
-    levi.from.set(cx - across * LEVI_CROSS * 0.5, y, cz - acrossZ * LEVI_CROSS * 0.5);
-    levi.to.set(cx + across * LEVI_CROSS * 0.5, y, cz + acrossZ * LEVI_CROSS * 0.5);
-    levi.t = startAt; // a screenshot can jump straight to mid-pass
-    levi.active = true;
-    leviathan.visible = true;
-    leviathan.position.lerpVectors(levi.from, levi.to, levi.t);
-    leviathan.lookAt(levi.to);
-  }
-
   function reseedJelly(jelly, camera) {
     const a = Math.random() * Math.PI * 2;
     const d = 18 + Math.random() * (JELLY_LEASH - 30);
@@ -286,24 +217,6 @@ export function createFauna(scene, noise, haloFactory) {
       if (p.distanceTo(camera.position) > JELLY_LEASH) reseedJelly(jelly, camera);
     }
 
-    // The leviathan: mostly a countdown to nothing happening.
-    if (levi.active) {
-      levi.t += delta / 15; // ~15 s to cross
-      if (levi.t >= 1) {
-        levi.active = false;
-        leviathan.visible = false;
-        levi.idle = LEVI_IDLE_MIN + Math.random() * (LEVI_IDLE_MAX - LEVI_IDLE_MIN);
-      } else {
-        leviathan.position.lerpVectors(levi.from, levi.to, levi.t);
-        leviathan.lookAt(levi.to);
-        // A slow tail-driven roll, so it reads as swimming rather than sliding.
-        leviathan.rotateZ(Math.sin(levi.t * Math.PI * 6) * 0.08);
-      }
-    } else {
-      levi.idle -= delta;
-      if (levi.idle <= 0) startPass(camera);
-    }
-
     for (const lure of lures) {
       // Reposition only while invisible, so one never pops in place.
       if (lure.sprite.material.opacity <= 0.001 && Math.random() < 0.01) {
@@ -317,8 +230,5 @@ export function createFauna(scene, noise, haloFactory) {
     }
   }
 
-  return {
-    update,
-    summonLeviathan: (camera, at, bearing) => startPass(camera, at, bearing),
-  };
+  return { update };
 }

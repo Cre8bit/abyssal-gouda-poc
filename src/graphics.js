@@ -16,6 +16,9 @@ import * as THREE from "three";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { buildForest, forestFor } from "./kelp.js";
 import { createFauna } from "./fauna.js";
+import { createCreature } from "./creature.js";
+import { biolumeFor, biolumeDensity, FIELD_RADIUS, HEART_RADIUS } from "./biolume.js";
+import { getCurrents, strengthOf, RADIUS as CURRENT_RADIUS } from "./current.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
@@ -39,7 +42,7 @@ const ALARM_FLASH = 1.1; // seconds for the red flash to bleed out
 const HEMI_BASE = 0.16;
 const GLOOM_BASE = 0.08;
 
-const SNOW_COUNT = 9000;
+const SNOW_COUNT = 2600;
 const SNOW_RADIUS = 42;
 const BUBBLE_COUNT = 460;
 const BUBBLE_RADIUS = 22;
@@ -67,6 +70,10 @@ let kelpLevel = -1;
 let bursts; // { points, states: [{origin, age, duration, delay}] }
 let fauna;
 let sparks; // { points, ages, head } — bioluminescence you stir up moving fast
+let creature;
+let bloom; // the bioluminescent biome: the one place particles are the point
+let bloomLevel = -1;
+const currentMotes = []; // one mote cloud per flow, so each is visible
 let swimSpeed = 0;
 let flare; // { group, light, core, halo, dir, travelled, alive }
 let flashlight; // { group, spot, spill, beam, lens, halo, on }
@@ -164,7 +171,10 @@ export function initGraphics(container) {
   createBursts();
   createFlare();
   createSparks();
+  createBloom();
+  createCurrentMotes();
   fauna = createFauna(scene, noise, createHalo);
+  creature = createCreature(scene);
 
   window.addEventListener("resize", onResize);
 
@@ -606,6 +616,7 @@ function rebuildKelp(level) {
 
 export function setDepthLevel(level) {
   if (level !== kelpLevel && level >= 0) rebuildKelp(level);
+  updateFields(level);
 }
 
 function updateAlarm(delta) {
@@ -825,6 +836,243 @@ function createSnow() {
   scene.add(snow);
 }
 
+const BLOOM_MOTES = 5200; // fewer than before, spread over a far larger region
+const CURRENT_MOTES = 900; // per flow
+
+// Shared look for free-floating bioluminescence: a small hot core in a soft
+// halo, additive so clusters build into a glow.
+function moteMaterial(uniforms, extraVert, extraFrag) {
+  return new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    uniforms,
+    vertexShader: /* glsl */ `
+      uniform float uTime;
+      uniform float uPixelRatio;
+      uniform float uSize;
+      uniform float uDim;
+      attribute float aSeed;
+      varying float vAmt;
+      ${extraVert.declarations}
+      void main() {
+        ${extraVert.body}
+        vec4 mv = modelViewMatrix * vec4(p, 1.0);
+        gl_PointSize = min((0.5 + aSeed * 0.9) * uPixelRatio * (uSize / -mv.z), 4.0);
+        vAmt = amt * uDim * smoothstep(140.0, 1.5, -mv.z);
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      varying float vAmt;
+      void main() {
+        float d = distance(gl_PointCoord, vec2(0.5));
+        float core = smoothstep(0.22, 0.0, d);
+        float halo = smoothstep(0.5, 0.1, d);
+        vec3 col = ${extraFrag};
+        gl_FragColor = vec4(col, (halo * 0.35 + core * 0.9) * vAmt);
+      }
+    `,
+  });
+}
+
+// The bloom: dense at the heart, thinning through a noise-chewed body.
+function createBloom() {
+  const dirs = new Float32Array(BLOOM_MOTES * 3);
+  const rads = new Float32Array(BLOOM_MOTES);
+  const seeds = new Float32Array(BLOOM_MOTES);
+  for (let i = 0; i < BLOOM_MOTES; i++) {
+    const x = Math.random() * 2 - 1;
+    const y = Math.random() * 2 - 1;
+    const z = Math.random() * 2 - 1;
+    const len = Math.hypot(x, y, z) || 1;
+    dirs[i * 3] = x / len;
+    dirs[i * 3 + 1] = y / len;
+    dirs[i * 3 + 2] = z / len;
+    rads[i] = Math.pow(Math.random(), 5.0); // crowd the heart hard
+    seeds[i] = Math.random();
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(dirs, 3));
+  geometry.setAttribute("aRad", new THREE.BufferAttribute(rads, 1));
+  geometry.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 1));
+
+  const material = moteMaterial(
+    {
+      uTime: { value: 0 },
+      uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
+      uSize: { value: 30 },
+      uDim: { value: 0.42 }, // deliberately faint: presence, not fireworks
+      uRadius: { value: FIELD_RADIUS },
+      uHeart: { value: HEART_RADIUS / FIELD_RADIUS },
+      uAniso: { value: new THREE.Vector3(1, 1, 1) },
+      uWarp: { value: 0.3 },
+      uSeed: { value: 0 },
+    },
+    {
+      declarations: `
+        uniform float uRadius;
+        uniform float uHeart;
+        uniform vec3 uAniso;
+        uniform float uWarp;
+        uniform float uSeed;
+        attribute float aRad;
+        float h31(vec3 q) {
+          return fract(sin(dot(q, vec3(127.1, 311.7, 74.7))) * 43758.5453);
+        }
+        float vn3(vec3 q) {
+          vec3 i = floor(q); vec3 f = fract(q);
+          f = f * f * (3.0 - 2.0 * f);
+          return mix(
+            mix(mix(h31(i), h31(i + vec3(1.0,0.0,0.0)), f.x),
+                mix(h31(i + vec3(0.0,1.0,0.0)), h31(i + vec3(1.0,1.0,0.0)), f.x), f.y),
+            mix(mix(h31(i + vec3(0.0,0.0,1.0)), h31(i + vec3(1.0,0.0,1.0)), f.x),
+                mix(h31(i + vec3(0.0,1.0,1.0)), h31(i + vec3(1.0,1.0,1.0)), f.x), f.y),
+            f.z);
+        }`,
+      body: `
+        vec3 dir = position;
+        float reach = 1.0 - uWarp * (1.0 - vn3(dir * 1.7 + uSeed));
+        float amt = 0.0;
+        vec3 p = dir * aRad * uRadius * uAniso;
+        if (aRad <= reach) {
+          float heart = 1.0 - smoothstep(0.0, uHeart, aRad);
+          float halo = 1.0 - smoothstep(0.0, reach, aRad);
+          float clump = 0.4 + 0.9 * vn3(dir * aRad * 3.0 + uSeed + uTime * 0.04);
+          amt = clamp(heart * 0.8 + halo * 0.55, 0.0, 1.0) * clump;
+          // Everything drifts; a still bloom looks dead.
+          p += vec3(
+            sin(uTime * 0.30 + aSeed * 6.283),
+            cos(uTime * 0.24 + aSeed * 4.1),
+            sin(uTime * 0.27 + aSeed * 5.7)
+          ) * 2.2;
+        }`,
+    },
+    "mix(vec3(0.16, 0.62, 0.95), vec3(0.80, 0.98, 1.0), core)",
+  );
+
+  bloom = new THREE.Points(geometry, material);
+  bloom.frustumCulled = false;
+  bloom.visible = false;
+  scene.add(bloom);
+}
+
+// Motes that ride inside a current, so the flow can be seen before it grabs you.
+function createCurrentMotes() {
+  for (const state of getCurrents()) currentMotes.push(makeMoteCloud());
+}
+
+function makeMoteCloud() {
+  const positions = new Float32Array(CURRENT_MOTES * 3);
+  const seeds = new Float32Array(CURRENT_MOTES);
+  const along = new Float32Array(CURRENT_MOTES);
+  const offs = new Float32Array(CURRENT_MOTES * 2);
+  for (let i = 0; i < CURRENT_MOTES; i++) {
+    seeds[i] = Math.random();
+    along[i] = Math.random();
+    const a = Math.random() * Math.PI * 2;
+    const r = Math.sqrt(Math.random());
+    offs[i * 2] = Math.cos(a) * r;
+    offs[i * 2 + 1] = Math.sin(a) * r;
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 1));
+  geometry.setAttribute("aAlong", new THREE.BufferAttribute(along, 1));
+  geometry.setAttribute("aOff", new THREE.BufferAttribute(offs, 2));
+
+  const material = moteMaterial(
+    {
+      uTime: { value: 0 },
+      uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
+      uSize: { value: 34 },
+      uDim: { value: 0.85 },
+      uPower: { value: 0 },
+    },
+    {
+      declarations: "uniform float uPower;",
+      body: `
+        vec3 p = position;
+        float amt = uPower;`,
+    },
+    "mix(vec3(0.20, 0.72, 0.92), vec3(0.85, 1.0, 1.0), core)",
+  );
+
+  const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+  points.visible = false;
+  scene.add(points);
+  return points;
+}
+
+// Place the bloom for this level, and stream the current's motes along its path.
+function updateFields(level) {
+  if (level !== bloomLevel && level >= 0) {
+    const f = biolumeFor(level);
+    bloom.position.set(f.x, f.y, f.z);
+    const u = bloom.material.uniforms;
+    u.uAniso.value.set(f.ax, f.ay, f.az);
+    u.uWarp.value = f.warp;
+    u.uSeed.value = f.seed % 1000;
+    bloom.visible = true;
+    bloomLevel = level;
+  }
+  bloom.material.uniforms.uTime.value = elapsed;
+
+  const flows = getCurrents();
+  for (let f = 0; f < flows.length; f++) streamFlow(flows[f], currentMotes[f]);
+}
+
+function streamFlow(flow, points) {
+  const power = strengthOf(flow);
+  points.visible = power > 0.01 && flow.path.length > 1;
+  if (!points.visible) return;
+
+  points.material.uniforms.uPower.value = power;
+  points.material.uniforms.uTime.value = elapsed;
+  const pos = points.geometry.attributes.position;
+  const along = points.geometry.attributes.aAlong;
+  const offs = points.geometry.attributes.aOff;
+  const last = flow.path.length - 1;
+
+  for (let i = 0; i < CURRENT_MOTES; i++) {
+    // Ride the flow, wrapping back to the mouth at the tail.
+    let t = along.getX(i) + delta_ * 0.055;
+    if (t > 1) t -= 1;
+    along.setX(i, t);
+
+    // Interpolate between nodes: snapping to the nearest one piles every mote
+    // into 14 clumps instead of a stream.
+    const f = t * last;
+    const i0 = Math.min(Math.floor(f), last - 1);
+    const frac = f - i0;
+    const a = flow.path[i0];
+    const b = flow.path[i0 + 1];
+    const node = {
+      x: a.x + (b.x - a.x) * frac,
+      y: a.y + (b.y - a.y) * frac,
+      z: a.z + (b.z - a.z) * frac,
+    };
+    const tan = flow.tangents[i0];
+    // Any two vectors perpendicular to the tangent will do for the offset.
+    const ux = -tan.z;
+    const uz = tan.x;
+    const ul = Math.hypot(ux, uz) || 1;
+    const ox = offs.getX(i) * CURRENT_RADIUS * 0.85;
+    const oy = offs.getY(i) * CURRENT_RADIUS * 0.85;
+    pos.setXYZ(
+      i,
+      node.x + (ux / ul) * ox,
+      node.y + oy,
+      node.z + (uz / ul) * ox,
+    );
+  }
+  pos.needsUpdate = true;
+  along.needsUpdate = true;
+}
+
+let delta_ = 0;
+
 const SPARK_COUNT = 500;
 const SPARK_LIFE = 2.4;
 
@@ -874,6 +1122,25 @@ function createSparks() {
 }
 
 // `speed` is 0..1 of top pace; only real effort wakes the water up.
+// One creature per depth: called when the bell settles.
+export function spawnCreature(y) {
+  creature.spawn(_v1.set(0, y, 0));
+}
+
+// Screenshot hook: put it a fixed distance ahead, broadside on.
+export function placeCreature(pos, bearing, dist) {
+  creature.spawn(_v1.set(pos.x, pos.y, pos.z));
+  creature.group.position.set(
+    pos.x + Math.cos(bearing) * dist,
+    pos.y - 4,
+    pos.z + Math.sin(bearing) * dist,
+  );
+}
+
+export function creaturePosition() {
+  return creature.position;
+}
+
 export function setSwimSpeed(speed) {
   swimSpeed = speed;
 }
@@ -907,10 +1174,6 @@ function updateSparks(delta) {
 
   pos.needsUpdate = true;
   sparks.points.geometry.attributes.aAge.needsUpdate = true;
-}
-
-export function summonLeviathan(at = 0, bearing = null) {
-  fauna.summonLeviathan(camera, at, bearing);
 }
 
 const FLARE_SPEED = 20; // metres per second
@@ -1585,8 +1848,10 @@ export function renderLoop(onFrame) {
     wrapAroundCamera(bubbles, BUBBLE_RADIUS, 0.85, delta, drift);
     updateBursts(delta);
     updateFlare(delta);
+    delta_ = delta;
     updateSparks(delta);
     fauna.update(camera, elapsed, delta);
+    creature.update(delta, elapsed, noise);
 
     kelpTime.value = elapsed;
     animateFlashlight();

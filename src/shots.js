@@ -3,6 +3,7 @@
 // shot are directly comparable.
 import { LEVEL_DROP } from "./bell.js";
 import { forestFor, FOREST_RADIUS } from "./kelp.js";
+import { biolumeFor, FIELD_RADIUS } from "./biolume.js";
 
 // Offsets are relative to the bell, which always sits at x=0, z=0 at its
 // level's depth — so one entry works at any level.
@@ -20,9 +21,13 @@ const VIEWS = {
   "kelp-edge": { level: 1, find: "kelp-edge", yaw: 0, pitch: 0 },
   "kelp-rim": { level: 1, find: "kelp-rim", yaw: 0, pitch: 0 },
   // Ambience: each of these isolates one of the new systems.
-  "levi-2": { level: 2, off: [40, 8, 40], yaw: 2.4, pitch: 0, leviathan: true },
-  "levi-3": { level: 3, off: [40, 8, 40], yaw: 2.4, pitch: 0, leviathan: true },
   "wake-2": { level: 2, off: [40, 8, 40], yaw: 2.4, pitch: -0.5, wake: true },
+  "bloom-heart": { level: 1, find: "bloom", yaw: 0.7, pitch: 0 },
+  "bloom-edge": { level: 2, find: "bloom-edge", yaw: 0, pitch: 0 },
+  "current-1": { level: 1, off: [40, 6, 40], yaw: 2.4, pitch: 0, current: true },
+  "current-3": { level: 3, off: [40, 6, 40], yaw: 2.4, pitch: 0, current: true },
+  "creature-2": { level: 2, off: [40, 6, 40], yaw: 2.4, pitch: 0, creature: true },
+  "creature-3": { level: 3, off: [40, 6, 40], yaw: 2.4, pitch: 0, creature: true },
   "jelly-1": { level: 1, off: [50, 4, 50], yaw: 2.4, pitch: 0.1 },
   "jelly-2": { level: 2, off: [50, 4, 50], yaw: 2.4, pitch: 0.1 },
   "kelp-deep": { level: 3, find: "kelp", yaw: 0.9, pitch: 0 },
@@ -58,6 +63,18 @@ function atForestRim(level) {
   return { x: f.x, y: f.y + 2, z: f.z + FOREST_RADIUS * 0.72 };
 }
 
+// Just off the bloom's heart, looking through the densest part of it.
+function inBloom(level) {
+  const f = biolumeFor(level);
+  return { x: f.x + 7, y: f.y + 2, z: f.z + 9 };
+}
+
+// Outside, far enough back that the whole cloud reads as one shape.
+function atBloomEdge(level) {
+  const f = biolumeFor(level);
+  return { x: f.x, y: f.y + 6, z: f.z + FIELD_RADIUS + 34 };
+}
+
 // The requested view, or null during normal play.
 export function getShot() {
   const name = new URLSearchParams(location.search).get("shot");
@@ -73,6 +90,8 @@ export function getShot() {
   if (view.find === "kelp") base = insideForest(view.level);
   else if (view.find === "kelp-edge") base = atForestEdge(view.level);
   else if (view.find === "kelp-rim") base = atForestRim(view.level);
+  else if (view.find === "bloom") base = inBloom(view.level);
+  else if (view.find === "bloom-edge") base = atBloomEdge(view.level);
   const spot = base ?? {
     x: view.off[0],
     y: -view.level * LEVEL_DROP + view.off[1],
@@ -90,8 +109,9 @@ export function getShot() {
     torch: view.torch !== false,
     flash: view.flash === true,
     flare: view.flare === true,
-    leviathan: view.leviathan === true,
     wake: view.wake === true,
+    current: view.current === true,
+    creature: view.creature === true,
   };
 }
 

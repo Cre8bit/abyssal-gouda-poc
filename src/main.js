@@ -15,7 +15,9 @@ import {
   setDepthLevel,
   fireFlare,
   setSwimSpeed,
-  summonLeviathan,
+  spawnCreature,
+  placeCreature,
+  creaturePosition,
   flashBellAlarm,
 } from "./graphics.js";
 import {
@@ -58,12 +60,18 @@ import {
   DROP_DURATION,
 } from "./bell.js";
 import { getShot, captureErrors } from "./shots.js";
+import { updateCurrent, currentForceAt, forceCurrent } from "./current.js";
+import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import {
   initSonar,
   playPing,
   playDescent,
   playCreak,
   setDroneDepth,
+  setSwimPace,
+  setBreathRate,
+  createCreatureVoice,
+  setSonarListener,
 } from "./sonar.js";
 import {
   initVoice,
@@ -79,6 +87,9 @@ const SPRINT_MULT = 2; // hold Shift to bolt for the bell
 const WATER_INERTIA = 4; // how quickly velocity reaches its target
 const NETWORK_RATE = 1 / 30; // send state 30x per second
 const CEILING_Y = 4; // you cannot swim back above the start line
+const O2_SECONDS = 180; // three minutes of autonomy
+const O2_REFILL_RANGE = 12; // close to the bell tops you back up
+const O2_REFILL_RATE = 22; // seconds of air gained per second alongside
 
 const REMOTE_COLOR = 0x66ff99;
 
@@ -98,6 +109,10 @@ const voiceText = document.getElementById("voice-indicator");
 const restartBtn = document.getElementById("restart-btn");
 const bellPrompt = document.getElementById("bell-prompt");
 const eventCenter = document.getElementById("event-center");
+const minimapCanvas = document.getElementById("minimap");
+const bellRadarCanvas = document.getElementById("bell-radar");
+const oxygenFill = document.getElementById("oxygen-fill");
+const oxygenText = document.getElementById("oxygen-text");
 
 const localPosition = { x: 0, y: 2, z: 8 };
 const velocity = { x: 0, y: 0, z: 0 };
@@ -112,6 +127,11 @@ let settleTimer = -1; // counts down between the bell's stop and the ejection
 let alarmTimer = ALARM_PERIOD;
 let creakTimer = 12;
 let flareCooldown = 0; // the flare is the one thing that buys you a look
+const currentNoise = new ImprovedNoise();
+const drift = { x: 0, y: 0, z: 0 }; // push from whatever current has hold of you
+let inCurrent = false;
+let creatureVoice = null;
+let oxygen = O2_SECONDS;
 
 const remoteBuffers = new Map(); // peerId -> SnapshotBuffer
 const remoteAttached = new Map(); // peerId -> bool
@@ -138,7 +158,10 @@ if (shot) {
 let shotFrame = 0;
 
 // Browsers block audio until the page has been interacted with.
-const startAudio = () => initSonar();
+const startAudio = () => {
+  initSonar();
+  creatureVoice ??= createCreatureVoice();
+};
 window.addEventListener("pointerdown", startAudio, { once: true });
 window.addEventListener("keydown", startAudio, { once: true });
 
@@ -387,7 +410,10 @@ renderLoop((delta) => {
 
   // 2. Advance the bell, then hand out the ejection once it has settled.
   const bell = getBell();
-  if (updateBell(delta)) settleTimer = SETTLE_DELAY;
+  if (updateBell(delta)) {
+    settleTimer = SETTLE_DELAY;
+    spawnCreature(getBell().y); // one arrives with every landing
+  }
   setBellY(bell.y);
   setWaterLevel(bell.level);
   if (settleTimer >= 0) {
@@ -414,11 +440,20 @@ renderLoop((delta) => {
     shotFrame++;
     if (shot.flash && shotFrame === 20) flashBellAlarm();
     if (shot.flare && shotFrame === 6) throwFlare();
-    // Frame 4, not 1: the camera is not moved to the shot position until later
-    // in the frame, so summoning any sooner places it around the world origin.
-    if (shot.leviathan && shotFrame === 4) {
-      // Aim the pass down the camera's own bearing so the shot catches it.
-      summonLeviathan(0.5, Math.atan2(-Math.cos(shot.yaw), -Math.sin(shot.yaw)));
+    // Frame 4: the camera is not moved to the shot pose until later in a frame.
+    if (shot.creature && shotFrame === 4) {
+      placeCreature(
+        localPosition,
+        Math.atan2(-Math.cos(shot.yaw), -Math.sin(shot.yaw)),
+        70,
+      );
+    }
+    if (shot.current && shotFrame === 4) {
+      forceCurrent(
+        localPosition,
+        currentNoise,
+        Math.atan2(-Math.cos(shot.yaw), -Math.sin(shot.yaw)),
+      );
     }
     velocity.x = velocity.y = velocity.z = 0;
   } else if (attached) {
@@ -451,9 +486,16 @@ renderLoop((delta) => {
     velocity.y += (target.y - velocity.y) * k;
     velocity.z += (target.z - velocity.z) * k;
 
-    localPosition.x += velocity.x * delta;
-    localPosition.y += velocity.y * delta;
-    localPosition.z += velocity.z * delta;
+    // The current is added on top of your own swimming, never replacing it —
+    // you can always fight it, you just lose ground doing so.
+    currentForceAt(localPosition.x, localPosition.y, localPosition.z, drift);
+    const wasIn = inCurrent;
+    inCurrent = Math.hypot(drift.x, drift.y, drift.z) > 0.2;
+    if (inCurrent && !wasIn) showEvent("≋ Caught in a current.");
+
+    localPosition.x += (velocity.x + drift.x) * delta;
+    localPosition.y += (velocity.y + drift.y) * delta;
+    localPosition.z += (velocity.z + drift.z) * delta;
     localPosition.y = Math.min(localPosition.y, CEILING_Y);
   }
 
@@ -463,16 +505,27 @@ renderLoop((delta) => {
     (MAX_SPEED * (isSprinting() ? SPRINT_MULT : 1));
   updateCamera(localPosition, yaw, pitch, Math.min(speed, 1));
   setSwimSpeed(shot?.wake ? 1 : Math.min(speed, 1));
+  setSwimPace(Math.min(speed, 1));
 
   // 7. The abyss gets heavier from the second ejection depth down, and blooms
   //    thicken the water wherever you happen to be swimming.
   const dread = clamp((bell.level - 1) / 2, 0, 1);
   setDread(dread);
   setDroneDepth(dread);
+  setBreathRate(Math.max(dread, Math.min(speed, 1)));
   setDepthLevel(bell.level);
 
   // 8. The bell's alarm: red flash on the hull, and a ping panned toward it.
   const bellDist = distanceToBell(localPosition);
+
+  // Oxygen: it only ever goes down out here, and the bell is the only refill.
+  if (!shot) {
+    if (bellDist <= O2_REFILL_RANGE) {
+      oxygen = Math.min(O2_SECONDS, oxygen + O2_REFILL_RATE * delta);
+    } else {
+      oxygen = Math.max(0, oxygen - delta);
+    }
+  }
   alarmTimer -= shot ? 0 : delta;
   if (alarmTimer <= 0) {
     alarmTimer = ALARM_PERIOD;
@@ -485,6 +538,8 @@ renderLoop((delta) => {
   }
 
   // Something shifting out in the dark, on no schedule you can learn.
+  if (!shot) updateCurrent(delta, localPosition, currentNoise);
+  if (shot?.current) updateCurrent(0, localPosition, currentNoise);
   if (flareCooldown > 0) flareCooldown = Math.max(0, flareCooldown - delta);
   creakTimer -= shot ? 0 : delta;
   if (creakTimer <= 0) {
@@ -494,6 +549,11 @@ renderLoop((delta) => {
 
   // 9. Spatial audio listener follows the camera.
   setListenerPose(localPosition, yaw, pitch);
+  setSonarListener(localPosition, yaw, pitch);
+  if (creatureVoice) {
+    const c = creaturePosition();
+    creatureVoice.setPosition(c.x, c.y, c.z);
+  }
 
   // 10. Broadcast local state, throttled.
   networkTimer += shot ? 0 : delta;
@@ -513,6 +573,14 @@ renderLoop((delta) => {
 
   // 12. HUD.
   drawCompass(yaw);
+  drawMinimap(yaw);
+  drawBellRadar(yaw, bellDist);
+
+  const o2 = oxygen / O2_SECONDS;
+  oxygenFill.style.width = `${(o2 * 100).toFixed(1)}%`;
+  oxygenFill.style.background =
+    o2 > 0.5 ? "#9fe8ff" : o2 > 0.2 ? "#ffcc7a" : "#ff6a5a";
+  oxygenText.textContent = `O₂ ${Math.ceil(oxygen)}s`;
   depthText.textContent = `LVL ${bell.level} · ▼ ${Math.max(0, Math.round(-localPosition.y))} m`;
   bellPrompt.textContent = attached
     ? `⚓ Hooked on — ${hooked}/${crew} aboard · E to release`
@@ -567,6 +635,92 @@ function drawCompass(yaw) {
 
   // Center marker.
   ctx.fillRect(w / 2 - 1, h - 12, 2, 12);
+}
+
+// Four quadrants around you. A teammate lights the one they are in — enough to
+// point you, never enough to walk straight to them.
+const minimapCtx = minimapCanvas.getContext("2d");
+
+function drawMinimap(yaw) {
+  const w = minimapCanvas.width;
+  const h = minimapCanvas.height;
+  const cx = w / 2;
+  const cy = h / 2;
+  const radius = Math.min(w, h) / 2 - 2;
+  const ctx = minimapCtx;
+
+  // How strongly each quadrant is lit: front, right, back, left.
+  const lit = [0, 0, 0, 0];
+  for (const [peerId, buffer] of remoteBuffers) {
+    const sample = buffer.last?.() ?? buffer.sample();
+    if (!sample) continue;
+    const dx = sample.x - localPosition.x;
+    const dz = sample.z - localPosition.z;
+    const dist = Math.hypot(dx, dz);
+    if (dist < 0.001) continue;
+    // Rotate into view space so the map turns with you.
+    const forward = -Math.atan2(dx, -dz) - yaw;
+    const a = ((forward % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+    const q = Math.floor(((a + Math.PI / 4) % (Math.PI * 2)) / (Math.PI / 2));
+    lit[q] = Math.max(lit[q], Math.max(0.15, 1 - dist / 160));
+  }
+
+  paintQuadrants(ctx, minimapCanvas, lit, "120, 220, 255");
+}
+
+// The same dial again, but for the bell. Deliberately a second instrument
+// rather than a marker on the first: you have to read them both.
+const bellRadarCtx = bellRadarCanvas.getContext("2d");
+
+function drawBellRadar(yaw, dist) {
+  const bell = getBell();
+  const lit = [0, 0, 0, 0];
+  const dx = 0 - localPosition.x;
+  const dz = 0 - localPosition.z;
+  if (Math.hypot(dx, dz) > 0.001) {
+    const forward = -Math.atan2(dx, -dz) - yaw;
+    const a = ((forward % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+    const q = Math.floor(((a + Math.PI / 4) % (Math.PI * 2)) / (Math.PI / 2));
+    lit[q] = Math.max(0.2, 1 - dist / 260);
+  }
+  paintQuadrants(bellRadarCtx, bellRadarCanvas, lit, "255, 196, 120");
+  // Vertical hint: the bell is often above or below, not just off to one side.
+  const rise = bell.y + 1.6 - localPosition.y;
+  if (Math.abs(rise) > 4) {
+    const ctx = bellRadarCtx;
+    ctx.fillStyle = "rgba(255, 210, 150, 0.85)";
+    ctx.font = "10px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText(rise > 0 ? "▲" : "▼", bellRadarCanvas.width / 2, 12);
+  }
+}
+
+function paintQuadrants(ctx, canvas, lit, rgb) {
+  const w = canvas.width;
+  const h = canvas.height;
+  const cx = w / 2;
+  const cy = h / 2;
+  const radius = Math.min(w, h) / 2 - 2;
+  ctx.clearRect(0, 0, w, h);
+  for (let q = 0; q < 4; q++) {
+    const start = -Math.PI / 2 - Math.PI / 4 + (q * Math.PI) / 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.arc(cx, cy, radius, start, start + Math.PI / 2);
+    ctx.closePath();
+    ctx.fillStyle = `rgba(${rgb}, ${0.05 + lit[q] * 0.45})`;
+    ctx.fill();
+    ctx.strokeStyle = `rgba(${rgb}, 0.22)`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+  ctx.fillStyle = "rgba(220, 245, 255, 0.9)";
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - 5);
+  ctx.lineTo(cx - 3.5, cy + 4);
+  ctx.lineTo(cx + 3.5, cy + 4);
+  ctx.closePath();
+  ctx.fill();
 }
 
 function showStatus(text) {

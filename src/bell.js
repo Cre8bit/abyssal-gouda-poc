@@ -6,6 +6,7 @@ export const DROP_DURATION = 2.2;
 export const ATTACH_RADIUS = 7;
 export const EJECT_MIN = 55;
 export const EJECT_MAX = 85;
+const EJECT_GROWTH = 0.35; // each depth throws you proportionally further
 export const SETTLE_DELAY = 0.4;
 export const ALARM_PERIOD = 5; // seconds between the bell's red flash + ping
 
@@ -88,8 +89,10 @@ export function slotOffset(peerId) {
 
 // Where a diver lands when the bell shakes them off: same depth, random bearing.
 export function ejectPosition(bellY) {
+  // The deeper you are, the wider the scatter — and the harder the way back.
+  const spread = 1 + Math.max(0, bell.level - 1) * EJECT_GROWTH;
   const angle = Math.random() * Math.PI * 2;
-  const dist = EJECT_MIN + Math.random() * (EJECT_MAX - EJECT_MIN);
+  const dist = (EJECT_MIN + Math.random() * (EJECT_MAX - EJECT_MIN)) * spread;
   return {
     x: Math.cos(angle) * dist,
     y: bellY,

@@ -8,6 +8,8 @@ let ambience = null;
 let ambienceFilter = null;
 let noiseBuffer = null;
 let droneDepth = -1;
+let swim = null; // { gain, filter } — water moving past you
+let breath = null; // { gain, filter } — your own regulator, barely there
 
 const PING_REF = 22; // metres at which the ping is half as loud
 
@@ -20,6 +22,8 @@ export function initSonar() {
   noiseBuffer = makeNoiseBuffer();
   startDrone();
   startAmbience();
+  startSwim();
+  startBreath();
   ctx.resume();
 }
 
@@ -102,6 +106,146 @@ export function setDroneDepth(dread) {
   droneDepth = dread;
   drone.gain.setTargetAtTime(0.02 + dread * 0.09, ctx.currentTime, 2);
   ambience.gain.setTargetAtTime(0.055 + dread * 0.03, ctx.currentTime, 2);
+}
+
+// Water past the hull of the helmet. You are inside a sealed metal sphere, so
+// this is a dull low surge, not the hiss you would hear with a bare head.
+function startSwim() {
+  const gain = ctx.createGain();
+  gain.gain.value = 0;
+
+  // Two stages: the helmet kills the top end hard, then a resonant low peak
+  // stands in for the shell ringing around you.
+  const muffle = ctx.createBiquadFilter();
+  muffle.type = "lowpass";
+  muffle.frequency.value = 240;
+  muffle.Q.value = 0.5;
+
+  const body = ctx.createBiquadFilter();
+  body.type = "peaking";
+  body.frequency.value = 120;
+  body.Q.value = 1.1;
+  body.gain.value = 5;
+
+  const src = noiseSource(true);
+  src.connect(muffle).connect(body).connect(gain).connect(master);
+  src.start();
+  swim = { gain, filter: muffle };
+}
+
+// `pace` is 0 still, ~0.5 swimming, 1 sprinting. Deliberately understated: it
+// should only register when it stops.
+export function setSwimPace(pace) {
+  if (!swim) return;
+  const p = Math.min(Math.max(pace, 0), 1);
+  const now = ctx.currentTime;
+  swim.gain.gain.setTargetAtTime(0.013 * p * p, now, 0.3);
+  swim.filter.frequency.setTargetAtTime(180 + 260 * p, now, 0.35);
+}
+
+// A slow regulator cycle, very quiet — the sound you notice only in its absence.
+function startBreath() {
+  const gain = ctx.createGain();
+  gain.gain.value = 0;
+
+  const filter = ctx.createBiquadFilter();
+  filter.type = "bandpass";
+  filter.frequency.value = 620;
+  filter.Q.value = 1.4;
+
+  const src = noiseSource(true);
+  src.connect(filter).connect(gain).connect(master);
+  src.start();
+
+  // Asymmetric: a short draw in, a longer release out.
+  const cycle = ctx.createOscillator();
+  cycle.type = "triangle";
+  cycle.frequency.value = 0.22; // ~13 breaths a minute
+  const depth = ctx.createGain();
+  depth.gain.value = 0.016;
+  cycle.connect(depth).connect(gain.gain);
+  cycle.start();
+
+  gain.gain.value = 0.018;
+  breath = { gain, filter, cycle };
+}
+
+// Breathing quickens with effort and with depth.
+export function setBreathRate(effort) {
+  if (!breath) return;
+  const now = ctx.currentTime;
+  breath.cycle.frequency.setTargetAtTime(0.22 + effort * 0.28, now, 1.5);
+}
+
+// --- The creature ---------------------------------------------------------
+
+// Its own swimming: the same muffled surge as yours, but out there in the dark
+// and positioned in space, so you can hear which way it went.
+export function createCreatureVoice() {
+  if (!ctx) return null;
+  const panner = ctx.createPanner();
+  panner.panningModel = "HRTF";
+  panner.distanceModel = "inverse";
+  panner.refDistance = 4;
+  panner.maxDistance = 120;
+  panner.rolloffFactor = 1.5;
+  panner.connect(master);
+
+  const gain = ctx.createGain();
+  gain.gain.value = 0.5;
+
+  const muffle = ctx.createBiquadFilter();
+  muffle.type = "lowpass";
+  muffle.frequency.value = 300;
+
+  // A slow surge, so it reads as something large moving unhurriedly.
+  const surge = ctx.createOscillator();
+  surge.type = "sine";
+  surge.frequency.value = 0.55;
+  const surgeDepth = ctx.createGain();
+  surgeDepth.gain.value = 0.4;
+  surge.connect(surgeDepth).connect(gain.gain);
+  surge.start();
+
+  const src = noiseSource(true);
+  src.connect(muffle).connect(gain).connect(panner);
+  src.start();
+
+  return {
+    setPosition(x, y, z) {
+      if (panner.positionX) {
+        panner.positionX.value = x;
+        panner.positionY.value = y;
+        panner.positionZ.value = z;
+      } else {
+        panner.setPosition(x, y, z);
+      }
+    },
+  };
+}
+
+// The sound world needs to know where your head is and which way it faces.
+export function setSonarListener(pos, yaw, pitch) {
+  if (!ctx) return;
+  const l = ctx.listener;
+  const cp = Math.cos(pitch);
+  const fx = -Math.sin(yaw) * cp;
+  const fy = Math.sin(pitch);
+  const fz = -Math.cos(yaw) * cp;
+  if (l.positionX) {
+    l.positionX.value = pos.x;
+    l.positionY.value = pos.y;
+    l.positionZ.value = pos.z;
+    l.forwardX.value = fx;
+    l.forwardY.value = fy;
+    l.forwardZ.value = fz;
+    l.upX.value = 0;
+    l.upY.value = 1;
+    l.upZ.value = 0;
+  } else {
+    l.setPosition(pos.x, pos.y, pos.z);
+    l.setOrientation(fx, fy, fz, 0, 1, 0);
+  }
 }
 
 // --- The bell -------------------------------------------------------------
