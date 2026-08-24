@@ -6,8 +6,6 @@
 //    the weight of the water column. Swells as you sink into the labyrinth.
 //  - REGULATOR BREATHING: an endless inhale-hiss / exhale-bubble cycle.
 //    Quickens with effort. The exhale drives the visible bubble stream.
-//  - SWIM WASH: band-passed noise that follows your speed — water moving
-//    over the suit.
 //  - HULL CREAKS & DISTANT MOANS: random far-off groans routed through a
 //    feedback-delay cave reverb. The labyrinth is alive, and it's big.
 //  - EVENTS: squelchy gouda digs, bubble bursts, catfish snaps, torch clicks.
@@ -20,7 +18,7 @@
 
 let ctx = null;
 let master, muffle, reverbSend, reverbOut;
-let droneGain, subGain, washGain, washFilter;
+let droneGain, subGain;
 let breathBus;
 let noiseBuffer = null; // 2 s of white noise, shared by everything
 let brownBuffer = null; // 2 s of brown noise — the low rumble bed
@@ -29,6 +27,8 @@ let breathTimer = 0;
 let breathPeriod = 5.2;
 let breathPhase = 0; // counts up; exhale fires at each cycle start
 let creakTimer = 8; // first creak comes early — set the tone
+let ghostTimer = 6; // sparse tonal swells replace any constant drone note
+let bedTime = 0;
 let effortSm = 0;
 let onExhale = null;
 
@@ -112,42 +112,39 @@ export function initAbyssAudio() {
   noiseBuffer = makeNoise("white");
   brownBuffer = makeNoise("brown");
 
-  // --- Pressure drone: detuned subs + brown noise water-mass. ---
+  // --- Water-mass bed: NO steady oscillators (constant tones read as an
+  // engine room). Just deep filtered noise whose color and level breathe on
+  // slow, incommensurate LFOs — the ocean shifting its weight. All tonal
+  // content comes from the sparse GHOST TONES scheduled in update().
   droneGain = ctx.createGain();
   droneGain.gain.value = 0.05;
   droneGain.connect(master);
 
-  for (const [freq, g] of [
-    [41, 0.5],
-    [57.3, 0.3],
-  ]) {
-    const osc = ctx.createOscillator();
-    osc.type = "sine";
-    osc.frequency.value = freq;
-    const og = ctx.createGain();
-    og.gain.value = g;
-    osc.connect(og);
-    og.connect(droneGain);
-    // Slow detune wander so the beat frequency never settles.
-    const lfo = ctx.createOscillator();
-    lfo.frequency.value = 0.05 + Math.random() * 0.04;
-    const lfoGain = ctx.createGain();
-    lfoGain.gain.value = 4;
-    lfo.connect(lfoGain);
-    lfoGain.connect(osc.detune);
-    lfo.start();
-    osc.start();
-  }
-
   const mass = loopNoise(brownBuffer);
   const massFilter = ctx.createBiquadFilter();
   massFilter.type = "lowpass";
-  massFilter.frequency.value = 110;
+  massFilter.frequency.value = 100;
   const massGain = ctx.createGain();
   massGain.gain.value = 0.6;
   mass.connect(massFilter);
   massFilter.connect(massGain);
   massGain.connect(droneGain);
+
+  // The bed slowly opens and closes (filter) and swells and fades (gain).
+  const bedLfo1 = ctx.createOscillator();
+  bedLfo1.frequency.value = 0.023;
+  const bedLfo1Gain = ctx.createGain();
+  bedLfo1Gain.gain.value = 45;
+  bedLfo1.connect(bedLfo1Gain);
+  bedLfo1Gain.connect(massFilter.frequency);
+  bedLfo1.start();
+  const bedLfo2 = ctx.createOscillator();
+  bedLfo2.frequency.value = 0.037;
+  const bedLfo2Gain = ctx.createGain();
+  bedLfo2Gain.gain.value = 0.18;
+  bedLfo2.connect(bedLfo2Gain);
+  bedLfo2Gain.connect(massGain.gain);
+  bedLfo2.start();
 
   // Extra sub for the deep layers (gain driven by depth in update).
   subGain = ctx.createGain();
@@ -158,18 +155,6 @@ export function initAbyssAudio() {
   sub.frequency.value = 28;
   sub.connect(subGain);
   sub.start();
-
-  // --- Swim wash: speed-following noise. ---
-  const wash = loopNoise(noiseBuffer);
-  washFilter = ctx.createBiquadFilter();
-  washFilter.type = "bandpass";
-  washFilter.frequency.value = 380;
-  washFilter.Q.value = 0.7;
-  washGain = ctx.createGain();
-  washGain.gain.value = 0;
-  wash.connect(washFilter);
-  washFilter.connect(washGain);
-  washGain.connect(master);
 
   // --- Breathing bus (events are scheduled onto it). ---
   breathBus = ctx.createGain();
@@ -304,6 +289,25 @@ function inhale(effort) {
     gain: 0.012 + effort * 0.01,
     dest: breathBus,
     attack: 0.25,
+  });
+}
+
+// --- Ghost tones: the mysterious replacement for a constant drone note. ---
+// Every so often a single soft tone swells out of the dark over several
+// seconds, drifts slightly flat, and dissolves into the cave reverb. Random
+// pitch from a sparse low set — never a chord, never a rhythm, never long
+// enough to read as machinery.
+function ghostTone(depth01) {
+  const set = [55, 69, 82, 98, 110, 147];
+  const f0 = set[(Math.random() * set.length) | 0] * (0.99 + Math.random() * 0.02);
+  tone({
+    duration: 8 + Math.random() * 7,
+    from: f0,
+    to: f0 * (0.93 + Math.random() * 0.05),
+    gain: 0.005 + depth01 * 0.006,
+    reverb: 1.8,
+    attack: 3.5,
+    vibrato: Math.random() < 0.35 ? 1.2 : 0,
   });
 }
 
@@ -456,15 +460,26 @@ export function updateAbyssAudio(delta, { speed = 0, radius = 420, sprinting = f
   const effortTarget = Math.min(1, speed + (sprinting ? 0.45 : 0));
   effortSm += (effortTarget - effortSm) * Math.min(1, delta * 0.8);
 
-  // Pressure drone and sub swell with depth; the world muffles down.
+  // Water-mass bed and sub swell with depth; the world muffles down. The
+  // sub rises and falls on its own slow cycle so it never reads as an
+  // idling engine.
+  bedTime += delta;
   droneGain.gain.value = 0.025 + depth01 * 0.045;
-  subGain.gain.value = depth01 * depth01 * 0.03;
+  subGain.gain.value =
+    depth01 * depth01 * 0.03 * (0.55 + 0.45 * Math.sin(bedTime * 0.09));
   muffle.frequency.value = 2400 - depth01 * 1500; // 2400 Hz → 900 Hz
   reverbOut.gain.value = 0.28 + depth01 * 0.32; // tighter spaces echo more
 
-  // Swim wash — barely there: a whisper of water over the suit.
-  washGain.gain.value = speed * speed * 0.03;
-  washFilter.frequency.value = 320 + speed * 480;
+  // (No swim sound at all: movement is felt through the breathing pace and
+  // exhale bubbles. The water speaks only through the bed and ghost tones.)
+
+  // Ghost tones: sparse tonal swells out of the dark, closer together (and
+  // slightly louder) the deeper you are.
+  ghostTimer -= delta;
+  if (ghostTimer <= 0) {
+    ghostTone(depth01);
+    ghostTimer = 16 + Math.random() * 26 - depth01 * 8;
+  }
 
   // Breathing cycle: 6 s calm → ~4 s at full effort.
   breathPeriod = 6.0 - effortSm * 2.0;

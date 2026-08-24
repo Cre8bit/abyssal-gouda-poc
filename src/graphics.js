@@ -70,9 +70,9 @@ const PLANKTON_COUNT = 320;
 const PLANKTON_RADIUS = 26;
 const BREATH_COUNT = 18; // your own exhaled bubbles
 
-const FLASHLIGHT_INTENSITY = 360;
-const SPILL_INTENSITY = 45;
-const REMOTE_LAMP_INTENSITY = 280;
+const FLASHLIGHT_INTENSITY = 260;
+const SPILL_INTENSITY = 32;
+const REMOTE_LAMP_INTENSITY = 190;
 const MAX_PIXEL_RATIO = 1.5;
 
 const DIVER_MODEL_URL = `${import.meta.env.BASE_URL}models/ratdiverAbyssalGouda.glb`;
@@ -148,6 +148,10 @@ function createLocalBody() {
         // Cull backfaces so open tube ends (shoulder/hip cuts) read as
         // see-through instead of dark interior walls.
         obj.material.side = THREE.FrontSide;
+        // Your own suit soaks the torch: darkened below the world's albedo
+        // so arms/gloves never blow out inside the beam core, but with
+        // enough albedo left to keep material definition.
+        obj.material.color?.multiplyScalar(0.58);
       }
     });
     pivot.add(rig.root);
@@ -317,9 +321,9 @@ function setupPostProcessing() {
 
   const bloom = new UnrealBloomPass(
     new THREE.Vector2(window.innerWidth, window.innerHeight),
-    0.4,
+    0.3,
     0.8,
-    0.75,
+    0.88,
   );
   composer.addPass(bloom);
 
@@ -358,6 +362,13 @@ function setupPostProcessing() {
         col.r = texture2D(tDiffuse, uv - ca).r;
         col.g = texture2D(tDiffuse, uv).g;
         col.b = texture2D(tDiffuse, uv + ca).b;
+
+        // HIGHLIGHT COMPRESSOR — nose-to-the-wall the torch core pushes
+        // values far past 1.0 and whites out the whole view. Roll everything
+        // above 1.0 onto a soft shoulder (caps at ~2.0) so close surfaces
+        // stay bright but always keep their detail.
+        vec3 over = max(col - 1.0, vec3(0.0));
+        col = min(col, vec3(1.0)) + over / (1.0 + over);
 
         // UNDERWATER GRADE — red is absorbed by the water column: crush the
         // shadows toward teal while the (flashlight-lit) highlights keep
@@ -1052,7 +1063,7 @@ export function addPlayer(id, color) {
   halo.position.set(0, 0.05, -0.7);
   pivot.add(halo);
 
-  const glow = new THREE.PointLight(color, 3, 12, 2);
+  const glow = new THREE.PointLight(color, 1.8, 12, 2);
   pivot.add(glow);
 
   scene.add(group);

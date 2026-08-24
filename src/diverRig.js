@@ -35,21 +35,27 @@ import * as THREE from "three";
 import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
 
 export const DIVER_SCALE = 1.4; // template ~0.95 tall → ~1.33 world units
+// The FIRST-PERSON body renders smaller than reality: at true scale the
+// arms loom huge and wide across the whole view when looking down (a
+// wide-FOV camera sitting right at the shoulders). A reduced visual scale
+// keeps them readable as "my arms" without dominating the frame.
+const FP_SCALE = 1.2;
 const LEAN = 1.0; // prone swimming lean (rad) — body pitches under the head
 const REF_SPEED = 10; // world speed that maps to a full-effort kick
 
-// First-person body cheat: the body sits lower and barely forward of the
+// First-person body cheat: the body sits well below and slightly behind the
 // true eye anchor, so at idle the hands stay OFF screen entirely and even
-// looking straight down you mostly see forearms, not two arms filling the
-// view. (Was y -0.04 / z -0.18 — hands grazed the screen edge at idle.)
-const FP_OFFSET = new THREE.Vector3(0, -0.14, -0.06);
+// looking straight down you see distant forearms, not two arms filling the
+// view edge-to-edge.
+const FP_OFFSET = new THREE.Vector3(0, -0.52, 0.14);
 
 // Base arm poses (template-space angles), numerically solved per view:
 // the FP pose reaches further forward-down so your own hands stay in frame.
 const ARM_POSE_THIRD = { uy: 1.45, ux: -0.45, fy: 0.25, fx: -0.15 };
-// FP arms hang low, tucked toward the body, and stay out of sight at idle —
-// they only enter the frame when looking well below the horizon.
-const ARM_POSE_FP = { uy: 1.5, ux: -1.35, fy: 0.5, fx: -0.15 };
+// FP arms hang low and WIDE: rotated out to shoulder width (hands never
+// converge in the middle of the view), reaching down-forward. They stay out
+// of sight at idle and only enter the frame looking well below the horizon.
+const ARM_POSE_FP = { uy: 1.25, ux: -1.6, fy: 0.55, fx: -0.15 };
 
 // Only these bones are ever posed (twist helpers excluded = simplified rig).
 const ANIMATED = [
@@ -204,7 +210,8 @@ function buildFpGeometry(scene) {
 // helmet never clips through the camera, and skips the head-look solve.
 export function createDiverRig(template, { firstPerson = false } = {}) {
   const model = SkeletonUtils.clone(template.scene);
-  model.scale.setScalar(DIVER_SCALE);
+  const scale = firstPerson ? FP_SCALE : DIVER_SCALE;
+  model.scale.setScalar(scale);
   model.rotation.y = Math.PI; // template faces +Z; game forward is -Z
 
   const root = new THREE.Group(); // carries lean/roll + the eye anchor
@@ -241,7 +248,7 @@ export function createDiverRig(template, { firstPerson = false } = {}) {
     -template.headRest.x,
     template.headRest.y,
     -template.headRest.z,
-  ).multiplyScalar(DIVER_SCALE);
+  ).multiplyScalar(scale);
 
   const rig = {
     root,
@@ -350,7 +357,7 @@ export function updateDiverRig(
   // Idle water-sway: the body never sits dead still — a slow two-axis
   // wallow that fades as real swimming takes over. Mostly damped in first
   // person: it would translate straight into hands bobbing on screen.
-  const sway = (1 - 0.6 * effort) * (rig.firstPerson ? 0.3 : 1);
+  const sway = (1 - 0.6 * effort) * (rig.firstPerson ? 0.12 : 1);
   applyRootPose(
     rig,
     0.05 * s(c * 0.33 + 1.2) * sway,
