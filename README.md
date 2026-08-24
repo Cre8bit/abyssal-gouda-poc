@@ -16,6 +16,28 @@ drop (`src/bell.js` holds the state machine, `src/main.js` drives it). Ejection
 positions are drawn independently on each client, so no positions cross the wire
 beyond the normal 30 Hz state stream.
 
+## The Lanternmaw
+
+From two levels down there is a second light in the water. It flashes on the
+same five-second beat as the bell's alarm, it pings on roughly the same
+frequency, and the bell radar in the corner of your HUD will light its
+quadrant for you in the same amber — because that instrument has never known
+what the bell *is*, only what pings like one. Swim to the wrong light and the
+lure reels back toward the teeth, a 46-metre face lights itself up out of the
+black, and the maw takes everyone still in front of it.
+
+- Being swallowed is not death: you are out of the dive until the bell settles
+  again, and the crew hauls you back with them. Survivors still count as a full
+  crew, so one bad encounter can't deadlock the descent.
+- **Everyone** swallowed is a wipe, and the dive resets to the surface.
+- The hull is real safety — it will not take a diver hooked onto the bell.
+- The host owns the hunt and streams the pose (`src/angler.js`); no client ever
+  decides on its own whether it was eaten.
+
+The model ships rigged but with **zero animation clips** — the swim, the
+tentacle wave, the lure bob, the gape and the lunge are all written per-frame
+onto the skeleton. `npm run angler` runs those rig checks headlessly.
+
 ## Stack
 
 - **Vite** — bundling & dev server

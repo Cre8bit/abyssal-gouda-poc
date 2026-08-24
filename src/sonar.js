@@ -393,6 +393,98 @@ export function playCreak() {
   osc.stop(at + 2.1);
 }
 
+// --- The Lanternmaw -------------------------------------------------------
+
+// The lure's counterfeit ping. Deliberately built from the same three-tap
+// shape as the bell's, just a shade flat and a shade slower to decay — from
+// far away the difference is exactly small enough to talk yourself out of.
+export function playLurePing(dist = 0, pan = 0) {
+  if (!ctx) return;
+  const now = ctx.currentTime;
+  const level = PING_REF / (PING_REF + dist);
+  if (level < 0.02) return;
+
+  const bus = ctx.createStereoPanner();
+  bus.pan.value = Math.max(-1, Math.min(1, pan));
+
+  const muffle = ctx.createBiquadFilter();
+  muffle.type = "lowpass";
+  muffle.frequency.value = 180 + 620 * level;
+  muffle.Q.value = 1.4;
+  bus.connect(muffle).connect(master);
+
+  for (const [delay, amp, freq] of [
+    [0, 0.38, 246], // ~a semitone under the bell
+    [0.34, 0.16, 219],
+    [0.74, 0.07, 196],
+  ]) {
+    pingVoice(bus, now + delay, amp * level, freq);
+  }
+  subThump(bus, now, 0.46 * level);
+}
+
+// The reveal: a hull-deep bellow with the water shoved out of the way.
+export function playMawRoar(dist = 0, pan = 0) {
+  if (!ctx) return;
+  const at = ctx.currentTime;
+  const level = Math.min(1, 90 / (60 + dist));
+
+  const bus = ctx.createStereoPanner();
+  bus.pan.value = Math.max(-1, Math.min(1, pan));
+  bus.connect(master);
+
+  // Two detuned saws sliding down: the beating between them is the growl.
+  for (const detune of [0, 7]) {
+    const osc = ctx.createOscillator();
+    osc.type = "sawtooth";
+    osc.frequency.setValueAtTime(58 + detune, at);
+    osc.frequency.exponentialRampToValueAtTime(21 + detune, at + 1.5);
+    const throat = ctx.createBiquadFilter();
+    throat.type = "lowpass";
+    throat.frequency.setValueAtTime(420, at);
+    throat.frequency.exponentialRampToValueAtTime(90, at + 1.6);
+    osc.connect(throat).connect(envelope(at, 0.5 * level, 0.18, 1.7)).connect(bus);
+    osc.start(at);
+    osc.stop(at + 1.8);
+  }
+
+  // Displaced water rushing in behind it.
+  const rush = noiseSource();
+  const band = ctx.createBiquadFilter();
+  band.type = "bandpass";
+  band.frequency.setValueAtTime(900, at);
+  band.frequency.exponentialRampToValueAtTime(180, at + 1.2);
+  band.Q.value = 0.7;
+  rush.connect(band).connect(envelope(at, 0.3 * level, 0.3, 1.4)).connect(bus);
+  rush.start(at);
+  rush.stop(at + 1.5);
+}
+
+// The maw closing on you: no distance term — you are inside it.
+export function playSwallow() {
+  if (!ctx) return;
+  const at = ctx.currentTime;
+
+  // The snap.
+  const snap = noiseSource();
+  const crush = ctx.createBiquadFilter();
+  crush.type = "lowpass";
+  crush.frequency.setValueAtTime(2600, at);
+  crush.frequency.exponentialRampToValueAtTime(120, at + 0.45);
+  snap.connect(crush).connect(envelope(at, 0.8, 0.012, 0.6)).connect(master);
+  snap.start(at);
+  snap.stop(at + 0.7);
+
+  // And then the pressure of being somewhere with no water moving in it.
+  const sub = ctx.createOscillator();
+  sub.type = "sine";
+  sub.frequency.setValueAtTime(70, at);
+  sub.frequency.exponentialRampToValueAtTime(24, at + 2.4);
+  sub.connect(envelope(at, 0.7, 0.05, 2.6)).connect(master);
+  sub.start(at);
+  sub.stop(at + 2.7);
+}
+
 // Attack/decay gain node — every voice here shares the same shape.
 function envelope(at, amp, attack, release) {
   const gain = ctx.createGain();

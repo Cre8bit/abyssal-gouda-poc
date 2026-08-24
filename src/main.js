@@ -19,6 +19,11 @@ import {
   placeCreature,
   creaturePosition,
   flashBellAlarm,
+  spawnAngler,
+  despawnAngler,
+  updateAngler,
+  anglerState,
+  placeAngler,
 } from "./graphics.js";
 import {
   hostGame,
@@ -72,6 +77,9 @@ import {
   setBreathRate,
   createCreatureVoice,
   setSonarListener,
+  playLurePing,
+  playMawRoar,
+  playSwallow,
 } from "./sonar.js";
 import {
   initVoice,
@@ -92,6 +100,11 @@ const O2_REFILL_RANGE = 12; // close to the bell tops you back up
 const O2_REFILL_RATE = 22; // seconds of air gained per second alongside
 
 const REMOTE_COLOR = 0x66ff99;
+
+// The Lanternmaw only hunts where it is dark enough for a lure to be the only
+// thing you can see — level 1 is still lit at the top, so it waits.
+const ANGLER_FROM_LEVEL = 1;
+const ANGLER_NET_RATE = 1 / 30;
 
 // --- UI elements ---
 const menu = document.getElementById("menu");
@@ -135,6 +148,17 @@ let oxygen = O2_SECONDS;
 
 const remoteBuffers = new Map(); // peerId -> SnapshotBuffer
 const remoteAttached = new Map(); // peerId -> bool
+const remoteEaten = new Map(); // peerId -> bool, set only by the host's verdict
+
+// --- Swallowed ------------------------------------------------------------
+// Being eaten is not death: you are simply out of the dive until the bell
+// settles again and the crew hauls you back. A wipe is when NOBODY is left,
+// and that is the only thing that resets the descent to the surface.
+let eaten = false;
+let eatenTimer = 0;
+const anglerDivers = []; // reused each frame — no per-frame allocation
+let anglerNetTimer = 0;
+let lurePingTimer = ALARM_PERIOD * 0.5; // offset from the bell's own beat
 
 // --- Setup ---
 const canvas = initGraphics(document.getElementById("scene-container"));
@@ -266,7 +290,7 @@ window.addEventListener("keydown", (e) => {
   } else if (e.code === "KeyG") {
     throwFlare();
   } else if (e.code === "KeyE") {
-    toggleAttach();
+    if (!eaten) toggleAttach();
   } else if (e.code === "KeyR") {
     restart();
     sendEvent({ kind: "restart" });
@@ -341,10 +365,123 @@ function restart() {
   setWaterLevel(0);
   attached = true;
   settleTimer = -1;
+  eaten = false;
+  eatenTimer = 0;
+  despawnAngler();
   for (const peerId of remoteAttached.keys()) remoteAttached.set(peerId, true);
+  for (const peerId of remoteEaten.keys()) remoteEaten.set(peerId, false);
   for (const buffer of remoteBuffers.values()) buffer.reset();
   showEvent("⟲ Restart — everyone back on the bell at the surface.");
   broadcastNow();
+}
+
+// --- The Lanternmaw -------------------------------------------------------
+//
+// One machine owns the hunt. Solo play has no host at all, so "nobody else is
+// connected" counts as owning it too — otherwise the fish would never move
+// for a player testing on their own.
+
+function myId() {
+  return getPeer()?.id ?? "solo";
+}
+
+function ownsAngler() {
+  return isHost || !isConnected();
+}
+
+// Everyone the fish could eat, as flat records it can mark `out` on. Remote
+// divers come from their interpolation buffers, which is close enough: the
+// bite radius is ~8 m and interpolation error is centimetres.
+function collectDivers() {
+  anglerDivers.length = 0;
+  anglerDivers.push({
+    id: myId(),
+    x: localPosition.x,
+    y: localPosition.y,
+    z: localPosition.z,
+    // Riding the bell is genuine safety — the hull is the one place it won't
+    // come, and without that the descent would be unwinnable.
+    out: eaten || attached,
+  });
+  for (const [peerId, buffer] of remoteBuffers) {
+    const s = buffer.last?.() ?? buffer.sample();
+    if (!s) continue;
+    anglerDivers.push({
+      id: peerId,
+      x: s.x,
+      y: s.y,
+      z: s.z,
+      out: remoteEaten.get(peerId) === true || remoteAttached.get(peerId) === true,
+    });
+  }
+  return anglerDivers;
+}
+
+// Host-side verdict. Everyone hears about it; the victim feels it.
+function swallow(id) {
+  if (id === myId()) {
+    if (eaten) return;
+    beSwallowed();
+  } else {
+    if (remoteEaten.get(id)) return;
+    remoteEaten.set(id, true);
+    showEvent("☠ A diver went into the dark. Nothing came back out.", 3600);
+  }
+  if (ownsAngler()) sendEvent({ kind: "eaten", who: id });
+  checkWipe();
+}
+
+function beSwallowed() {
+  eaten = true;
+  eatenTimer = 0;
+  attached = false;
+  velocity.x = velocity.y = velocity.z = 0;
+  if (flashlightOn) flashlightOn = toggleFlashlight();
+  playSwallow();
+  document.getElementById("swallowed")?.classList.remove("hidden");
+  showEvent("☠ SWALLOWED.", 4000);
+  broadcastNow();
+}
+
+// Everybody out of the water at once is the only true loss state.
+function checkWipe() {
+  if (!ownsAngler()) return;
+  const alive =
+    (eaten ? 0 : 1) +
+    [...remoteBuffers.keys()].filter((id) => !remoteEaten.get(id)).length;
+  if (alive > 0) return;
+  showEvent("☠ The crew is gone. The bell goes back up empty.", 4500);
+  sendEvent({ kind: "wipe" });
+  setTimeout(() => restart(), 2600);
+}
+
+// The bell settling is also the recovery beat: whoever it took gets spat back
+// out into the ejection scatter with the rest of the crew.
+function recoverEaten() {
+  if (eaten) {
+    eaten = false;
+    eatenTimer = 0;
+    document.getElementById("swallowed")?.classList.add("hidden");
+    if (!flashlightOn) flashlightOn = toggleFlashlight();
+    showEvent("…you come to in open water. Your light still works.", 3200);
+  }
+  for (const peerId of remoteEaten.keys()) remoteEaten.set(peerId, false);
+}
+
+// Narration for the four beats of the attack, so the horror lands even when
+// you are facing the wrong way.
+function anglerEvent(kind, mark, dist) {
+  const forMe = !mark || mark.id === myId();
+  if (kind === "notice" && forMe) {
+    showEvent("The light ahead stops blinking.", 3000);
+  } else if (kind === "reveal") {
+    const angler = anglerState();
+    const pan = panToward(angler.lurePosition(), getYaw());
+    playMawRoar(dist ?? 40, pan);
+    if (forMe) showEvent("✷ IT IS NOT THE BELL.", 3200);
+  } else if (kind === "lunge" && forMe) {
+    showEvent("⚠ SWIM.", 2000);
+  }
 }
 
 // --- Network callbacks ---
@@ -352,6 +489,7 @@ onPeerConnected((peerId) => {
   addPlayer(peerId, REMOTE_COLOR);
   remoteBuffers.set(peerId, new SnapshotBuffer());
   remoteAttached.set(peerId, false);
+  remoteEaten.set(peerId, false);
   statusPanel.classList.add("hidden");
   if (hostedId) miniCopyLinkBtn.classList.remove("hidden"); // only the host has a link to share
   // A joiner starts at level 0 — drop them straight onto the bell's real depth.
@@ -362,6 +500,7 @@ onPeerDisconnected((peerId) => {
   removePlayer(peerId);
   remoteBuffers.delete(peerId);
   remoteAttached.delete(peerId);
+  remoteEaten.delete(peerId);
   miniCopyLinkBtn.classList.add("hidden");
   showStatus("Diver disconnected.");
 });
@@ -385,6 +524,18 @@ onEventReceived((peerId, data) => {
     settleTimer = -1;
   } else if (data.kind === "restart") {
     restart();
+  } else if (data.kind === "angler") {
+    // Pose stream from the host. A client never runs the hunt itself.
+    anglerState().applyNet(data.s);
+  } else if (data.kind === "eaten") {
+    if (data.who === myId()) {
+      if (!eaten) beSwallowed();
+    } else {
+      remoteEaten.set(data.who, true);
+      showEvent("☠ A diver went into the dark. Nothing came back out.", 3600);
+    }
+  } else if (data.kind === "wipe") {
+    showEvent("☠ The crew is gone. The bell goes back up empty.", 4500);
   }
 });
 
@@ -413,6 +564,12 @@ renderLoop((delta) => {
   if (updateBell(delta)) {
     settleTimer = SETTLE_DELAY;
     spawnCreature(getBell().y); // one arrives with every landing
+    recoverEaten(); // and whoever it took last level surfaces with the crew
+    // Deeper down the water is black enough for a single light to be the only
+    // thing in the world — that is when the lure works.
+    if (ownsAngler() && bell.level >= ANGLER_FROM_LEVEL) {
+      spawnAngler(getBell().y);
+    }
   }
   setBellY(bell.y);
   setWaterLevel(bell.level);
@@ -421,10 +578,16 @@ renderLoop((delta) => {
     if (settleTimer < 0) eject();
   }
 
+  // Swallowed divers are counted out of the crew entirely, so the survivors
+  // can still fill the bell and drop. Without that, one bad encounter would
+  // deadlock the descent for everybody.
+  const eatenPeers = [...remoteEaten.keys()].filter((id) => remoteEaten.get(id));
   const hooked =
-    (attached ? 1 : 0) +
-    [...remoteAttached.values()].filter(Boolean).length;
-  const crew = 1 + remoteAttached.size;
+    (attached && !eaten ? 1 : 0) +
+    [...remoteAttached.entries()].filter(
+      ([id, att]) => att && !remoteEaten.get(id),
+    ).length;
+  const crew = Math.max(1, 1 + remoteAttached.size - eatenPeers.length - (eaten ? 1 : 0));
 
   // 3. The host alone decides when the bell falls, and tells everyone.
   if (!shot && isHost && settleTimer < 0 && readyToDrop(delta, hooked, crew)) {
@@ -448,6 +611,14 @@ renderLoop((delta) => {
         70,
       );
     }
+    if (shot.angler && shotFrame === 4) {
+      placeAngler(
+        localPosition,
+        Math.atan2(-Math.cos(shot.yaw), -Math.sin(shot.yaw)),
+        shot.anglerDist ?? 60,
+        shot.angler,
+      );
+    }
     if (shot.current && shotFrame === 4) {
       forceCurrent(
         localPosition,
@@ -456,6 +627,12 @@ renderLoop((delta) => {
       );
     }
     velocity.x = velocity.y = velocity.z = 0;
+  } else if (eaten) {
+    // Inside it. You still have a camera and nothing to point it at; the slow
+    // roll is the only thing telling you the world is still moving.
+    eatenTimer += delta;
+    velocity.x = velocity.y = velocity.z = 0;
+    localPosition.y -= 1.6 * delta;
   } else if (attached) {
     // Riding the bell: the slot owns your position, swimming is disabled.
     localPosition.x = mySlot.x;
@@ -537,6 +714,43 @@ renderLoop((delta) => {
     playPing(bellDist, pan);
   }
 
+  // --- The Lanternmaw ----------------------------------------------------
+  const angler = anglerState();
+  angler.setAlarmPeriod(ALARM_PERIOD);
+  updateAngler(delta, {
+    frozen: !!shot,
+    divers: !shot && ownsAngler() ? collectDivers() : [],
+    onSwallow: swallow,
+    onEvent: anglerEvent,
+  });
+
+  // The host streams the pose so every window sees the same animal in the
+  // same place — a mob that eats you is not something to run twice.
+  if (ownsAngler() && isConnected() && !shot) {
+    anglerNetTimer += delta;
+    if (anglerNetTimer >= ANGLER_NET_RATE) {
+      anglerNetTimer = 0;
+      sendEvent({ kind: "angler", s: angler.netState() });
+    }
+  }
+
+  // Its counterfeit ping, on the bell's own period but half a beat off. Only
+  // while it is still pretending — once the face is lit it has no more use
+  // for the disguise.
+  const lurePos = angler.lurePosition();
+  const lureDist = Math.hypot(
+    lurePos.x - localPosition.x,
+    lurePos.y - localPosition.y,
+    lurePos.z - localPosition.z,
+  );
+  if (!shot && angler.isDecoy()) {
+    lurePingTimer -= delta;
+    if (lurePingTimer <= 0) {
+      lurePingTimer = ALARM_PERIOD;
+      playLurePing(lureDist, panToward(lurePos, yaw));
+    }
+  }
+
   // Something shifting out in the dark, on no schedule you can learn.
   if (!shot) updateCurrent(delta, localPosition, currentNoise);
   if (shot?.current) updateCurrent(0, localPosition, currentNoise);
@@ -582,11 +796,13 @@ renderLoop((delta) => {
     o2 > 0.5 ? "#9fe8ff" : o2 > 0.2 ? "#ffcc7a" : "#ff6a5a";
   oxygenText.textContent = `O₂ ${Math.ceil(oxygen)}s`;
   depthText.textContent = `LVL ${bell.level} · ▼ ${Math.max(0, Math.round(-localPosition.y))} m`;
-  bellPrompt.textContent = attached
-    ? `⚓ Hooked on — ${hooked}/${crew} aboard · E to release`
-    : bellDist <= ATTACH_RADIUS
-      ? `⚓ Press E to hook onto the bell — ${hooked}/${crew} aboard`
-      : `Bell ${Math.round(bellDist)} m away — ${hooked}/${crew} aboard`;
+  bellPrompt.textContent = eaten
+    ? `☠ Swallowed — you come back when the bell next settles`
+    : attached
+      ? `⚓ Hooked on — ${hooked}/${crew} aboard · E to release`
+      : bellDist <= ATTACH_RADIUS
+        ? `⚓ Press E to hook onto the bell — ${hooked}/${crew} aboard`
+        : `Bell ${Math.round(bellDist)} m away — ${hooked}/${crew} aboard`;
 });
 
 // --- Compass strip (canvas, like a dive HUD) ---
@@ -675,17 +891,32 @@ const bellRadarCtx = bellRadarCanvas.getContext("2d");
 function drawBellRadar(yaw, dist) {
   const bell = getBell();
   const lit = [0, 0, 0, 0];
-  const dx = 0 - localPosition.x;
-  const dz = 0 - localPosition.z;
-  if (Math.hypot(dx, dz) > 0.001) {
-    const forward = -Math.atan2(dx, -dz) - yaw;
-    const a = ((forward % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
-    const q = Math.floor(((a + Math.PI / 4) % (Math.PI * 2)) / (Math.PI / 2));
-    lit[q] = Math.max(0.2, 1 - dist / 260);
+  quadrantAt(lit, 0, 0, yaw, Math.max(0.2, 1 - dist / 260));
+
+  // The spoof. The radar has never known what the bell IS — it lights the
+  // quadrant of the nearest thing pinging on the bell's frequency, and the
+  // lure pings on the bell's frequency. While the fish is still pretending
+  // and its light is closer than the hull, this instrument lies to you, in
+  // exactly the same amber, with the same confidence.
+  const angler = anglerState();
+  let beacon = { y: bell.y + 1.6 };
+  if (angler.isDecoy()) {
+    const lure = angler.lurePosition();
+    const lureDist = Math.hypot(
+      lure.x - localPosition.x,
+      lure.y - localPosition.y,
+      lure.z - localPosition.z,
+    );
+    if (lureDist < dist) {
+      lit[0] = lit[1] = lit[2] = lit[3] = 0;
+      quadrantAt(lit, lure.x, lure.z, yaw, Math.max(0.2, 1 - lureDist / 260));
+      beacon = lure;
+    }
   }
+
   paintQuadrants(bellRadarCtx, bellRadarCanvas, lit, "255, 196, 120");
   // Vertical hint: the bell is often above or below, not just off to one side.
-  const rise = bell.y + 1.6 - localPosition.y;
+  const rise = beacon.y - localPosition.y;
   if (Math.abs(rise) > 4) {
     const ctx = bellRadarCtx;
     ctx.fillStyle = "rgba(255, 210, 150, 0.85)";
@@ -693,6 +924,17 @@ function drawBellRadar(yaw, dist) {
     ctx.textAlign = "center";
     ctx.fillText(rise > 0 ? "▲" : "▼", bellRadarCanvas.width / 2, 12);
   }
+}
+
+// Light the quadrant a world point falls into, in view space.
+function quadrantAt(lit, x, z, yaw, strength) {
+  const dx = x - localPosition.x;
+  const dz = z - localPosition.z;
+  if (Math.hypot(dx, dz) <= 0.001) return;
+  const forward = -Math.atan2(dx, -dz) - yaw;
+  const a = ((forward % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+  const q = Math.floor(((a + Math.PI / 4) % (Math.PI * 2)) / (Math.PI / 2));
+  lit[q] = Math.max(lit[q], strength);
 }
 
 function paintQuadrants(ctx, canvas, lit, rgb) {
@@ -744,4 +986,13 @@ function showEvent(text, duration = 2200) {
 
 function clamp(v, min, max) {
   return Math.max(min, Math.min(max, v));
+}
+
+// Stereo pan in [-1, 1] for a world point, from where you are and where you
+// are looking. Positive is to your right.
+function panToward(pos, yaw) {
+  const dx = pos.x - localPosition.x;
+  const dz = pos.z - localPosition.z;
+  const dist = Math.hypot(dx, dz) || 1;
+  return clamp((dx * Math.cos(yaw) - dz * Math.sin(yaw)) / dist, -1, 1);
 }

@@ -41,6 +41,24 @@ const VIEWS = {
   "bell-side": { level: 2, off: [24, 2, 6], yaw: -1.35, pitch: -0.05 },
   "flare-2": { level: 2, off: [30, 4, 30], yaw: 2.4, pitch: 0, flare: true },
   "flare-3": { level: 3, off: [30, 4, 30], yaw: 2.4, pitch: 0, flare: true },
+  // The Lanternmaw, at the three distances that matter: the lie, the moment
+  // it stops being a lie, and the mouth.
+  "lure-far": {
+    level: 2, off: [30, 4, 30], yaw: 2.4, pitch: 0,
+    angler: "lurk", anglerDist: 150,
+  },
+  "lure-near": {
+    level: 3, off: [30, 4, 30], yaw: 2.4, pitch: 0,
+    angler: "lurk", anglerDist: 62,
+  },
+  "maw-reveal": {
+    level: 3, off: [30, 4, 30], yaw: 2.4, pitch: 0,
+    angler: "reveal", anglerDist: 34,
+  },
+  "maw-lunge": {
+    level: 2, off: [30, 4, 30], yaw: 2.4, pitch: 0,
+    angler: "lunge", anglerDist: 26,
+  },
 };
 
 export const SHOT_NAMES = Object.keys(VIEWS);

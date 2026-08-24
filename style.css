@@ -332,6 +332,55 @@ button:active {
   background: rgba(0, 40, 60, 0.7);
 }
 
+/* Swallowed — the inside of the Lanternmaw. Not quite black: there is a dim
+   red wash to it, and it breathes. */
+#swallowed {
+  position: fixed;
+  inset: 0;
+  z-index: 40;
+  pointer-events: none;
+  display: grid;
+  place-items: center;
+  background:
+    radial-gradient(
+      ellipse at 50% 55%,
+      rgba(60, 6, 6, 0.55) 0%,
+      rgba(6, 0, 0, 0.94) 55%,
+      rgba(0, 0, 0, 0.99) 100%
+    );
+  animation: gullet 5.5s ease-in-out infinite;
+}
+
+@keyframes gullet {
+  0%,
+  100% {
+    opacity: 0.93;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+#swallowed-inner {
+  text-align: center;
+  font-family: monospace;
+}
+
+#swallowed-title {
+  font-size: 30px;
+  letter-spacing: 0.55em;
+  text-indent: 0.55em;
+  color: rgba(255, 120, 96, 0.82);
+  text-shadow: 0 0 26px rgba(255, 60, 40, 0.5);
+}
+
+#swallowed-sub {
+  margin-top: 14px;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  color: rgba(220, 180, 175, 0.5);
+}
+
 .hidden {
   display: none !important;
 }

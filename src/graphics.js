@@ -17,6 +17,7 @@ import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { buildForest, forestFor } from "./kelp.js";
 import { createFauna } from "./fauna.js";
 import { createCreature } from "./creature.js";
+import { createAngler } from "./angler.js";
 import { biolumeFor, biolumeDensity, FIELD_RADIUS, HEART_RADIUS } from "./biolume.js";
 import { getCurrents, strengthOf, RADIUS as CURRENT_RADIUS } from "./current.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
@@ -71,6 +72,7 @@ let bursts; // { points, states: [{origin, age, duration, delay}] }
 let fauna;
 let sparks; // { points, ages, head } — bioluminescence you stir up moving fast
 let creature;
+let angler;
 let bloom; // the bioluminescent biome: the one place particles are the point
 let bloomLevel = -1;
 const currentMotes = []; // one mote cloud per flow, so each is visible
@@ -175,6 +177,7 @@ export function initGraphics(container) {
   createCurrentMotes();
   fauna = createFauna(scene, noise, createHalo);
   creature = createCreature(scene);
+  angler = createAngler(scene);
 
   window.addEventListener("resize", onResize);
 
@@ -1139,6 +1142,31 @@ export function placeCreature(pos, bearing, dist) {
 
 export function creaturePosition() {
   return creature.position;
+}
+
+// --- The Lanternmaw ------------------------------------------------------
+// Unlike the ambient creature, the angler needs to know where the divers are,
+// so main.js drives it from inside onFrame rather than it ticking on its own.
+
+export function spawnAngler(y) {
+  angler.spawn(_v1.set(0, y, 0));
+}
+
+export function despawnAngler() {
+  angler.despawn();
+}
+
+export function updateAngler(delta, ctx) {
+  angler.update(delta, elapsed, noise, ctx);
+}
+
+export function anglerState() {
+  return angler;
+}
+
+// Screenshot hook: park it dead ahead in a fixed phase.
+export function placeAngler(pos, bearing, dist, phase) {
+  angler.place(pos, bearing, dist, phase);
 }
 
 export function setSwimSpeed(speed) {
