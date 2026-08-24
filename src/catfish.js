@@ -23,6 +23,7 @@ import {
   getSpawnPoint,
   WORLD_R,
 } from "./gouda.js";
+import { toonify } from "./toon.js";
 
 const MODEL_URL = `${import.meta.env.BASE_URL}models/catfish_rigged.glb`;
 
@@ -40,6 +41,9 @@ const BITE_DURATION = 1.0; // matches the baked clip
 const BITE_SNAP_T = 0.38; // jaws slam shut at this point of the clip
 const WAYPOINT_EPS = 3;
 const TURN_RATE = 1.8; // rad/s yaw ease (heavy, deliberate turns)
+const SAFE_RADIUS = 75; // no-hunt bubble around the player spawn point
+const SPAWN_MIN = 95; // fish first appear between these distances from
+const SPAWN_MAX = 240; // spawn — visible bulbs in the distance, not a threat
 const STATE_ID = { lurk: 0, stalk: 1, strike: 2 };
 const STATE_NAME = ["lurk", "stalk", "strike"];
 
@@ -60,7 +64,8 @@ function loadTemplate() {
           o.frustumCulled = false; // skinned bounds don't follow the bones
         }
       });
-      return gltf;
+      toonify(gltf.scene, { ink: 0.8 }); // heavy ink — it's the monster
+      return gltf;  
     })
     .catch((err) => {
       console.warn("catfish model failed to load", err);
@@ -113,28 +118,40 @@ export function spawnCatfish(count, gameHooks = {}) {
   });
 }
 
+function distToSpawn(p) {
+  const s = getSpawnPoint();
+  return Math.hypot(p.x - s.x, p.y - s.y, p.z - s.z);
+}
+
 // A wander point in the clear ring around the ball (outside the crust,
-// inside the soft leash the player is held by).
+// inside the soft leash the player is held by) — never inside the safe
+// bubble around the player spawn.
 function openWaterSpot(near = null) {
   const p = new THREE.Vector3();
-  if (near) {
-    p.set(
-      near.x + (Math.random() - 0.5) * 50,
-      near.y + (Math.random() - 0.5) * 34,
-      near.z + (Math.random() - 0.5) * 50,
-    );
-  } else {
-    // First placement: scattered around the PLAYER SPAWN side of the drift
-    // (the full ring is enormous — random points would land out of sight).
-    const s = getSpawnPoint();
-    p.set(
-      s.x + (Math.random() - 0.5) * 200,
-      s.y + (Math.random() - 0.5) * 90,
-      s.z + (Math.random() - 0.5) * 200,
-    );
+  for (let tries = 0; tries < 12; tries++) {
+    if (near) {
+      p.set(
+        near.x + (Math.random() - 0.5) * 50,
+        near.y + (Math.random() - 0.5) * 34,
+        near.z + (Math.random() - 0.5) * 50,
+      );
+    } else {
+      // First placement: a ring around the spawn — close enough that a
+      // lone diver sees bulbs bobbing in the distance, far enough that the
+      // spawn itself stays safe.
+      const s = getSpawnPoint();
+      const a = Math.random() * Math.PI * 2;
+      const d = SPAWN_MIN + Math.random() * (SPAWN_MAX - SPAWN_MIN);
+      p.set(
+        s.x + Math.cos(a) * d,
+        s.y + (Math.random() - 0.5) * 70,
+        s.z + Math.sin(a) * d,
+      );
+    }
+    const r = Math.max(WORLD_R * 0.92, Math.min(WORLD_R + 18, p.length() || 1));
+    p.normalize().multiplyScalar(r);
+    if (distToSpawn(p) > SAFE_RADIUS) break; // outside the bubble — done
   }
-  const r = Math.max(WORLD_R * 0.92, Math.min(WORLD_R + 18, p.length() || 1));
-  p.normalize().multiplyScalar(r);
   return { x: p.x, y: p.y, z: p.z };
 }
 
@@ -348,8 +365,10 @@ function simulate(f, delta, playerPos, localDist, others) {
   f.cooldown = Math.max(0, f.cooldown - delta);
 
   // ---- state transitions ----
-  if (f.state === "lurk" && dist < STALK_RANGE) f.state = "stalk";
-  else if (f.state === "stalk" && dist > LOSE_RANGE) {
+  // The spawn bubble is sanctuary: prey inside it is invisible to the fish.
+  const preySafe = distToSpawn(prey) < SAFE_RADIUS;
+  if (f.state === "lurk" && dist < STALK_RANGE && !preySafe) f.state = "stalk";
+  else if (f.state === "stalk" && (dist > LOSE_RANGE || preySafe)) {
     f.state = "lurk";
     f.waypoint = wanderPoint(f);
   }

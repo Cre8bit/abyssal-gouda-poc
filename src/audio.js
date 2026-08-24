@@ -1,0 +1,487 @@
+// audio.js — procedural abyssal sound engine. ZERO assets: every sound is
+// synthesized in Web Audio, so the game stays a tiny static bundle.
+//
+// The soundscape of oppressive depth:
+//  - PRESSURE DRONE: two detuned sub-oscillators + filtered brown noise —
+//    the weight of the water column. Swells as you sink into the labyrinth.
+//  - REGULATOR BREATHING: an endless inhale-hiss / exhale-bubble cycle.
+//    Quickens with effort. The exhale drives the visible bubble stream.
+//  - SWIM WASH: band-passed noise that follows your speed — water moving
+//    over the suit.
+//  - HULL CREAKS & DISTANT MOANS: random far-off groans routed through a
+//    feedback-delay cave reverb. The labyrinth is alive, and it's big.
+//  - EVENTS: squelchy gouda digs, bubble bursts, catfish snaps, torch clicks.
+//  - GLOBAL MUFFLE: one master low-pass — highs die underwater; it closes
+//    down further the deeper you go.
+//
+// Everything is one static node graph + short-lived event nodes. CPU cost is
+// negligible next to rendering, and nothing here touches the WebRTC voice
+// path (voice.js keeps its own context and HRTF panners).
+
+let ctx = null;
+let master, muffle, reverbSend, reverbOut;
+let droneGain, subGain, washGain, washFilter;
+let breathBus;
+let noiseBuffer = null; // 2 s of white noise, shared by everything
+let brownBuffer = null; // 2 s of brown noise — the low rumble bed
+
+let breathTimer = 0;
+let breathPeriod = 5.2;
+let breathPhase = 0; // counts up; exhale fires at each cycle start
+let creakTimer = 8; // first creak comes early — set the tone
+let effortSm = 0;
+let onExhale = null;
+
+export function isAudioReady() {
+  return ctx !== null;
+}
+
+export function setExhaleListener(fn) {
+  onExhale = fn;
+}
+
+function makeNoise(color) {
+  const len = ctx.sampleRate * 2;
+  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  if (color === "brown") {
+    let last = 0;
+    for (let i = 0; i < len; i++) {
+      const white = Math.random() * 2 - 1;
+      last = (last + 0.02 * white) / 1.02;
+      data[i] = last * 3.5;
+    }
+  } else {
+    for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+  }
+  return buf;
+}
+
+function loopNoise(buffer) {
+  const src = ctx.createBufferSource();
+  src.buffer = buffer;
+  src.loop = true;
+  src.start();
+  return src;
+}
+
+// Must be called from a user gesture (click/keydown) — browsers require it.
+// Idempotent: safe to call on every gesture.
+export function initAbyssAudio() {
+  if (ctx) {
+    if (ctx.state === "suspended") ctx.resume();
+    return;
+  }
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+  // --- Master chain: everything → muffle low-pass → compressor → out.
+  const comp = ctx.createDynamicsCompressor();
+  comp.threshold.value = -18;
+  comp.ratio.value = 4;
+  comp.connect(ctx.destination);
+
+  muffle = ctx.createBiquadFilter();
+  muffle.type = "lowpass";
+  muffle.frequency.value = 2400;
+  muffle.Q.value = 0.4;
+  muffle.connect(comp);
+
+  master = ctx.createGain();
+  master.gain.value = 0.6;
+  master.connect(muffle);
+
+  // --- Cave reverb: a cheap feedback-delay loop, darkened each pass.
+  reverbSend = ctx.createGain();
+  reverbSend.gain.value = 1;
+  const delay = ctx.createDelay(1);
+  delay.delayTime.value = 0.31;
+  const fb = ctx.createGain();
+  fb.gain.value = 0.52;
+  const dark = ctx.createBiquadFilter();
+  dark.type = "lowpass";
+  dark.frequency.value = 850;
+  reverbSend.connect(delay);
+  delay.connect(dark);
+  dark.connect(fb);
+  fb.connect(delay);
+  reverbOut = ctx.createGain();
+  reverbOut.gain.value = 0.5;
+  dark.connect(reverbOut);
+  reverbOut.connect(master);
+
+  noiseBuffer = makeNoise("white");
+  brownBuffer = makeNoise("brown");
+
+  // --- Pressure drone: detuned subs + brown noise water-mass. ---
+  droneGain = ctx.createGain();
+  droneGain.gain.value = 0.05;
+  droneGain.connect(master);
+
+  for (const [freq, g] of [
+    [41, 0.5],
+    [57.3, 0.3],
+  ]) {
+    const osc = ctx.createOscillator();
+    osc.type = "sine";
+    osc.frequency.value = freq;
+    const og = ctx.createGain();
+    og.gain.value = g;
+    osc.connect(og);
+    og.connect(droneGain);
+    // Slow detune wander so the beat frequency never settles.
+    const lfo = ctx.createOscillator();
+    lfo.frequency.value = 0.05 + Math.random() * 0.04;
+    const lfoGain = ctx.createGain();
+    lfoGain.gain.value = 4;
+    lfo.connect(lfoGain);
+    lfoGain.connect(osc.detune);
+    lfo.start();
+    osc.start();
+  }
+
+  const mass = loopNoise(brownBuffer);
+  const massFilter = ctx.createBiquadFilter();
+  massFilter.type = "lowpass";
+  massFilter.frequency.value = 110;
+  const massGain = ctx.createGain();
+  massGain.gain.value = 0.6;
+  mass.connect(massFilter);
+  massFilter.connect(massGain);
+  massGain.connect(droneGain);
+
+  // Extra sub for the deep layers (gain driven by depth in update).
+  subGain = ctx.createGain();
+  subGain.gain.value = 0;
+  subGain.connect(master);
+  const sub = ctx.createOscillator();
+  sub.type = "sine";
+  sub.frequency.value = 28;
+  sub.connect(subGain);
+  sub.start();
+
+  // --- Swim wash: speed-following noise. ---
+  const wash = loopNoise(noiseBuffer);
+  washFilter = ctx.createBiquadFilter();
+  washFilter.type = "bandpass";
+  washFilter.frequency.value = 380;
+  washFilter.Q.value = 0.7;
+  washGain = ctx.createGain();
+  washGain.gain.value = 0;
+  wash.connect(washFilter);
+  washFilter.connect(washGain);
+  washGain.connect(master);
+
+  // --- Breathing bus (events are scheduled onto it). ---
+  breathBus = ctx.createGain();
+  breathBus.gain.value = 0.85;
+  breathBus.connect(master);
+}
+
+// --- One-shot helpers ------------------------------------------------------
+
+function noiseBurst({
+  duration,
+  type = "bandpass",
+  from,
+  to,
+  q = 1,
+  gain,
+  color = "white",
+  dest = master,
+  reverb = 0,
+  attack = 0.01,
+}) {
+  const t = ctx.currentTime;
+  const src = ctx.createBufferSource();
+  src.buffer = color === "brown" ? brownBuffer : noiseBuffer;
+  src.loop = true;
+  const f = ctx.createBiquadFilter();
+  f.type = type;
+  f.Q.value = q;
+  f.frequency.setValueAtTime(from, t);
+  f.frequency.exponentialRampToValueAtTime(Math.max(20, to), t + duration);
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(gain, t + attack);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+  src.connect(f);
+  f.connect(g);
+  g.connect(dest);
+  if (reverb > 0) {
+    const send = ctx.createGain();
+    send.gain.value = reverb;
+    g.connect(send);
+    send.connect(reverbSend);
+  }
+  src.start(t);
+  src.stop(t + duration + 0.05);
+}
+
+function tone({
+  duration,
+  type = "sine",
+  from,
+  to = from,
+  gain,
+  dest = master,
+  reverb = 0,
+  attack = 0.02,
+  vibrato = 0,
+}) {
+  const t = ctx.currentTime;
+  const osc = ctx.createOscillator();
+  osc.type = type;
+  osc.frequency.setValueAtTime(from, t);
+  osc.frequency.exponentialRampToValueAtTime(Math.max(20, to), t + duration);
+  const g = ctx.createGain();
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(gain, t + attack);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + duration);
+  osc.connect(g);
+  g.connect(dest);
+  if (reverb > 0) {
+    const send = ctx.createGain();
+    send.gain.value = reverb;
+    g.connect(send);
+    send.connect(reverbSend);
+  }
+  let lfo = null;
+  if (vibrato > 0) {
+    lfo = ctx.createOscillator();
+    lfo.frequency.value = 3.3;
+    const lg = ctx.createGain();
+    lg.gain.value = vibrato;
+    lfo.connect(lg);
+    lg.connect(osc.frequency);
+    lfo.start(t);
+    lfo.stop(t + duration + 0.05);
+  }
+  osc.start(t);
+  osc.stop(t + duration + 0.05);
+}
+
+// --- The breathing cycle -----------------------------------------------------
+
+function exhale(effort) {
+  // Bubbles leaving the regulator: a descending gurgle plus a few rising
+  // pitch-blips (individual bubbles breaking away).
+  noiseBurst({
+    duration: 1.05,
+    from: 950,
+    to: 320,
+    q: 1.4,
+    gain: 0.028 + effort * 0.02,
+    dest: breathBus,
+    attack: 0.05,
+  });
+  const nBlips = 2 + Math.floor(Math.random() * 3);
+  for (let i = 0; i < nBlips; i++) {
+    setTimeout(
+      () => {
+        if (!ctx) return;
+        const f0 = 500 + Math.random() * 700;
+        tone({
+          duration: 0.09,
+          from: f0,
+          to: f0 * 1.9,
+          gain: 0.006 + Math.random() * 0.005,
+          dest: breathBus,
+          attack: 0.005,
+        });
+      },
+      120 + i * (130 + Math.random() * 120),
+    );
+  }
+  onExhale?.();
+}
+
+function inhale(effort) {
+  noiseBurst({
+    duration: 0.9,
+    from: 400,
+    to: 650,
+    q: 1.1,
+    gain: 0.012 + effort * 0.01,
+    dest: breathBus,
+    attack: 0.25,
+  });
+}
+
+// --- Random abyss voices ------------------------------------------------------
+
+function distantVoice(depth01) {
+  const roll = Math.random();
+  if (roll < 0.45) {
+    // Hull-creak: a strained metallic groan, close-ish. Pressure works on
+    // the suit.
+    const f0 = 70 + Math.random() * 60;
+    tone({
+      duration: 0.5 + Math.random() * 0.5,
+      type: "sawtooth",
+      from: f0,
+      to: f0 * (0.7 + Math.random() * 0.2),
+      gain: 0.008,
+      reverb: 0.9,
+      attack: 0.08,
+      vibrato: 6,
+    });
+  } else if (roll < 0.8) {
+    // Distant moan — something enormous, far away, reverb-drowned.
+    const f0 = 55 + Math.random() * 35;
+    tone({
+      duration: 3 + Math.random() * 2.5,
+      from: f0,
+      to: f0 * 0.72,
+      gain: 0.012 + depth01 * 0.012,
+      reverb: 1.6,
+      attack: 0.9,
+      vibrato: 2.5,
+    });
+  } else {
+    // A far rockfall / cheese-shift: low rumble tumbling away.
+    noiseBurst({
+      duration: 1.6,
+      type: "lowpass",
+      from: 220,
+      to: 60,
+      gain: 0.028,
+      color: "brown",
+      reverb: 1.2,
+      attack: 0.15,
+    });
+  }
+}
+
+// --- Public events -------------------------------------------------------------
+
+// Digging into gouda: a wet squelchy crunch — the cheese gives, bubbles
+// squeeze out, a low thump as the carve collapses.
+export function playDig() {
+  if (!ctx) return;
+  noiseBurst({
+    duration: 0.34,
+    from: 1300,
+    to: 160,
+    q: 1.1,
+    gain: 0.07,
+    color: "brown",
+    reverb: 0.5,
+    attack: 0.008,
+  });
+  tone({
+    duration: 0.22,
+    from: 260,
+    to: 80,
+    gain: 0.038,
+    attack: 0.005,
+  }); // the squelch
+  tone({
+    duration: 0.4,
+    from: 62,
+    to: 40,
+    gain: 0.055,
+    reverb: 0.6,
+    attack: 0.01,
+  }); // the thump
+  // Bubbles escaping the fresh wound.
+  for (let i = 0; i < 4; i++) {
+    setTimeout(
+      () => {
+        if (!ctx) return;
+        const f0 = 400 + Math.random() * 800;
+        tone({
+          duration: 0.08,
+          from: f0,
+          to: f0 * 2.1,
+          gain: 0.008,
+          attack: 0.004,
+        });
+      },
+      60 + i * 90,
+    );
+  }
+}
+
+// A catfish snapping at you: sharp jaw-clap + guttural growl.
+export function playBite() {
+  if (!ctx) return;
+  noiseBurst({
+    duration: 0.08,
+    from: 2500,
+    to: 400,
+    q: 2,
+    gain: 0.09,
+    attack: 0.002,
+  });
+  tone({
+    duration: 0.5,
+    type: "sawtooth",
+    from: 65,
+    to: 38,
+    gain: 0.045,
+    reverb: 0.7,
+    attack: 0.01,
+    vibrato: 9,
+  });
+}
+
+export function playClick() {
+  if (!ctx) return;
+  tone({ duration: 0.03, type: "square", from: 1400, gain: 0.012, attack: 0.002 });
+}
+
+// Teleport/scatter: a rushing whoosh, disorienting.
+export function playWhoosh() {
+  if (!ctx) return;
+  noiseBurst({
+    duration: 1.1,
+    from: 200,
+    to: 1400,
+    q: 0.8,
+    gain: 0.04,
+    reverb: 0.8,
+    attack: 0.3,
+  });
+}
+
+// --- Per-frame update ------------------------------------------------------------
+// opts: { speed (0..1), radius (dist from map center), sprinting }
+export function updateAbyssAudio(delta, { speed = 0, radius = 420, sprinting = false } = {}) {
+  if (!ctx || ctx.state !== "running") return;
+
+  // Depth into the labyrinth, 0 at the drift edge → 1 at the heart.
+  const depth01 = Math.max(0, Math.min(1, 1 - radius / 420));
+
+  // Effort follows speed; sprinting spikes it.
+  const effortTarget = Math.min(1, speed + (sprinting ? 0.45 : 0));
+  effortSm += (effortTarget - effortSm) * Math.min(1, delta * 0.8);
+
+  // Pressure drone and sub swell with depth; the world muffles down.
+  droneGain.gain.value = 0.025 + depth01 * 0.045;
+  subGain.gain.value = depth01 * depth01 * 0.03;
+  muffle.frequency.value = 2400 - depth01 * 1500; // 2400 Hz → 900 Hz
+  reverbOut.gain.value = 0.28 + depth01 * 0.32; // tighter spaces echo more
+
+  // Swim wash — barely there: a whisper of water over the suit.
+  washGain.gain.value = speed * speed * 0.03;
+  washFilter.frequency.value = 320 + speed * 480;
+
+  // Breathing cycle: 6 s calm → ~4 s at full effort.
+  breathPeriod = 6.0 - effortSm * 2.0;
+  breathTimer += delta;
+  if (breathTimer >= breathPeriod) {
+    breathTimer = 0;
+    breathPhase++;
+    exhale(effortSm);
+    // Inhale comes just after the exhale settles.
+    const eff = effortSm;
+    setTimeout(() => ctx && inhale(eff), 1400 - effortSm * 500);
+  }
+
+  // Random distant voices of the abyss — more frequent (and closer) deep in.
+  creakTimer -= delta;
+  if (creakTimer <= 0) {
+    distantVoice(depth01);
+    creakTimer = 10 + Math.random() * 24 - depth01 * 6;
+  }
+}

@@ -24,13 +24,21 @@ import {
   updateDiverRig,
 } from "./diverRig.js";
 import { initCatfishSystem } from "./catfish.js";
+import { toonify } from "./toon.js";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
 
-const ABYSS_COLOR = 0x020806; // murky green-black
+// DEEP TEAL-BLUE ABYSS — water, not space. The key anti-space cues:
+// the void is never pure black (a faint blue-teal ambient floor — light
+// scattered by the water itself), and its hue shifts with depth: a ghost of
+// blue-green above, crushing blue-black below.
+const ABYSS_COLOR = 0x020c12; // mid-water teal-black
+const ABYSS_SHALLOW = new THREE.Color(0x04151d); // looking-up ghost teal
+const ABYSS_DEEP = new THREE.Color(0x010407); // crushing blue-black
+const _fogColor = new THREE.Color(ABYSS_COLOR);
 
 // ONION FOG — density depends on how deep into the ball the player is.
 // At the outer edge the water is almost clear: the whole glowing cheese
@@ -58,10 +66,13 @@ const BUBBLE_COUNT = 160;
 const BUBBLE_RADIUS = 22;
 const BURSTS = 5;
 const BURST_PARTICLES = 24;
+const PLANKTON_COUNT = 320;
+const PLANKTON_RADIUS = 26;
+const BREATH_COUNT = 18; // your own exhaled bubbles
 
-const FLASHLIGHT_INTENSITY = 650;
-const SPILL_INTENSITY = 90;
-const REMOTE_LAMP_INTENSITY = 420;
+const FLASHLIGHT_INTENSITY = 360;
+const SPILL_INTENSITY = 45;
+const REMOTE_LAMP_INTENSITY = 280;
 const MAX_PIXEL_RATIO = 1.5;
 
 const DIVER_MODEL_URL = `${import.meta.env.BASE_URL}models/ratdiverAbyssalGouda.glb`;
@@ -79,6 +90,8 @@ let horrorPass;
 let snow;
 let bubbles;
 let bursts; // { points, states: [{origin, age, duration, delay}] }
+let plankton; // bioluminescent drifters, blinking cyan in the dark
+let breath; // { points, states } — the diver's own exhaled bubbles
 let flashlight; // { group, spot, spill, beam, halo, on } — helmet-mounted
 let elapsed = 0;
 let moveFactor = 0;
@@ -97,7 +110,10 @@ let diverTemplatePromise = null;
 function loadDiverTemplate() {
   diverTemplatePromise ??= new GLTFLoader()
     .loadAsync(DIVER_MODEL_URL)
-    .then((gltf) => prepareDiverTemplate(gltf))
+    .then((gltf) => {
+      toonify(gltf.scene); // cel-shaded diver, same maps
+      return prepareDiverTemplate(gltf);
+    })
     .catch(() => null);
   return diverTemplatePromise;
 }
@@ -211,7 +227,7 @@ export function initGraphics(container) {
   renderer.setPixelRatio(renderPixelRatio());
   renderer.setSize(window.innerWidth, window.innerHeight);
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.3; // cheese should read YELLOW, not olive
+  renderer.toneMappingExposure = 1.1; // yellow cheese, but never blown out
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   // Shadows update EVERY frame. The old 30 Hz throttle showed a stale shadow
@@ -222,11 +238,11 @@ export function initGraphics(container) {
 
   setupPostProcessing();
 
-  // Natural deep-water base light: faint sickly green murk, near-black below.
-  // Slightly stronger than realistic so the ball's silhouette reads from the
-  // drift; the per-zone bioluminescent veins do the rest of the storytelling.
-  scene.add(new THREE.HemisphereLight(0x3d451e, 0x050503, 0.28));
-  const gloom = new THREE.DirectionalLight(0x3a4418, 0.1);
+  // Natural deep-water base light: cold blue-teal from far above (the memory
+  // of a surface kilometres up), near-black blue below. Red is long dead at
+  // this depth — only the flashlight brings warmth back.
+  scene.add(new THREE.HemisphereLight(0x12303e, 0x010407, 0.2));
+  const gloom = new THREE.DirectionalLight(0x2c5566, 0.07);
   gloom.position.set(2, 40, 1);
   scene.add(gloom);
 
@@ -236,6 +252,8 @@ export function initGraphics(container) {
   createSnow();
   createBubbles();
   createBursts();
+  createPlankton();
+  createBreath();
 
   window.addEventListener("resize", onResize);
 
@@ -277,6 +295,19 @@ function updateAtmosphere(delta) {
   const target = fogDensityFor(radius);
   const k = Math.min(1, delta * 0.7); // slow, diver-paced transition
   scene.fog.density += (target - scene.fog.density) * k;
+
+  // Depth-graded water column: the fog (and the void behind it) is a ghost
+  // of teal when you're high in the water, and crushes toward blue-black as
+  // you sink. This vertical hue gradient is what makes the void read as a
+  // MEDIUM instead of empty space.
+  const y = camera.position.y;
+  let t = (y + 120) / 300; // -120 → 0 (deep), +180 → 1 (shallow)
+  t = Math.max(0, Math.min(1, t));
+  t = t * t * (3 - 2 * t);
+  _fogColor.copy(ABYSS_DEEP).lerp(ABYSS_SHALLOW, t);
+  scene.fog.color.lerp(_fogColor, k);
+  scene.background.copy(scene.fog.color);
+
   return 3 / scene.fog.density; // ~visibility in world units
 }
 
@@ -286,9 +317,9 @@ function setupPostProcessing() {
 
   const bloom = new UnrealBloomPass(
     new THREE.Vector2(window.innerWidth, window.innerHeight),
-    0.55,
+    0.4,
     0.8,
-    0.7,
+    0.75,
   );
   composer.addPass(bloom);
 
@@ -310,20 +341,40 @@ function setupPostProcessing() {
       varying vec2 vUv;
 
       void main() {
+        // WATER REFRACTION — two overlapping slow wave fields, strong enough
+        // to feel (space is rigid; water is never still).
         vec2 uv = vUv;
         uv += vec2(
-          sin(uv.y * 18.0 + uTime * 0.35),
-          cos(uv.x * 15.0 - uTime * 0.28)
-        ) * 0.00035;
+          sin(uv.y * 14.0 + uTime * 0.45) + sin(uv.y * 31.0 - uTime * 0.7) * 0.5,
+          cos(uv.x * 12.0 - uTime * 0.38) + cos(uv.x * 27.0 + uTime * 0.6) * 0.5
+        ) * 0.0011;
 
-        vec3 col = texture2D(tDiffuse, uv).rgb;
+        // Chromatic dispersion — light splitting through the water/visor,
+        // strongest at the edges of the view.
+        vec2 toC = vUv - vec2(0.5);
+        float d = length(toC);
+        vec2 ca = toC * d * 0.006;
+        vec3 col;
+        col.r = texture2D(tDiffuse, uv - ca).r;
+        col.g = texture2D(tDiffuse, uv).g;
+        col.b = texture2D(tDiffuse, uv + ca).b;
 
+        // UNDERWATER GRADE — red is absorbed by the water column: crush the
+        // shadows toward teal while the (flashlight-lit) highlights keep
+        // their warmth. Split-tone by luminance.
         float lum = dot(col, vec3(0.299, 0.587, 0.114));
-        col = mix(col, vec3(lum), 0.10);
-        col *= vec3(1.02, 1.0, 0.80); // warm gouda grade — kill the blue
+        col = mix(col, vec3(lum), 0.08);
+        vec3 shadowGrade = col * vec3(0.68, 0.92, 1.05);
+        vec3 lightGrade  = col * vec3(1.05, 1.00, 0.88);
+        col = mix(shadowGrade, lightGrade, smoothstep(0.06, 0.55, lum));
 
-        float d = distance(vUv, vec2(0.5));
-        col *= smoothstep(0.88, 0.32, d);
+        // The blue floor: barely-there teal in the darkest values — enough
+        // to read as water, kept whisper-faint so the abyss stays BLACK.
+        float dark = 1.0 - smoothstep(0.0, 0.16, lum);
+        col += vec3(0.0015, 0.005, 0.008) * dark;
+
+        // Heavy diving-mask vignette.
+        col *= smoothstep(0.92, 0.30, d);
 
         gl_FragColor = vec4(col, 1.0);
       }
@@ -506,9 +557,10 @@ function createFlashlight() {
   group.add(spot.target);
 
   // Broad soft spill — covers most of the field of view, so wherever you
-  // look gets at least a soft wash of light.
+  // look gets at least a soft wash of light. Cooler than the hot core:
+  // water scatters the torch's edges toward green-blue.
   const spill = new THREE.SpotLight(
-    0xe6d8ab,
+    0xc4d8c2,
     SPILL_INTENSITY,
     35,
     1.05,
@@ -522,7 +574,7 @@ function createFlashlight() {
   // Short-range fill: lights your own hands/arms and the wall right in
   // front of your visor, independent of the cones. Kept very dim so your
   // own body barely catches the light and the abyss stays scary.
-  const fill = new THREE.PointLight(0xf0e0b4, 0.7, 5, 1.8);
+  const fill = new THREE.PointLight(0xf0e0b4, 0.4, 5, 1.8);
   fill.position.set(0, -0.05, -0.3);
   group.add(fill);
 
@@ -620,7 +672,8 @@ function createSnow() {
         float lit = min(vLit, 1.2);
         // Barely visible in the dark; blazing motes inside a beam.
         float a = smoothstep(0.5, 0.08, d) * vAlpha * (0.10 + lit * 0.9);
-        vec3 col = mix(vec3(0.5, 0.52, 0.42), vec3(1.0, 0.95, 0.8), lit);
+        // Cool grey-blue motes in the dark; warm only inside a torch beam.
+        vec3 col = mix(vec3(0.42, 0.50, 0.55), vec3(1.0, 0.95, 0.8), lit);
         gl_FragColor = vec4(col * (1.0 + lit * 2.0), a);
       }
     `,
@@ -715,6 +768,19 @@ function createBursts() {
   bursts = { points, states };
 }
 
+// Fire a bubble burst on demand (e.g. a dig tearing gas pockets out of the
+// cheese). Steals the burst slot that's furthest from being visible.
+export function burstAt(x, y, z) {
+  if (!bursts) return;
+  let best = null;
+  for (const s of bursts.states) {
+    if (best === null || s.age < best.age) best = s;
+  }
+  best.origin.set(x, y, z);
+  best.age = 0;
+  best.duration = 2.2 + Math.random();
+}
+
 function respawnBurst(state) {
   // A pocket of gas escaping the cheese somewhere below/around the diver.
   const angle = Math.random() * Math.PI * 2;
@@ -762,6 +828,130 @@ function updateBursts(delta) {
         state.origin.z + Math.sin(seed * 6.283) * spread - wob,
       );
     }
+  }
+  positions.needsUpdate = true;
+}
+
+// --- Plankton: sparse bioluminescent drifters. Most of the time they're
+// nearly invisible; each one blinks awake on its own slow cycle — tiny cyan
+// lives in the dark. Nothing says "you are in water" like the water being
+// inhabited.
+function createPlankton() {
+  const positions = new Float32Array(PLANKTON_COUNT * 3);
+  const seeds = new Float32Array(PLANKTON_COUNT);
+  for (let i = 0; i < PLANKTON_COUNT; i++) {
+    positions[i * 3] = (Math.random() - 0.5) * 2 * PLANKTON_RADIUS;
+    positions[i * 3 + 1] = (Math.random() - 0.5) * 2 * PLANKTON_RADIUS;
+    positions[i * 3 + 2] = (Math.random() - 0.5) * 2 * PLANKTON_RADIUS;
+    seeds[i] = Math.random() * 100;
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 1));
+
+  const material = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    uniforms: {
+      uTime: { value: 0 },
+      uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
+    },
+    vertexShader: /* glsl */ `
+      uniform float uTime;
+      uniform float uPixelRatio;
+      attribute float aSeed;
+      varying float vBlink;
+      void main() {
+        vec3 p = position;
+        // Each drifter wanders on its own little orbit.
+        p.x += sin(uTime * 0.21 + aSeed) * 0.9;
+        p.y += sin(uTime * 0.17 + aSeed * 2.3) * 0.6;
+        p.z += cos(uTime * 0.19 + aSeed * 1.1) * 0.9;
+
+        // Slow personal blink cycle: long dark, brief soft flash.
+        float cyc = sin(uTime * (0.10 + fract(aSeed) * 0.14) + aSeed * 7.0);
+        vBlink = smoothstep(0.86, 0.985, cyc);
+
+        vec4 mv = modelViewMatrix * vec4(p, 1.0);
+        gl_PointSize = (1.5 + fract(aSeed * 3.7) * 2.0) * uPixelRatio
+          * (30.0 / -mv.z) * (0.6 + vBlink);
+        vBlink *= smoothstep(28.0, 6.0, -mv.z);
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      varying float vBlink;
+      void main() {
+        float d = distance(gl_PointCoord, vec2(0.5));
+        float a = smoothstep(0.5, 0.05, d) * vBlink;
+        gl_FragColor = vec4(vec3(0.35, 0.95, 0.95) * (0.6 + vBlink), a * 0.85);
+      }
+    `,
+  });
+
+  plankton = new THREE.Points(geometry, material);
+  scene.add(plankton);
+}
+
+// --- Breath bubbles: your own exhale. A slot ring of bubbles; emitBreath()
+// (driven by the audio engine's breathing cycle, or a fallback timer)
+// releases a small cluster just behind the visor that wobbles surfaceward.
+function createBreath() {
+  const positions = new Float32Array(BREATH_COUNT * 3);
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+
+  const material = new THREE.PointsMaterial({
+    color: 0xcfe8e4,
+    size: 0.09,
+    transparent: true,
+    opacity: 0.5,
+    depthWrite: false,
+  });
+
+  const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+  scene.add(points);
+
+  const states = [];
+  for (let i = 0; i < BREATH_COUNT; i++) {
+    states.push({ x: 0, y: -9999, z: 0, age: 99, seed: Math.random() });
+  }
+  breath = { points, states, cursor: 0 };
+}
+
+// Release a cluster of exhale bubbles at the diver's helmet.
+export function emitBreath(count = 5) {
+  if (!breath) return;
+  camera.getWorldPosition(_v1);
+  for (let n = 0; n < count; n++) {
+    const s = breath.states[breath.cursor];
+    breath.cursor = (breath.cursor + 1) % BREATH_COUNT;
+    s.x = _v1.x + (Math.random() - 0.5) * 0.25;
+    s.y = _v1.y + 0.15 + Math.random() * 0.1;
+    s.z = _v1.z + (Math.random() - 0.5) * 0.25;
+    s.age = -n * 0.09; // stagger the cluster
+    s.seed = Math.random();
+  }
+}
+
+function updateBreath(delta) {
+  const positions = breath.points.geometry.attributes.position;
+  for (let i = 0; i < BREATH_COUNT; i++) {
+    const s = breath.states[i];
+    s.age += delta;
+    if (s.age < 0 || s.age > 6) {
+      positions.setXYZ(i, 0, -9999, 0);
+      continue;
+    }
+    const wob = Math.sin(elapsed * (3.0 + s.seed * 3.0) + s.seed * 40.0) * 0.06;
+    positions.setXYZ(
+      i,
+      s.x + wob,
+      s.y + s.age * (0.9 + s.seed * 0.5),
+      s.z - wob,
+    );
   }
   positions.needsUpdate = true;
 }
@@ -825,6 +1015,7 @@ export function addPlayer(id, color) {
   );
   visor.position.set(0, 0.15, -0.5);
   placeholder.add(visor);
+  toonify(placeholder); // match the cel-shaded world
   pivot.add(placeholder);
 
   // Headlamp rig — initially mounted on the pivot; reparented into the
@@ -1013,10 +1204,21 @@ export function setPlayerLight(id, on) {
 }
 
 export function updateCamera(playerPos, yaw, pitch, speed = 0, roll = 0) {
-  camera.position.set(playerPos.x, playerPos.y, playerPos.z);
+  // BUOYANCY — a visual-only sway layered on the simulated position. Water
+  // never holds you perfectly still: a slow vertical heave, a hint of side
+  // drift, and a breathing roll. Fades as swim speed takes over.
+  const idle = 1 - Math.min(1, moveFactor * 2.5);
+  const heave = Math.sin(elapsed * 0.45) * 0.05 + Math.sin(elapsed * 0.9) * 0.02;
+  const surgeX = Math.sin(elapsed * 0.31 + 1.7) * 0.03;
+  camera.position.set(
+    playerPos.x + surgeX * idle,
+    playerPos.y + heave * idle,
+    playerPos.z + Math.cos(elapsed * 0.27) * 0.03 * idle,
+  );
   camera.rotation.y = yaw;
-  camera.rotation.x = pitch;
-  camera.rotation.z = roll; // subtle bank into turns (order YXZ: applied last)
+  camera.rotation.x = pitch + Math.sin(elapsed * 0.5) * 0.0035 * idle;
+  // Subtle bank into turns + buoyant roll (order YXZ: applied last).
+  camera.rotation.z = roll + Math.sin(elapsed * 0.23) * 0.004 * idle;
   moveFactor += (speed - moveFactor) * 0.05;
 }
 
@@ -1082,13 +1284,17 @@ export function renderLoop(onFrame) {
     elapsed = clock.elapsedTime;
 
     snow.material.uniforms.uTime.value = elapsed;
+    plankton.material.uniforms.uTime.value = elapsed;
     horrorPass.uniforms.uTime.value = elapsed;
     for (const mat of beamMaterials) mat.uniforms.uTime.value = elapsed;
 
     const drift = currentDrift();
-    wrapAroundCamera(snow, SNOW_RADIUS, -0.22, delta, drift);
+    // Snow SINKS slowly — suspension, not a starfield falling past a ship.
+    wrapAroundCamera(snow, SNOW_RADIUS, -0.09, delta, drift);
     wrapAroundCamera(bubbles, BUBBLE_RADIUS, 0.85, delta, drift);
+    wrapAroundCamera(plankton, PLANKTON_RADIUS, -0.015, delta, drift);
     updateBursts(delta);
+    updateBreath(delta);
 
     animateFlashlight();
 

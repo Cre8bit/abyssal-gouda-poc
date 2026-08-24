@@ -11,7 +11,18 @@ import {
   setPlayerLight,
   loadWorld,
   rebuildWorld,
+  emitBreath,
+  burstAt,
 } from "./graphics.js";
+import {
+  initAbyssAudio,
+  updateAbyssAudio,
+  setExhaleListener,
+  playDig,
+  playBite,
+  playClick,
+  playWhoosh,
+} from "./audio.js";
 import {
   resolveCollision,
   findOpenSpot,
@@ -112,6 +123,14 @@ const canvas = initGraphics(document.getElementById("scene-container"));
 initInput();
 initMouseLook(canvas);
 
+// Procedural abyss soundscape — must boot inside a user gesture, so hook
+// every plausible first interaction (idempotent).
+for (const evt of ["pointerdown", "keydown"]) {
+  window.addEventListener(evt, () => initAbyssAudio(), { passive: true });
+}
+// The regulator's exhale releases a visible bubble cluster at the helmet.
+setExhaleListener(() => emitBreath(4 + ((Math.random() * 3) | 0)));
+
 // --- World generation, with a loading screen ---
 // Every game gets its own seed: from the URL if present (invite links carry
 // it), otherwise random. The host's seed wins — joiners rebuild on mismatch.
@@ -150,7 +169,7 @@ async function buildWorld(rebuild = false) {
   // in the labyrinth). Host-simulated and broadcast to joiners; solo players
   // simulate their own.
   despawnCatfish();
-  spawnCatfish(Math.min(16, 10 + 2 * difficulty), {
+  spawnCatfish(Math.min(8, 4 + difficulty), {
     onBite: (fishPos) => {
       // Shove the diver away from the snapping jaws.
       const dx = localPosition.x - fishPos.x;
@@ -160,6 +179,7 @@ async function buildWorld(rebuild = false) {
       velocity.x += (dx / d) * 9;
       velocity.y += (dy / d) * 9;
       velocity.z += (dz / d) * 9;
+      playBite();
       showEvent("🐟 A lantern-catfish snaps at you! Swim!");
     },
   });
@@ -249,6 +269,7 @@ scatterBtn.addEventListener("click", scatter);
 window.addEventListener("keydown", (e) => {
   if (e.code === "KeyF") {
     flashlightOn = toggleFlashlight();
+    playClick();
     showEvent(
       flashlightOn ? "🔦 Flashlight ON" : "🔦 Flashlight OFF — pitch black…",
     );
@@ -298,6 +319,8 @@ function tryDig() {
   }
   lastDigAt = now;
   digAt(hit.x, hit.y, hit.z, DIG_RADIUS);
+  playDig();
+  burstAt(hit.x, hit.y, hit.z); // gas pockets tear free of the cheese
   showEvent("⛏ You carve into the gouda");
   if (isConnected()) {
     sendEvent({ kind: "dig", x: hit.x, y: hit.y, z: hit.z, r: DIG_RADIUS });
@@ -315,6 +338,7 @@ function scatter() {
   const b = findOpenSpot(a, SCATTER_MIN, SCATTER_MAX);
 
   teleportLocal(a.x, a.y, a.z);
+  playWhoosh();
   sendEvent({ kind: "tp", x: b.x, y: b.y, z: b.z });
   showEvent(
     "⨨ Scattered! Find your teammate — look for their light, listen for their voice.",
@@ -374,12 +398,21 @@ onStateReceived((peerId, { x, y, z, yaw, pitch, light, sy, sp }) => {
 onEventReceived((peerId, data) => {
   if (data.kind === "tp") {
     teleportLocal(data.x, data.y ?? 5, data.z);
+    playWhoosh();
     showEvent(
       "⨨ Scattered! Find your teammate — look for their light, listen for their voice.",
     );
   } else if (data.kind === "dig") {
     // Teammate dug somewhere: apply the same carve locally.
     digAt(data.x, data.y, data.z, data.r ?? DIG_RADIUS);
+    burstAt(data.x, data.y, data.z);
+    // Audible only if they're digging nearby — muffled thumps through cheese.
+    const dd = Math.hypot(
+      data.x - localPosition.x,
+      data.y - localPosition.y,
+      data.z - localPosition.z,
+    );
+    if (dd < 45) playDig();
   } else if (data.kind === "fish" && !hostedId) {
     // Host's fish states: run them as interpolated puppets.
     applyCatfishState(data.f);
@@ -498,8 +531,14 @@ renderLoop((delta) => {
     }
   }
 
-  // 5. Spatial audio listener follows the camera.
+  // 5. Spatial audio listener follows the camera; the procedural abyss
+  // soundscape follows depth, speed, and effort.
   setListenerPose(localPosition, yaw, pitch);
+  updateAbyssAudio(delta, {
+    speed: Math.min(1, speed),
+    radius: distFromCenter,
+    sprinting: isSprinting(),
+  });
 
   // 6. Broadcast local state, throttled.
   networkTimer += delta;

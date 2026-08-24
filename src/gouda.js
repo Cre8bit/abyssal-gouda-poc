@@ -36,6 +36,7 @@
 import * as THREE from "three";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { MarchingCubes } from "three/examples/jsm/objects/MarchingCubes.js";
+import { getToonGradient } from "./toon.js";
 
 export const WORLD_R = 420; // outer edge of the drift
 export const BOUNDARY_R = 470; // visible map boundary veil
@@ -714,10 +715,14 @@ function vec3str(hex) {
 // Bioluminescent veins live in the PASTE (glowing from within); the rind
 // stays dead and dark. That contrast is the gouda signature.
 function createGoudaMaterial({ paste, rind, rough, vein, veinStrength }) {
-  const material = new THREE.MeshStandardMaterial({
+  // Cel-shaded cheese: MeshToonMaterial quantizes the lighting into hard
+  // bands (shared gradient map, see toon.js); the custom paste/rind/vein
+  // injection below rides on top unchanged. `rough` is kept for tuning
+  // history but toon shading has no roughness.
+  void rough;
+  const material = new THREE.MeshToonMaterial({
     color: 0xffffff, // overridden per-fragment by the paste/rind mix
-    roughness: rough,
-    metalness: 0.0,
+    gradientMap: getToonGradient(),
   });
 
   const pasteVec = vec3str(paste);
@@ -749,6 +754,11 @@ function createGoudaMaterial({ paste, rind, rough, vein, veinStrength }) {
           float mottle = 0.92 + 0.08 * sin(vGoudaWorld.x * 0.9 + vGoudaWorld.y * 1.3)
                                      * sin(vGoudaWorld.z * 1.1 - vGoudaWorld.y * 0.7);
           diffuseColor.rgb = mix(${pasteVec}, ${rindVec}, vCrust) * mottle;
+          // Ink rim: darken grazing angles toward black — the toon outline.
+          vec3 inkV = normalize(cameraPosition - vGoudaWorld);
+          vec3 inkN = normalize(vGoudaNormal + vec3(1e-5));
+          float ink = smoothstep(0.30, 0.10, abs(dot(inkN, inkV)));
+          diffuseColor.rgb *= mix(1.0, 0.30, ink);
         }`,
         )
         .replace(
@@ -764,15 +774,35 @@ function createGoudaMaterial({ paste, rind, rough, vein, veinStrength }) {
           pulse *= 0.7 + 0.3 * sin(uGoudaTime * 0.173 + gp.y * 0.05);
           vec3 gv = normalize(cameraPosition - gp);
           vec3 gn = normalize(vGoudaNormal + vec3(1e-5));
-          float rim = pow(clamp(1.0 - abs(dot(gn, gv)), 0.0, 1.0), 2.2);
           float inPaste = 1.0 - vCrust * 0.85; // the glow lives in the paste
           // Faint constant self-glow so the paste reads yellow even unlit.
-          totalEmissiveRadiance += ${pasteVec} * inPaste * 0.05;
+          totalEmissiveRadiance += ${pasteVec} * inPaste * 0.04;
           totalEmissiveRadiance += ${veinVec} * patches * (0.25 + 0.75 * pulse) * ${vs} * inPaste;
-          totalEmissiveRadiance += vec3(0.95, 0.62, 0.16) * rim * (0.04 + 0.05 * pulse);
+
+          // WATER SHIMMER — drifting interference ripples playing over
+          // up-facing surfaces, as if the glow of the veins refracts through
+          // moving water above. Reads as caustics without any sun.
+          vec2 cuv = gp.xz * 0.32;
+          float cw = sin(cuv.x * 1.9 + uGoudaTime * 0.65)
+                   + sin(cuv.y * 2.4 - uGoudaTime * 0.5)
+                   + sin((cuv.x + cuv.y) * 1.4 + uGoudaTime * 0.9);
+          float caust = pow(clamp(cw * 0.3333 * 0.5 + 0.5, 0.0, 1.0), 3.0);
+          float upFace = clamp(gn.y * 0.8 + 0.2, 0.0, 1.0);
+          totalEmissiveRadiance += vec3(0.16, 0.30, 0.34) * caust * upFace * 0.06;
+
+          // WET SHEEN — a cold glassy film catching grazing angles, kept
+          // very faint so walls never light up on their own.
+          float wet = pow(clamp(1.0 - abs(dot(gn, gv)), 0.0, 1.0), 3.5);
+          totalEmissiveRadiance += vec3(0.10, 0.20, 0.24) * wet
+            * (0.35 + 0.65 * caust) * 0.2;
         }`,
         );
   };
+  // Zones share the same injection SOURCE but different baked constants —
+  // force a distinct program per zone so three's shader cache can't merge
+  // them into one look.
+  material.customProgramCacheKey = () =>
+    `gouda${pasteVec}${rindVec}${veinVec}${vs}`;
 
   return material;
 }
@@ -873,12 +903,11 @@ function createGoldCore(parent, rng, pos, scale = 1) {
   group.position.set(pos.x, pos.y, pos.z);
   group.scale.setScalar(scale);
 
-  const goldMat = new THREE.MeshStandardMaterial({
+  const goldMat = new THREE.MeshToonMaterial({
     color: 0xffc23d,
     emissive: 0xffb020,
     emissiveIntensity: 2.4,
-    roughness: 0.3,
-    metalness: 0.6,
+    gradientMap: getToonGradient(),
   });
 
   const core = new THREE.Mesh(new THREE.IcosahedronGeometry(4.5, 1), goldMat);
