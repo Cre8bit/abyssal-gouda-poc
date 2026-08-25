@@ -26,12 +26,23 @@
     <div id="hud" class="hidden">
       <canvas id="compass" width="420" height="34"></canvas>
       <div id="depth">▼ 0 m</div>
+      <div id="o2-bar" title="Oxygen">
+        <span class="o2-label">O₂</span>
+        <div class="o2-track"><div id="o2-fill"></div></div>
+      </div>
       <div id="voice-indicator">VOICE · off</div>
+      <div id="ping"></div>
+      <div id="peer-status"></div>
       <div id="event-center"></div>
       <button id="scatter-btn" class="hidden">⤨ Scatter (T)</button>
       <button id="mini-copy-link-btn" class="hidden" title="Copy invite link">
         📋
       </button>
+    </div>
+
+    <!-- O₂ blackout -->
+    <div id="death-overlay">
+      <div class="death-text">— BLACKOUT —</div>
     </div>
 
     <!-- UI overlay -->

@@ -63,11 +63,34 @@ freeze a pose on sliders, slow playback to 0.1×, toggle bones/wireframe, and
 orbit freely. **Rule: every new model added to the game must be registered in
 `src/preview.js` (`MODELS`) in the same PR — see `AGENTS.md`.**
 
+## Multiplayer (Phase 0)
+
+Up to N players over a **full P2P mesh**: the host is only the introducer —
+when a newcomer joins, the host sends it the list of connected peers and the
+newcomer dials each of them (data + proximity voice), so everyone sees and
+hears everyone. Per pair there are two channels on one RTCPeerConnection:
+a **reliable ordered** PeerJS channel for gameplay events (dig, tp, seed —
+must all arrive), and a **raw unreliable, unordered** negotiated RTCDataChannel
+for 30 Hz pose packets (24-byte binary, sequence-numbered so stale packets
+are dropped; a lost pose is replaced 33 ms later instead of retransmitted —
+no head-of-line blocking, no lag spikes on loss). Per-peer ping/pong measures
+RTT (worst shown in the HUD). Run `npm test` for the codec unit tests.
+
+Players carry a 7-bit **status mask** in each state packet (carrying,
+gassed, poisoned, trapped, speaking — `src/effects.js`), re-broadcast
+immediately on change. Effects apply locally; peers only render the flags.
+
+**Oxygen** (`src/oxygen.js`): a full tank lasts ~10 min of calm swimming;
+sprinting and distress statuses burn it faster. It refills near the spawn
+point (the future bathyscaphe berth). Hitting zero = blackout, then respawn
+at the spawn with a full tank. If the fish-simulating peer disconnects, the
+remaining peers deterministically elect a replacement (lowest peer id).
+
 ## How to play
 
 1. Player 1 clicks **Host Game**, then **Copy invite link** (or shares the ID).
-2. Player 2 opens the invite link (auto-joins), or clicks **Join Game** and enters the ID.
-3. Swim with **ZQSD/WASD** (layout-agnostic), look with the mouse, **Space/Shift** to rise/sink, **F** flashlight, **T** scatter, **V** mute voice.
+2. Players 2-N open the invite link (auto-join), or click **Join Game** and enter the ID.
+3. Swim with **ZQSD/WASD** (layout-agnostic), look with the mouse, **Space/C** to rise/sink, **Shift** sprint (burns O₂), **E** dig, **F** flashlight, **T** scatter, **V** mute voice. Watch the O₂ bar — refill at the spawn.
 
 ## Testing locally (two windows)
 

@@ -9,7 +9,8 @@ let localStream = null;
 let muted = false;
 let statusCb = null;
 
-const remoteVoices = new Map(); // peerId -> { panner, el }
+const remoteVoices = new Map(); // peerId -> { panner, el, call }
+const pendingCalls = new Set(); // peerIds we are currently dialing
 
 export function onVoiceStatus(fn) {
   statusCb = fn;
@@ -46,27 +47,48 @@ export function initVoice(peer) {
   });
 }
 
-// Start a voice call to a remote peer (the joiner initiates).
+// Start a voice call to a remote peer. In the mesh, only the NEWCOMER
+// initiates (network.js's `initiator` flag) — so two peers never call each
+// other simultaneously. Guarded against duplicates anyway.
 export async function callPeer(peer, remoteId) {
+  if (remoteVoices.has(remoteId) || pendingCalls.has(remoteId)) return;
+  pendingCalls.add(remoteId);
   try {
     report("connecting");
     const call = peer.call(remoteId, await ensureMic());
     attachCall(call);
   } catch {
+    pendingCalls.delete(remoteId);
     report("mic-denied");
   }
 }
 
 function attachCall(call) {
   call.on("stream", (stream) => {
-    setupSpatialAudio(call.peer, stream);
+    pendingCalls.delete(call.peer);
+    setupSpatialAudio(call.peer, stream, call);
     report("on");
   });
   call.on("close", () => teardown(call.peer));
-  call.on("error", () => report("error"));
+  call.on("error", () => {
+    pendingCalls.delete(call.peer);
+    report("error");
+  });
 }
 
-function setupSpatialAudio(peerId, stream) {
+// Drop one peer's voice (mesh disconnect).
+export function hangUp(peerId) {
+  pendingCalls.delete(peerId);
+  const voice = remoteVoices.get(peerId);
+  if (voice?.call) {
+    try {
+      voice.call.close();
+    } catch {}
+  }
+  teardown(peerId);
+}
+
+function setupSpatialAudio(peerId, stream, call = null) {
   audioCtx ??= new (window.AudioContext || window.webkitAudioContext)();
   audioCtx.resume();
 
@@ -88,7 +110,7 @@ function setupSpatialAudio(peerId, stream) {
   source.connect(panner);
   panner.connect(audioCtx.destination);
 
-  remoteVoices.set(peerId, { panner, el });
+  remoteVoices.set(peerId, { panner, el, call });
 }
 
 function teardown(peerId) {
@@ -97,7 +119,8 @@ function teardown(peerId) {
   voice.panner.disconnect();
   voice.el.srcObject = null;
   remoteVoices.delete(peerId);
-  report("off");
+  // Only report silence when the LAST voice is gone (mesh: several peers).
+  if (remoteVoices.size === 0) report("off");
 }
 
 // --- Per-frame spatial updates ---

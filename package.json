@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "runner": "node tools/runner.mjs"
+    "runner": "node tools/runner.mjs",
+    "test": "node tools/test-protocol.mjs"
   },
   "dependencies": {
     "peerjs": "^1.5.4",
