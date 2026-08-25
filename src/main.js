@@ -57,6 +57,7 @@ import {
   isSprinting,
 } from "./input.js";
 import { SnapshotBuffer } from "./interpolation.js";
+import { getShotConfig, applyShot } from "./shots.js";
 import {
   spawnCatfish,
   despawnCatfish,
@@ -184,7 +185,12 @@ async function buildWorld(rebuild = false) {
     },
   });
 }
-buildWorld();
+// Headless screenshot mode (?shot=<name>, see shots.js + tools/runner.mjs):
+// once the world is up, skip the menu and pin the player to the vantage point.
+const shotConfig = getShotConfig();
+buildWorld().then(() => {
+  if (shotConfig) applyShot(shotConfig, teleportLocal, localPosition);
+});
 
 // --- UI handlers ---
 hostBtn.addEventListener("click", async () => {

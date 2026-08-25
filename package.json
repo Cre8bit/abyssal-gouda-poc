@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "runner": "node tools/runner.mjs"
   },
   "dependencies": {
     "peerjs": "^1.5.4",

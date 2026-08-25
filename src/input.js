@@ -90,6 +90,13 @@ export function updateLook(delta) {
   swimPitch += (pitch - swimPitch) * ks;
 }
 
+// Shot harness (shots.js): snap the look — and the lazy swim body — to an
+// exact pose, bypassing the mouse smoothing entirely.
+export function setLook(newYaw, newPitch) {
+  targetYaw = yaw = swimYaw = newYaw;
+  targetPitch = pitch = swimPitch = clamp(newPitch, -PITCH_LIMIT, PITCH_LIMIT);
+}
+
 export function getYaw() {
   return yaw;
 }

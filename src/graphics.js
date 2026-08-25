@@ -22,6 +22,7 @@ import {
   prepareDiverTemplate,
   createDiverRig,
   updateDiverRig,
+  FP_VIEW,
 } from "./diverRig.js";
 import { initCatfishSystem } from "./catfish.js";
 import { toonify } from "./toon.js";
@@ -118,9 +119,9 @@ function loadDiverTemplate() {
   return diverTemplatePromise;
 }
 
-// --- Local first-person body: your own arms/torso, visible looking down. ---
-// The head is collapsed (never blocks the camera); the body trails the lazy
-// swim orientation while the camera looks around freely.
+// --- Local first-person body: just your two gloves, visible looking down. ---
+// Pure POV: no body is rendered at all. The gloves ride the (invisible) arm
+// bones and enter the frame only on a steep look down.
 let localBody = null; // { group, pivot, rig }
 const localState = {
   active: false,
@@ -132,8 +133,8 @@ const localState = {
   vel: new THREE.Vector3(),
 };
 
-// No clip planes anywhere anymore: the FP rig renders only legs + arms
-// (diverRig.js drops the torso/head triangles at prep time), so nothing can
+// No clip planes anywhere anymore: the FP rig renders only the two gloves
+// (diverRig.js drops every other triangle at prep time), so nothing can
 // ever be sliced open near the camera.
 function createLocalBody() {
   loadDiverTemplate().then((template) => {
@@ -145,9 +146,10 @@ function createLocalBody() {
     rig.root.traverse((obj) => {
       if (obj.isMesh) {
         obj.material = obj.material.clone();
-        // Cull backfaces so open tube ends (shoulder/hip cuts) read as
-        // see-through instead of dark interior walls.
-        obj.material.side = THREE.FrontSide;
+        // Double-sided: with the arms reaching forward the wrist/shoulder
+        // tube cuts are seen end-on, and a culled backface there reads as a
+        // severed arm. A dark interior wall reads as the sleeve's inside.
+        obj.material.side = THREE.DoubleSide;
         // Your own suit soaks the torch: darkened below the world's albedo
         // so arms/gloves never blow out inside the beam core, but with
         // enough albedo left to keep material definition.
@@ -171,33 +173,22 @@ export function updateLocalPlayer(pos, yaw, pitch, swimYaw, swimPitch, vel) {
   localState.vel.set(vel.x, vel.y, vel.z);
 }
 
-let localBodyPitch = 0; // smoothed VISUAL pitch of the FP body
-
 function updateLocalBody(delta) {
   if (!localBody || !localState.active) return;
 
-  // The body's VISUAL pitch is decoupled from the camera: a prone swimmer's
-  // body stays level while the head looks around — that's what makes the
-  // arms appear when you look down. Swimming pitches the body toward the
-  // travel direction, but only mildly and ASYMMETRICALLY: nosing down tips
-  // the body away below you (fine), but nosing up would rotate the torso
-  // straight into the forward view — so upward pitch is pinned near zero.
-  const speed = localState.vel.length();
-  const align = Math.min(1, speed / 2.5);
-  // Diving down lets the body nose down further (-0.55) so the arms rotate
-  // away beneath you instead of hanging across the downward view.
-  const targetPitch = Math.max(
-    -0.55,
-    Math.min(0.05, localState.swimPitch * align),
-  );
-  localBodyPitch += (targetPitch - localBodyPitch) * Math.min(1, delta * 3);
-
+  // The gloves are SCREEN-ANCHORED, FPS-style: the invisible body yaws and
+  // pitches WITH the camera (not with the swim direction), so the hands hold
+  // a fixed spot at the bottom of the frame instead of the view rotating
+  // onto them. FP_VIEW.base tips the rig so a level view only grazes the
+  // glove tops; follow < 1 lets them rise slightly on a full look-down while
+  // still hugging the bottom edge.
+  const bodyPitch = FP_VIEW.base + localState.pitch * FP_VIEW.follow;
   localBody.group.position.copy(localState.pos);
-  localBody.group.rotation.y = localState.swimYaw;
-  localBody.pivot.rotation.x = localBodyPitch;
+  localBody.group.rotation.y = localState.yaw;
+  localBody.pivot.rotation.x = bodyPitch;
   updateDiverRig(localBody.rig, delta, {
-    bodyYaw: localState.swimYaw,
-    bodyPitch: localBodyPitch,
+    bodyYaw: localState.yaw,
+    bodyPitch,
     lookYaw: localState.yaw,
     lookPitch: localState.pitch,
     vel: localState.vel,
@@ -597,6 +588,12 @@ function createFlashlight() {
   camera.add(group);
 
   flashlight = { group, spot, spill, fill, on: true };
+}
+
+// Shot harness (shots.js, ?light=N): flat inspection light so first-person
+// geometry reads clearly in screenshots. Never used in a real session.
+export function addShotLight(intensity = 1.5) {
+  scene.add(new THREE.HemisphereLight(0xbfd8e0, 0x4a4236, intensity));
 }
 
 export function toggleFlashlight() {

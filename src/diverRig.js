@@ -10,7 +10,7 @@
 //   legs   L/R_Thigh → L/R_Calf → L/R_Foot        (flutter kick)
 //   spine  Waist → Spine01 → Spine02              (undulation)
 //   neck   NeckTwist01/02 → Head                  (camera-synced look)
-//   arms   L/R_Upperarm → L/R_Forearm → L/R_Hand  (stroke, visible in FP)
+//   arms   L/R_Upperarm → L/R_Forearm → L/R_Hand  (stroke; FP shows gloves only)
 // The 14 *Twist* helper bones are identity passthroughs and are never
 // touched; Root/Hip/Pelvis/Clavicles/ToeBases stay at rest. Whole-body
 // motion (prone lean, bank into strafes, nose-toward-travel) lives on the
@@ -43,19 +43,42 @@ const FP_SCALE = 1.2;
 const LEAN = 1.0; // prone swimming lean (rad) — body pitches under the head
 const REF_SPEED = 10; // world speed that maps to a full-effort kick
 
-// First-person body cheat: the body sits well below and slightly behind the
-// true eye anchor, so at idle the hands stay OFF screen entirely and even
-// looking straight down you see distant forearms, not two arms filling the
-// view edge-to-edge.
-const FP_OFFSET = new THREE.Vector3(0, -0.52, 0.14);
+// First-person body cheat: the (invisible) body sits well below and slightly
+// FORWARD of the true eye anchor, so at idle the gloves stay off screen and
+// looking down they appear at a natural distance, never looming at the lens.
+const FP_OFFSET = new THREE.Vector3(0, -0.5, -0.2);
 
 // Base arm poses (template-space angles), numerically solved per view:
 // the FP pose reaches further forward-down so your own hands stay in frame.
-const ARM_POSE_THIRD = { uy: 1.45, ux: -0.45, fy: 0.25, fx: -0.15 };
-// FP arms hang low and WIDE: rotated out to shoulder width (hands never
-// converge in the middle of the view), reaching down-forward. They stay out
-// of sight at idle and only enter the frame looking well below the horizon.
-const ARM_POSE_FP = { uy: 1.25, ux: -1.6, fy: 0.55, fx: -0.15 };
+const ARM_POSE_THIRD = { uy: 1.45, ux: -0.45, fy: 0.25, fx: -0.15, hx: 0.18 };
+// FP pose places the gloves+forearms (the only FP geometry) LOW and WIDE
+// (screenshot-tuned via tools/runner.mjs pose sweeps): spaced across the
+// whole view width, forearms sweeping off the bottom corners, pure-POV style.
+const ARM_POSE_FP = { uy: -0.2, ux: -0.7, fy: 1.1, fx: -0.15, hx: -0.05 };
+
+// FP hands are SCREEN-ANCHORED, FPS-style: the invisible body yaws with the
+// camera and pitches with it too — `base` tips the rig so at level view only
+// the glove tops graze the bottom edge, and `follow` < 1 lets the hands rise
+// just a little on a full look-down while still hugging the frame bottom.
+// (graphics.js applies base + pitch * follow to the FP pivot every frame.)
+export const FP_VIEW = { base: 0.3, follow: 0.7 };
+
+// Shot-harness tuning hook (shots.js): override the FP pose/offset straight
+// from URL params, so arm placement can be swept from the screenshot runner
+// without touching code. Mutates the live objects — rigs read them by
+// reference every frame.
+export function configureFpBody({ uy, ux, fy, fx, hx, ox, oy, oz, pb, pf } = {}) {
+  if (uy !== undefined) ARM_POSE_FP.uy = uy;
+  if (ux !== undefined) ARM_POSE_FP.ux = ux;
+  if (fy !== undefined) ARM_POSE_FP.fy = fy;
+  if (fx !== undefined) ARM_POSE_FP.fx = fx;
+  if (hx !== undefined) ARM_POSE_FP.hx = hx;
+  if (ox !== undefined) FP_OFFSET.x = ox;
+  if (oy !== undefined) FP_OFFSET.y = oy;
+  if (oz !== undefined) FP_OFFSET.z = oz;
+  if (pb !== undefined) FP_VIEW.base = pb;
+  if (pf !== undefined) FP_VIEW.follow = pf;
+}
 
 // Only these bones are ever posed (twist helpers excluded = simplified rig).
 const ANIMATED = [
@@ -121,87 +144,94 @@ export function prepareDiverTemplate(gltf) {
   return { scene, data, headFix, headRest, fpGeometry: buildFpGeometry(scene) };
 }
 
-// First-person geometry: the head/helmet/collar TRIANGLES are deleted
-// outright. (Collapsing the neck bone doesn't work: helmet verts partially
-// weighted to spine/clavicles only collapse halfway, leaving huge stretched
-// shells floating in front of the camera.) A triangle goes if any of its
-// verts is majority-weighted to the head/neck chain, or sits high on the
-// torso in the rest pose (template y > 0.54 — helmet 0.616..0.945, collar
-// rim 0.54..0.60) WITHOUT being arm-weighted, so shoulders/deltoids keep
-// their geometry. Built once, shared by FP rigs.
+// First-person geometry: ONLY the gloves + forearms survive. Everything
+// else — torso, head, upper arms, legs — is deleted at prep time. Rendering
+// any connected body from a camera parked at the head reads as "floating
+// behind a mannequin"; hands riding the bottom of the frame is the classic
+// FPS proprioception cheat, and there is nothing near the lens to clip,
+// slice, or see through. A triangle survives if all three verts are
+// majority-weighted to a Hand/Forearm bone; the elbow cut is fan-capped so
+// the sleeve reads as a closed object from every angle. This is also the
+// cheap way to do it: one draw call on a reduced index buffer, so the GPU
+// only skins/shades the verts that are actually visible. Built once, shared
+// by FP rigs.
 function buildFpGeometry(scene) {
   let mesh;
   scene.traverse((o) => {
     if (o.isSkinnedMesh) mesh ??= o;
   });
   const geo = mesh.geometry;
-  const pos = geo.attributes.position;
   const sj = geo.attributes.skinIndex;
   const sw = geo.attributes.skinWeight;
-  const headSet = new Set();
-  const armSet = new Set();
+  const handSet = new Set();
   mesh.skeleton.bones.forEach((b, i) => {
-    if (/Head|NeckTwist/.test(b.name)) headSet.add(i);
-    else if (/Hand|Forearm|Upperarm/.test(b.name)) armSet.add(i);
+    if (/Hand|Forearm/.test(b.name)) handSet.add(i);
   });
-  // The FP rig renders ONLY arms + legs. The torso is dropped entirely: it
-  // was the sole source of near-camera glitches (clip cuts, open shells),
-  // and prone you can barely see your own chest anyway. With no torso there
-  // is nothing to clip and nothing for the arms to intersect.
-  const legSet = new Set();
-  const armSplit = new Set();
-  mesh.skeleton.bones.forEach((b, i) => {
-    if (/Thigh|Calf|Foot|Toe|Pelvis/.test(b.name)) legSet.add(i);
-    if (/Hand|Forearm|Upperarm/.test(b.name)) armSplit.add(i);
-  });
-  const weights = (i) => {
-    let headW = 0;
-    let armW = 0;
-    let legW = 0;
-    for (let k = 0; k < 4; k++) {
-      const w = sw.getComponent(i, k);
-      const j = sj.getComponent(i, k);
-      if (headSet.has(j)) headW += w;
-      else if (armSet.has(j)) armW += w;
-      if (legSet.has(j)) legW += w;
-    }
-    return { headW, armW, legW };
-  };
-  const bad = (i) => {
-    const { headW, armW } = weights(i);
-    return headW > 0.5 || (pos.getY(i) > 0.54 && armW < 0.4);
-  };
-  const armV = (i) => {
+  const handW = (i) => {
     let w = 0;
     for (let k = 0; k < 4; k++) {
-      if (armSplit.has(sj.getComponent(i, k))) w += sw.getComponent(i, k);
+      if (handSet.has(sj.getComponent(i, k))) w += sw.getComponent(i, k);
     }
     return w;
   };
   const index = geo.index.array;
-  const legKeep = [];
-  const armKeep = [];
+  const keep = [];
   for (let t = 0; t < index.length; t += 3) {
     const a = index[t];
     const b = index[t + 1];
     const c = index[t + 2];
-    if (bad(a) || bad(b) || bad(c)) continue;
-    if (armV(a) > 0.5 && armV(b) > 0.5 && armV(c) > 0.5) {
-      armKeep.push(a, b, c);
-    } else if (
-      weights(a).legW > 0.4 &&
-      weights(b).legW > 0.4 &&
-      weights(c).legW > 0.4
-    ) {
-      legKeep.push(a, b, c);
+    if (handW(a) > 0.5 && handW(b) > 0.5 && handW(c) > 0.5) {
+      keep.push(a, b, c);
     }
-    // everything else (torso/waist/shoulders) is simply not rendered in FP
   }
-  const legs = geo.clone();
-  legs.setIndex(legKeep);
-  const arms = geo.clone();
-  arms.setIndex(armKeep);
-  return { legs, arms };
+  const hands = geo.clone();
+  hands.setIndex(capOpenLoops(keep));
+  return { hands };
+}
+
+// Deleting the torso leaves the arm/leg sleeves as OPEN TUBES — and in first
+// person the camera sits right behind the shoulder cut, looking straight down
+// the hollow arm. Cap every boundary loop with a triangle fan so the cuts
+// read as solid shoulder/hip mass instead of glowing rings into an empty
+// sleeve. (Winding doesn't matter: the FP material is double-sided.)
+function capOpenLoops(index) {
+  const edges = new Map(); // "lo_hi" -> count
+  for (let t = 0; t < index.length; t += 3) {
+    for (let e = 0; e < 3; e++) {
+      const a = index[t + e];
+      const b = index[t + ((e + 1) % 3)];
+      const k = a < b ? `${a}_${b}` : `${b}_${a}`;
+      edges.set(k, (edges.get(k) ?? 0) + 1);
+    }
+  }
+  const link = new Map(); // boundary vert -> neighbors along the boundary
+  for (const [k, count] of edges) {
+    if (count !== 1) continue;
+    const [a, b] = k.split("_").map(Number);
+    (link.get(a) ?? link.set(a, []).get(a)).push(b);
+    (link.get(b) ?? link.set(b, []).get(b)).push(a);
+  }
+  const capped = index.slice();
+  const seen = new Set();
+  for (const start of link.keys()) {
+    if (seen.has(start)) continue;
+    const loop = [start];
+    seen.add(start);
+    let prev = -1;
+    let cur = start;
+    for (;;) {
+      const nxt = (link.get(cur) ?? []).find((v) => v !== prev && !seen.has(v));
+      if (nxt === undefined) break;
+      loop.push(nxt);
+      seen.add(nxt);
+      prev = cur;
+      cur = nxt;
+    }
+    for (let i = 1; i + 1 < loop.length; i++) {
+      capped.push(loop[0], loop[i], loop[i + 1]);
+    }
+  }
+  return capped;
 }
 
 // Build one rig instance. Returns { root, ... } — mount `root` under a
@@ -223,24 +253,15 @@ export function createDiverRig(template, { firstPerson = false } = {}) {
   });
 
   if (firstPerson) {
-    // FP renders ONLY legs + arms (see buildFpGeometry) — no torso, no head,
-    // so there is nothing near the camera to clip, slice, or intersect.
+    // FP renders ONLY the two gloves (see buildFpGeometry) — the invisible
+    // arm bones still pose them, so placement is tuned via ARM_POSE_FP and
+    // they keep the subtle swim drift.
     let fpMesh = null;
     model.traverse((o) => {
       if (o.isSkinnedMesh) fpMesh ??= o;
     });
-    fpMesh.geometry = template.fpGeometry.legs;
-    const armMesh = new THREE.SkinnedMesh(
-      template.fpGeometry.arms,
-      fpMesh.material,
-    );
-    armMesh.castShadow = true;
-    armMesh.frustumCulled = false;
-    armMesh.position.copy(fpMesh.position);
-    armMesh.quaternion.copy(fpMesh.quaternion);
-    armMesh.scale.copy(fpMesh.scale);
-    armMesh.bind(fpMesh.skeleton, fpMesh.bindMatrix);
-    fpMesh.parent.add(armMesh);
+    fpMesh.geometry = template.fpGeometry.hands;
+    fpMesh.castShadow = false; // two floating gloves cast a nonsense shadow
   }
 
   // Head rest position, template space → rig space (rotY(π) flips x/z).
@@ -364,22 +385,25 @@ export function updateDiverRig(
     0.06 * s(c * 0.41) * sway,
   );
 
-  // Flutter kick: thighs anti-phase, knees lag, feet trail like fins.
-  pose(rig, "L_Thigh", "aX", kick * s(c));
-  pose(rig, "R_Thigh", "aX", kick * s(c + Math.PI));
-  const knee = 0.2 + 0.35 * effort;
-  pose(rig, "L_Calf", "aX", knee + kick * 0.7 * s(c - 0.9));
-  pose(rig, "R_Calf", "aX", knee + kick * 0.7 * s(c - 0.9 + Math.PI));
-  pose(rig, "L_Foot", "aX", 0.55 - kick * 0.5 * s(c - 1.3));
-  pose(rig, "R_Foot", "aX", 0.55 - kick * 0.5 * s(c - 1.3 + Math.PI));
+  // Legs and spine drive nothing visible in first person (only gloves +
+  // forearms render there) — skip their posing entirely, it's pure waste.
+  if (!rig.firstPerson) {
+    // Flutter kick: thighs anti-phase, knees lag, feet trail like fins.
+    pose(rig, "L_Thigh", "aX", kick * s(c));
+    pose(rig, "R_Thigh", "aX", kick * s(c + Math.PI));
+    const knee = 0.2 + 0.35 * effort;
+    pose(rig, "L_Calf", "aX", knee + kick * 0.7 * s(c - 0.9));
+    pose(rig, "R_Calf", "aX", knee + kick * 0.7 * s(c - 0.9 + Math.PI));
+    pose(rig, "L_Foot", "aX", 0.55 - kick * 0.5 * s(c - 1.3));
+    pose(rig, "R_Foot", "aX", 0.55 - kick * 0.5 * s(c - 1.3 + Math.PI));
 
-  // Undulation rippling up the spine — grows strongly with speed so the
-  // whole body works while sprinting (heavily damped in first person: it
-  // rocks the shoulders and therefore the hands).
-  const und = (0.04 + 0.12 * effort) * (rig.firstPerson ? 0.2 : 1);
-  pose(rig, "Waist", "aX", und * s(c * 0.5));
-  pose(rig, "Spine01", "aX", und * s(c * 0.5 - 0.6));
-  pose(rig, "Spine02", "aX", und * 0.8 * s(c * 0.5 - 1.2));
+    // Undulation rippling up the spine — grows strongly with speed so the
+    // whole body works while sprinting.
+    const und = 0.04 + 0.12 * effort;
+    pose(rig, "Waist", "aX", und * s(c * 0.5));
+    pose(rig, "Spine01", "aX", und * s(c * 0.5 - 0.6));
+    pose(rig, "Spine02", "aX", und * 0.8 * s(c * 0.5 - 1.2));
+  }
 
   // Arms: held forward (this is what the local player sees looking down),
   // stroking breaststroke-style at half the kick rate. Never fully still:
@@ -406,8 +430,8 @@ export function updateDiverRig(
   pose(rig, "R_Forearm", "aY", ap.fy + arm * 0.6 * Math.max(0, sw2) + sOff * 0.6);
   poseAdd(rig, "R_Forearm", "aX", ap.fx);
   const handWiggle = rig.firstPerson ? 0.04 : 0.16;
-  pose(rig, "L_Hand", "aX", 0.18 + handWiggle * sw);
-  pose(rig, "R_Hand", "aX", 0.18 + handWiggle * sw);
+  pose(rig, "L_Hand", "aX", ap.hx + handWiggle * sw);
+  pose(rig, "R_Hand", "aX", ap.hx + handWiggle * sw);
 
   // First person: the head is collapsed/invisible and the local torch is
   // camera-mounted — skip the whole look solve.
