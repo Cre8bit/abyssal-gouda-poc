@@ -56,6 +56,7 @@ export function getShotConfig() {
     pitch: num("pitch", base.pitch ?? 0),
     keys: p.get("keys")?.split(",").filter(Boolean) ?? base.keys ?? [],
     light: num("light", 0),
+    settle: num("settle", 30),
   };
 }
 
@@ -77,4 +78,13 @@ export function applyShot(cfg, teleport, position) {
   for (const code of cfg.keys) {
     window.dispatchEvent(new KeyboardEvent("keydown", { code }));
   }
+
+  // Raise the runner's ready flag after `settle` rendered frames, so swim
+  // animation and drift are visibly mid-motion when the frame is captured.
+  let frames = 0;
+  const tick = () => {
+    if (++frames >= cfg.settle) window.__shotReady = true;
+    else requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
 }
