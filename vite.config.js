@@ -1,4 +1,5 @@
 import { defineConfig } from "vite";
+import { fileURLToPath } from "node:url";
 
 export default defineConfig({
   // Relative base so the build works on GitHub Pages project sites
@@ -9,6 +10,14 @@ export default defineConfig({
   },
   build: {
     target: "es2020",
+    rollupOptions: {
+      input: {
+        main: fileURLToPath(new URL("./index.html", import.meta.url)),
+        // Model/animation bench (src/preview.js) — ships with the build so
+        // the deployed site exposes it at /preview.html too.
+        preview: fileURLToPath(new URL("./preview.html", import.meta.url)),
+      },
+    },
   },
   plugins: [localPeerServer()],
 });
