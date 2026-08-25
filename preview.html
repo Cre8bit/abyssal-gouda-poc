@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Abyssal — Model Bench</title>
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { height: 100%; overflow: hidden; background: #04141e; }
+      body {
+        font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+        font-size: 12px;
+        color: #bfe0ee;
+        user-select: none;
+      }
+      #stage { position: fixed; inset: 0; }
+      #stage canvas { display: block; }
+
+      #panel {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        width: 252px;
+        max-height: calc(100vh - 24px);
+        overflow-y: auto;
+        background: rgba(3, 16, 24, 0.82);
+        border: 1px solid #1d4457;
+        border-radius: 8px;
+        padding: 12px;
+        backdrop-filter: blur(6px);
+      }
+      #panel h1 {
+        font-size: 13px;
+        letter-spacing: 2px;
+        color: #7fd4ff;
+        margin-bottom: 10px;
+      }
+      .section { margin-top: 12px; }
+      .section .label {
+        font-size: 10px;
+        letter-spacing: 1.5px;
+        color: #4f7f95;
+        margin-bottom: 5px;
+        text-transform: uppercase;
+      }
+      .row { display: flex; flex-wrap: wrap; gap: 4px; }
+      button {
+        font: inherit;
+        color: #9fcbdd;
+        background: #0a2635;
+        border: 1px solid #1d4457;
+        border-radius: 4px;
+        padding: 4px 8px;
+        cursor: pointer;
+      }
+      button:hover { border-color: #3a7d9c; color: #d6f1ff; }
+      button.on {
+        background: #12475e;
+        border-color: #4fb3e0;
+        color: #e8f8ff;
+      }
+      .slider-row {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        margin-top: 5px;
+      }
+      .slider-row .name { width: 62px; color: #6fa3b8; }
+      .slider-row .val { width: 40px; text-align: right; color: #d6f1ff; }
+      .slider-row input { flex: 1; accent-color: #4fb3e0; }
+      .hint { margin-top: 10px; color: #3e6a7e; line-height: 1.5; }
+
+      #hud {
+        position: fixed;
+        right: 12px;
+        bottom: 12px;
+        width: 224px;
+        background: rgba(3, 16, 24, 0.82);
+        border: 1px solid #1d4457;
+        border-radius: 8px;
+        padding: 10px 12px;
+        backdrop-filter: blur(6px);
+      }
+      #hud .title {
+        font-size: 10px;
+        letter-spacing: 1.5px;
+        color: #4f7f95;
+        text-transform: uppercase;
+        margin-bottom: 6px;
+      }
+      .hud-line {
+        display: flex;
+        justify-content: space-between;
+        margin-top: 2px;
+      }
+      .hud-line .k { color: #6fa3b8; }
+      .hud-line .v { color: #d6f1ff; }
+      .hud-bar { margin-top: 5px; }
+      .hud-bar .k { color: #6fa3b8; margin-bottom: 2px; }
+      .hud-bar .track {
+        height: 5px;
+        background: #0a2635;
+        border-radius: 3px;
+        overflow: hidden;
+      }
+      .hud-bar .fill {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, #2a7da5, #7fd4ff);
+        border-radius: 3px;
+      }
+
+      #loading {
+        position: fixed;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        color: #4f9cbf;
+        letter-spacing: 3px;
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+
+    <div id="panel">
+      <h1>ABYSSAL · BENCH</h1>
+      <div class="section">
+        <div class="label">Model</div>
+        <div class="row" id="models"></div>
+      </div>
+      <div id="model-ui"></div>
+      <div class="section">
+        <div class="label">Playback</div>
+        <div class="row">
+          <button id="btn-pause">pause</button>
+        </div>
+        <div id="global-sliders"></div>
+      </div>
+      <div class="section">
+        <div class="label">Debug</div>
+        <div class="row" id="toggles"></div>
+      </div>
+      <div class="hint">
+        drag to orbit · wheel to zoom<br />
+        space = model action · R = reset cam
+      </div>
+    </div>
+
+    <div id="hud">
+      <div class="title" id="hud-title">—</div>
+      <div id="hud-body"></div>
+    </div>
+
+    <div id="loading">loading model…</div>
+
+    <script type="module" src="/src/preview.js"></script>
+  </body>
+</html>

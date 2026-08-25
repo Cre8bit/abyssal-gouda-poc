@@ -53,6 +53,16 @@ npm install
 npm run dev
 ```
 
+### Model & animation bench
+
+`npm run dev`, then open **http://localhost:5173/preview.html** — an
+inspection bench for every model in the game (rat diver, first-person gloves,
+lantern-catfish). It runs the real animation code (procedural rig, baked
+clips, lantern moods) with the ability to stop and stare: solo one clip,
+freeze a pose on sliders, slow playback to 0.1×, toggle bones/wireframe, and
+orbit freely. **Rule: every new model added to the game must be registered in
+`src/preview.js` (`MODELS`) in the same PR — see `AGENTS.md`.**
+
 ## How to play
 
 1. Player 1 clicks **Host Game**, then **Copy invite link** (or shares the ID).

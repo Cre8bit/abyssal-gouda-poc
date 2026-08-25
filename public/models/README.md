@@ -1,5 +1,9 @@
 # Models
 
+> **Rule:** every model added here must also be registered in the preview
+> bench — `src/preview.js` (`MODELS`), served at `/preview.html`. See
+> `AGENTS.md`.
+
 ## catfish_rigged.glb (lantern-catfish mob)
 
 The anglerfish-catfish, programmatically skinned and animated from
