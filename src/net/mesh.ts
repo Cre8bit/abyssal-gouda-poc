@@ -1,4 +1,10 @@
-// network.js — PeerJS full mesh: N peers, dual channels per pair.
+// network/mesh.ts — PeerJS full mesh: connection topology & lifecycle.
+//
+// This half of the network layer owns WHO we are connected to; its sibling
+// sync.ts owns WHAT flows over those connections (packet codec, dispatch,
+// broadcast). The split line: mesh code is asynchronous and stateful
+// (signaling, dialing, ICE, keep-alive), state code is synchronous and hot
+// (30 Hz). sync.ts plugs into the raw data firehose via setDataSinks().
 //
 // TOPOLOGY — full mesh. The host is only special as the *introducer*: when a
 // newcomer connects, the host sends it the list of already-connected peers
@@ -17,74 +23,94 @@
 //    ondatachannel handling. Until it opens (or if it ever closes), state
 //    silently falls back to the reliable channel.
 //
-// STATE PACKETS — 24-byte binary (see encodeState). Each carries a u16
-// sequence number: stale/reordered packets are dropped on arrival, so an
-// unordered channel can never make a player jump backwards.
-//
 // RESILIENCE — per-peer ping/pong over the events channel measures RTT
 // (exposed via getRtt/getWorstRtt) and doubles as a keep-alive.
-import Peer from "peerjs";
-import {
-  encodeState,
-  decodeState,
-  seqNewer,
-  STATE_PACKET_BYTES,
-} from "./protocol.js";
+import Peer, { type DataConnection } from "peerjs";
 
 const STATE_CHANNEL_ID = 99; // negotiated id — clear of PeerJS's own channel
 const PING_INTERVAL_MS = 2000;
 
-let peer = null;
-let myId = null;
+// One entry per mesh link. `seqIn` belongs logically to sync.ts (packet
+// dedup) but lives here so dropping a peer drops its sequence history too.
+export interface PeerRecord {
+  conn: DataConnection;
+  state: RTCDataChannel | null;
+  seqIn: number;
+  initiator: boolean;
+  rtt: number | null;
+  pingTimer: ReturnType<typeof setInterval> | null;
+}
+
+// Reliable-channel JSON payloads ({ type: "event", kind, ... }).
+export interface EventPayload {
+  type: string;
+  kind?: string;
+  [key: string]: unknown;
+}
+
+let peer: Peer | null = null;
+let myId: string | null = null;
 let amHost = false;
-let hostId = null; // the peer we joined (null on the host)
+let hostId: string | null = null; // the peer we joined (null on the host)
 
-// peerId -> { conn, state: RTCDataChannel|null, seqIn, initiator, rtt, pingTimer }
-const peers = new Map();
+export const peers = new Map<string, PeerRecord>();
 
-let seqOut = 0; // shared u16 counter for outgoing state packets
+// --- Data sinks: sync.ts registers here at module init -----------------------
+export interface DataSinks {
+  // Binary = a state packet (raw channel, or reliable-channel fallback).
+  onBinary(peerId: string, data: ArrayBuffer | ArrayBufferView): void;
+  // Application-level reliable event (internal "__" events never reach this).
+  onEvent(peerId: string, data: EventPayload): void;
+  // Legacy JSON state from older clients — still accepted.
+  onLegacyState(peerId: string, data: unknown): void;
+}
 
-const callbacks = {
-  onStateReceived: null, // (peerId, {x,y,z,yaw,pitch,sy,sp,light,status}) => void
-  onEventReceived: null, // (peerId, data) => void
-  onPeerConnected: null, // (peerId, {initiator}) => void
-  onPeerDisconnected: null, // (peerId) => void
+let sinks: DataSinks = {
+  onBinary: () => {},
+  onEvent: () => {},
+  onLegacyState: () => {},
 };
 
-export function onStateReceived(fn) {
-  callbacks.onStateReceived = fn;
-}
-export function onEventReceived(fn) {
-  callbacks.onEventReceived = fn;
-}
-export function onPeerConnected(fn) {
-  callbacks.onPeerConnected = fn;
-}
-export function onPeerDisconnected(fn) {
-  callbacks.onPeerDisconnected = fn;
+export function setDataSinks(s: DataSinks): void {
+  sinks = s;
 }
 
-export function getPeer() {
+// --- Lifecycle callbacks (main.js) -------------------------------------------
+type PeerConnectedCb = (peerId: string, info: { initiator: boolean }) => void;
+type PeerDisconnectedCb = (peerId: string) => void;
+
+let peerConnectedCb: PeerConnectedCb | null = null;
+let peerDisconnectedCb: PeerDisconnectedCb | null = null;
+
+export function onPeerConnected(fn: PeerConnectedCb): void {
+  peerConnectedCb = fn;
+}
+export function onPeerDisconnected(fn: PeerDisconnectedCb): void {
+  peerDisconnectedCb = fn;
+}
+
+// --- Getters ------------------------------------------------------------------
+export function getPeer(): Peer | null {
   return peer;
 }
-export function getMyId() {
+export function getMyId(): string | null {
   return myId;
 }
-export function getHostId() {
+export function getHostId(): string | null {
   return hostId;
 }
-export function getPeerIds() {
+export function getPeerIds(): string[] {
   return [...peers.keys()];
 }
-export function isConnected() {
+export function isConnected(): boolean {
   return [...peers.values()].some((r) => r.conn.open);
 }
 // RTT (ms) to one peer, or the worst across the mesh (for the HUD).
-export function getRtt(peerId) {
+export function getRtt(peerId: string): number | null {
   return peers.get(peerId)?.rtt ?? null;
 }
-export function getWorstRtt() {
-  let worst = null;
+export function getWorstRtt(): number | null {
+  let worst: number | null = null;
   for (const r of peers.values()) {
     if (r.rtt != null && (worst === null || r.rtt > worst)) worst = r.rtt;
   }
@@ -92,7 +118,7 @@ export function getWorstRtt() {
 }
 
 // ICE: STUN for direct connections + a free public TURN relay as fallback.
-const ICE_CONFIG = {
+const ICE_CONFIG: RTCConfiguration = {
   iceServers: [
     {
       urls: ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"],
@@ -109,15 +135,16 @@ const ICE_CONFIG = {
   ],
 };
 
-// In dev, use the local signaling server started by Vite (vite.config.js),
+// In dev, use the local signaling server started by Vite (vite.config.ts),
 // falling back to the public PeerJS cloud. In production: cloud directly.
-let signalingMode = null; // 'local' | 'cloud' once connected
+export type SignalingMode = "local" | "cloud";
+let signalingMode: SignalingMode | null = null; // set once connected
 
-export function getSignalingMode() {
+export function getSignalingMode(): SignalingMode | null {
   return signalingMode;
 }
 
-function newPeer(useLocal) {
+function newPeer(useLocal: boolean): Peer {
   const opts = {
     config: ICE_CONFIG,
     debug: import.meta.env.DEV ? 2 : 0,
@@ -132,9 +159,11 @@ function newPeer(useLocal) {
     : new Peer(opts);
 }
 
-function createPeer({ forceMode = null } = {}) {
+function createPeer({
+  forceMode = null,
+}: { forceMode?: SignalingMode | null } = {}): Promise<Peer> {
   return new Promise((resolve, reject) => {
-    const attempt = (useLocal, canFallback) => {
+    const attempt = (useLocal: boolean, canFallback: boolean) => {
       const p = newPeer(useLocal);
       let opened = false;
       p.on("open", () => {
@@ -173,7 +202,7 @@ function createPeer({ forceMode = null } = {}) {
 }
 
 // Host: wait for connections. Resolves with the ID to share.
-export async function hostGame() {
+export async function hostGame(): Promise<string> {
   const p = await createPeer();
   amHost = true;
   return p.id;
@@ -182,7 +211,10 @@ export async function hostGame() {
 // Client: connect to a host by ID. Resolves once the data channel is open.
 // The host then introduces us to every other peer ("__peers") and we dial
 // them all — full mesh.
-export async function joinGame(hostPeerId, mode = null) {
+export async function joinGame(
+  hostPeerId: string,
+  mode: SignalingMode | null = null,
+): Promise<string> {
   await createPeer({ forceMode: mode });
   hostId = hostPeerId.trim();
   await dial(hostId, 15000);
@@ -190,9 +222,10 @@ export async function joinGame(hostPeerId, mode = null) {
 }
 
 // Dial one peer (we are the initiator). Resolves when the channel opens.
-function dial(remoteId, timeoutMs = 12000) {
+function dial(remoteId: string, timeoutMs = 12000): Promise<string> {
   return new Promise((resolve, reject) => {
-    if (peers.has(remoteId) || remoteId === myId) return resolve(remoteId);
+    if (peers.has(remoteId) || remoteId === myId || !peer)
+      return resolve(remoteId);
     const timer = setTimeout(
       () =>
         reject(
@@ -204,9 +237,9 @@ function dial(remoteId, timeoutMs = 12000) {
     );
     const conn = peer.connect(remoteId, { reliable: true });
     // e.g. "peer-unavailable" (wrong/expired ID) surfaces on the peer itself.
-    const onPeerError = (err) => {
+    const onPeerError = (err: Error) => {
       clearTimeout(timer);
-      peer.off?.("error", onPeerError);
+      peer?.off("error", onPeerError);
       reject(err);
     };
     peer.on("error", onPeerError);
@@ -215,19 +248,23 @@ function dial(remoteId, timeoutMs = 12000) {
     });
     conn.on("open", () => {
       clearTimeout(timer);
-      peer.off?.("error", onPeerError);
+      peer?.off("error", onPeerError);
       setupConnection(conn, true, { alreadyOpen: true });
       resolve(remoteId);
     });
     conn.on("error", (err) => {
       clearTimeout(timer);
-      peer.off?.("error", onPeerError);
+      peer?.off("error", onPeerError);
       reject(err);
     });
   });
 }
 
-function setupConnection(conn, initiator, { alreadyOpen = false } = {}) {
+function setupConnection(
+  conn: DataConnection,
+  initiator: boolean,
+  { alreadyOpen = false } = {},
+): void {
   const register = () => {
     if (peers.has(conn.peer)) {
       // Duplicate (shouldn't happen — only newcomers dial): keep the old one.
@@ -235,7 +272,7 @@ function setupConnection(conn, initiator, { alreadyOpen = false } = {}) {
       conn.close();
       return;
     }
-    const rec = {
+    const rec: PeerRecord = {
       conn,
       state: null,
       seqIn: -1,
@@ -254,7 +291,7 @@ function setupConnection(conn, initiator, { alreadyOpen = false } = {}) {
         rawSend(rec, { type: "event", kind: "__peers", ids: others });
       }
     }
-    callbacks.onPeerConnected?.(conn.peer, { initiator });
+    peerConnectedCb?.(conn.peer, { initiator });
   };
 
   if (alreadyOpen) register();
@@ -264,18 +301,19 @@ function setupConnection(conn, initiator, { alreadyOpen = false } = {}) {
     // Binary on the reliable channel = state packet fallback (raw channel
     // not open yet on the sender's side).
     if (data instanceof ArrayBuffer || ArrayBuffer.isView(data)) {
-      handleStatePacket(conn.peer, data);
+      sinks.onBinary(conn.peer, data);
       return;
     }
-    if (data?.type === "event") {
-      if (typeof data.kind === "string" && data.kind.startsWith("__")) {
-        handleInternalEvent(conn.peer, data);
+    const msg = data as EventPayload | null;
+    if (msg?.type === "event") {
+      if (typeof msg.kind === "string" && msg.kind.startsWith("__")) {
+        handleInternalEvent(conn.peer, msg);
       } else {
-        callbacks.onEventReceived?.(conn.peer, data);
+        sinks.onEvent(conn.peer, msg);
       }
-    } else if (data?.type === "state") {
+    } else if (msg?.type === "state") {
       // Legacy JSON state (older clients) — still accepted.
-      callbacks.onStateReceived?.(conn.peer, data);
+      sinks.onLegacyState(conn.peer, msg);
     }
   });
 
@@ -283,43 +321,51 @@ function setupConnection(conn, initiator, { alreadyOpen = false } = {}) {
   conn.on("error", () => dropPeer(conn.peer));
 }
 
-function dropPeer(peerId) {
+function dropPeer(peerId: string): void {
   const rec = peers.get(peerId);
   if (!rec) return;
-  clearInterval(rec.pingTimer);
+  if (rec.pingTimer !== null) clearInterval(rec.pingTimer);
   try {
     rec.state?.close();
-  } catch {}
+  } catch {
+    /* best effort */
+  }
   // Close the DataConnection too (idempotent if we got here from its own
   // close/error event) — this releases the underlying RTCPeerConnection
   // instead of leaving a half-dead pair holding sockets and ICE candidates.
   try {
     rec.conn.close();
-  } catch {}
+  } catch {
+    /* best effort */
+  }
   peers.delete(peerId);
-  callbacks.onPeerDisconnected?.(peerId);
+  peerDisconnectedCb?.(peerId);
 }
 
 // --- Mesh bookkeeping (internal "__" events on the reliable channel) ---
 
-function handleInternalEvent(peerId, data) {
+function handleInternalEvent(peerId: string, data: EventPayload): void {
   if (data.kind === "__peers" && peerId === hostId) {
     // The host's introduction list: dial everyone we don't know yet.
-    for (const id of data.ids ?? []) {
+    const ids = Array.isArray(data.ids) ? (data.ids as string[]) : [];
+    for (const id of ids) {
       if (id === myId || peers.has(id)) continue;
       dial(id).catch((err) =>
         console.warn(`[net] mesh dial to ${id.slice(0, 6)} failed:`, err),
       );
     }
   } else if (data.kind === "__ping") {
-    sendEventTo(peerId, { kind: "__pong", t: data.t });
+    const rec = peers.get(peerId);
+    if (rec) rawSend(rec, { type: "event", kind: "__pong", t: data.t });
   } else if (data.kind === "__pong") {
     const rec = peers.get(peerId);
-    if (rec) rec.rtt = Math.round(performance.now() - data.t);
+    if (rec && typeof data.t === "number") {
+      rec.rtt = Math.round(performance.now() - data.t);
+    }
   }
 }
 
-function startPing(rec) {
+function startPing(rec: PeerRecord): void {
   rec.pingTimer = setInterval(() => {
     if (rec.conn.open) {
       rawSend(rec, { type: "event", kind: "__ping", t: performance.now() });
@@ -331,7 +377,7 @@ function startPing(rec) {
 
 // Both sides create the channel with the same negotiated id — symmetric, no
 // in-band signaling, and PeerJS's own ondatachannel never sees it.
-function attachStateChannel(rec) {
+function attachStateChannel(rec: PeerRecord): void {
   const pc = rec.conn.peerConnection;
   if (!pc || typeof pc.createDataChannel !== "function") return;
   try {
@@ -344,7 +390,9 @@ function attachStateChannel(rec) {
     ch.binaryType = "arraybuffer";
     ch.onopen = () => {
       rec.state = ch;
-      console.log(`[net] unreliable state channel up (${rec.conn.peer.slice(0, 6)})`);
+      console.log(
+        `[net] unreliable state channel up (${rec.conn.peer.slice(0, 6)})`,
+      );
     };
     ch.onclose = () => {
       if (rec.state === ch) rec.state = null; // fall back to reliable
@@ -352,71 +400,16 @@ function attachStateChannel(rec) {
     ch.onerror = () => {
       if (rec.state === ch) rec.state = null;
     };
-    ch.onmessage = (e) => handleStatePacket(rec.conn.peer, e.data);
+    ch.onmessage = (e) => sinks.onBinary(rec.conn.peer, e.data);
   } catch (err) {
     console.warn("[net] raw state channel unavailable, using fallback:", err);
   }
 }
 
-// --- State packet intake (codec lives in protocol.js) -----------------------
-
-let badPacketWarned = false;
-function handleStatePacket(peerId, data) {
-  const rec = peers.get(peerId);
-  if (!rec) return;
-  const s = decodeState(data);
-  if (!s) {
-    // Otherwise a protocol-version mismatch is a SILENT desync: every state
-    // packet dropped, remote divers frozen, no error anywhere.
-    if (!badPacketWarned) {
-      badPacketWarned = true;
-      console.warn(
-        `[net] dropping undecodable state packets from ${peerId.slice(0, 6)} — protocol version mismatch? Both players should reload to the latest build.`,
-      );
-    }
-    return;
-  }
-  if (rec.seqIn >= 0 && !seqNewer(s.seq, rec.seqIn)) return; // stale — drop
-  rec.seqIn = s.seq;
-  callbacks.onStateReceived?.(peerId, s);
-}
-
-// --- Sending ----------------------------------------------------------------
-
-function rawSend(rec, payload) {
+// Reliable-channel send, used by both halves of the layer.
+export function rawSend(
+  rec: PeerRecord,
+  payload: EventPayload | ArrayBuffer | ArrayBufferView,
+): void {
   if (rec.conn.open) rec.conn.send(payload);
-}
-
-// Broadcast the local pose + flags to every peer, over the unreliable
-// channel when up (reliable fallback otherwise). ~24 bytes × peers × 30 Hz.
-// One scratch buffer, reused every tick: channel .send() copies the bytes
-// synchronously, so nothing downstream holds a reference to it.
-const stateScratch = new ArrayBuffer(STATE_PACKET_BYTES);
-export function broadcastState(s) {
-  if (peers.size === 0) return;
-  seqOut = (seqOut + 1) & 0xffff;
-  const packet = encodeState(s, seqOut, stateScratch);
-  for (const rec of peers.values()) {
-    if (rec.state?.readyState === "open") {
-      try {
-        rec.state.send(packet);
-      } catch {
-        rawSend(rec, packet); // buffer hiccup — fall back this once
-      }
-    } else {
-      rawSend(rec, packet);
-    }
-  }
-}
-
-// Reliable gameplay event to every peer (e.g. { kind: 'dig', x, y, z }).
-export function sendEvent(data) {
-  const payload = { type: "event", ...data };
-  for (const rec of peers.values()) rawSend(rec, payload);
-}
-
-// Reliable gameplay event to ONE peer (e.g. per-player scatter targets).
-export function sendEventTo(peerId, data) {
-  const rec = peers.get(peerId);
-  if (rec) rawSend(rec, { type: "event", ...data });
 }

@@ -12,10 +12,25 @@
 // with toonify().
 import * as THREE from "three";
 
-let gradient = null;
+// Structural view over the lit material families (standard/physical/
+// lambert/phong) — just the fields toonify() reads off them.
+interface LitMaterial extends THREE.Material {
+  isMeshStandardMaterial?: boolean;
+  isMeshPhysicalMaterial?: boolean;
+  isMeshLambertMaterial?: boolean;
+  isMeshPhongMaterial?: boolean;
+  color?: THREE.Color;
+  map?: THREE.Texture | null;
+  normalMap?: THREE.Texture | null;
+  emissive?: THREE.Color;
+  emissiveMap?: THREE.Texture | null;
+  emissiveIntensity?: number;
+}
+
+let gradient: THREE.DataTexture | null = null;
 
 // 4 hard light bands. NearestFilter is what makes them BANDS.
-export function getToonGradient() {
+export function getToonGradient(): THREE.DataTexture {
   if (gradient) return gradient;
   const data = new Uint8Array([40, 105, 180, 255]);
   gradient = new THREE.DataTexture(data, 4, 1, THREE.RedFormat);
@@ -27,7 +42,7 @@ export function getToonGradient() {
 
 // GLSL snippet: darken outgoingLight at grazing view angles (ink outline).
 // `normal` and `vViewPosition` are toon-shader built-ins at this point.
-export function inkInjection(strength = 0.7) {
+export function inkInjection(strength: number = 0.7): string {
   const s = strength.toFixed(3);
   return /* glsl */ `
     {
@@ -40,10 +55,14 @@ export function inkInjection(strength = 0.7) {
 
 // Convert every lit material under `root` to a MeshToonMaterial that keeps
 // its maps/colors, plus the ink rim. ShaderMaterials/sprites are untouched.
-export function toonify(root, { ink = 0.7 } = {}) {
+export function toonify(
+  root: THREE.Object3D,
+  { ink = 0.7 }: { ink?: number } = {},
+): void {
   root.traverse((o) => {
-    if (!o.isMesh && !o.isSkinnedMesh) return;
-    const m = o.material;
+    if (!(o as THREE.Mesh).isMesh && !(o as THREE.SkinnedMesh).isSkinnedMesh)
+      return;
+    const m = (o as THREE.Mesh).material as LitMaterial | undefined;
     if (!m || m.userData.__toon) return;
     if (
       !m.isMeshStandardMaterial &&
@@ -75,6 +94,6 @@ export function toonify(root, { ink = 0.7 } = {}) {
       );
     };
     t.customProgramCacheKey = () => `toon-ink-${ink}`;
-    o.material = t;
+    (o as THREE.Mesh).material = t;
   });
 }

@@ -1,14 +1,15 @@
 // Unit tests for the binary state codec — run with: node tools/test-protocol.mjs
+// (node ≥ 23.6 / 22.18 strips the .ts types natively — no build step needed)
 import {
   encodeState,
   decodeState,
   seqNewer,
   wrapAngle,
   STATE_PACKET_BYTES,
-} from "../src/protocol.js";
+} from "../src/net/protocol.ts";
 
 let failures = 0;
-function check(name, cond) {
+function check(name: string, cond: boolean) {
   if (!cond) {
     failures++;
     console.error(`✗ ${name}`);
@@ -16,7 +17,7 @@ function check(name, cond) {
     console.log(`✓ ${name}`);
   }
 }
-const close = (a, b, eps = 1e-3) => Math.abs(a - b) < eps;
+const close = (a: number, b: number, eps = 1e-3) => Math.abs(a - b) < eps;
 
 // --- Roundtrip ---
 const state = {
@@ -34,29 +35,34 @@ const buf = encodeState(state, 7);
 check("packet is 24 bytes", buf.byteLength === STATE_PACKET_BYTES);
 const d = decodeState(buf);
 check("decodes", d !== null);
-check("seq", d.seq === 7);
-check("light", d.light === true);
-check("status", d.status === 0b0101);
-check("x (f32)", close(d.x, state.x, 1e-2));
-check("y (f32)", close(d.y, state.y, 1e-2));
-check("z (f32)", close(d.z, state.z, 1e-2));
-check("yaw quantized", close(d.yaw, state.yaw));
-check("pitch quantized", close(d.pitch, state.pitch));
-check("sy quantized", close(d.sy, state.sy));
-check("sp quantized", close(d.sp, state.sp));
+check("seq", d!.seq === 7);
+check("light", d!.light === true);
+check("status", d!.status === 0b0101);
+check("x (f32)", close(d!.x, state.x, 1e-2));
+check("y (f32)", close(d!.y, state.y, 1e-2));
+check("z (f32)", close(d!.z, state.z, 1e-2));
+check("yaw quantized", close(d!.yaw, state.yaw));
+check("pitch quantized", close(d!.pitch, state.pitch));
+check("sy quantized", close(d!.sy, state.sy));
+check("sp quantized", close(d!.sp, state.sp));
 
 // --- Yaw accumulates unbounded in input.js: must wrap cleanly ---
 const spun = decodeState(encodeState({ ...state, yaw: 10 * Math.PI + 0.3 }, 1));
-check("unbounded yaw wraps to ±π", close(spun.yaw, wrapAngle(0.3)));
+check("unbounded yaw wraps to ±π", close(spun!.yaw, wrapAngle(0.3)));
 const negSpun = decodeState(encodeState({ ...state, yaw: -7 * Math.PI }, 2));
-check("negative spins wrap", close(Math.abs(negSpun.yaw), Math.PI, 1e-2));
+check("negative spins wrap", close(Math.abs(negSpun!.yaw), Math.PI, 1e-2));
 
 // --- Light off / empty status ---
 const dark = decodeState(encodeState({ ...state, light: false, status: 0 }, 3));
-check("light off", dark.light === false && dark.status === 0);
+check("light off", dark!.light === false && dark!.status === 0);
 // Status must never clobber the light bit.
-const full = decodeState(encodeState({ ...state, light: false, status: 0x7f }, 4));
-check("status 0x7f keeps light off", full.light === false && full.status === 0x7f);
+const full = decodeState(
+  encodeState({ ...state, light: false, status: 0x7f }, 4),
+);
+check(
+  "status 0x7f keeps light off",
+  full!.light === false && full!.status === 0x7f,
+);
 
 // --- decodeState accepts views (binarypack may hand back Uint8Array) ---
 const asView = new Uint8Array(buf);

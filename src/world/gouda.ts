@@ -36,7 +36,8 @@
 import * as THREE from "three";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { MarchingCubes } from "three/examples/jsm/objects/MarchingCubes.js";
-import { getToonGradient } from "./toon.js";
+import { getToonGradient } from "../render/toon.ts";
+import type { Vec3 } from "../state.ts";
 
 export const WORLD_R = 420; // outer edge of the drift
 export const BOUNDARY_R = 470; // visible map boundary veil
@@ -67,7 +68,7 @@ const RES_WARREN = 64;
 const RES_WALL = 48;
 const RES_MED = 48;
 const RES_SMALL = 32;
-const MAX_POLYS = {
+const MAX_POLYS: Record<number, number> = {
   96: 220000,
   72: 140000,
   64: 110000,
@@ -86,27 +87,137 @@ const PLANE_K = 0.025;
 
 const noise = new ImprovedNoise();
 
+// --- Types (erased at runtime) ---------------------------------------------------
+
+type Rng = () => number;
+
+interface PlaneCut {
+  nx: number;
+  ny: number;
+  nz: number;
+  off: number;
+}
+
+// Eyes (caverns/chambers), pores AND player digs all share this shape.
+interface SphereCarve {
+  x: number;
+  y: number;
+  z: number;
+  r: number;
+}
+
+interface Tunnel {
+  ax: number;
+  ay: number;
+  az: number;
+  bx: number;
+  by: number;
+  bz: number;
+  r: number;
+}
+
+type ZoneName =
+  | "drift"
+  | "reef"
+  | "chimneys"
+  | "scree"
+  | "warrens"
+  | "crust"
+  | "galleries"
+  | "bulwark"
+  | "hollows"
+  | "heart";
+
+// opts for makeChunkData — documented at its definition site below.
+interface ChunkOpts {
+  kind: "wheel" | "hunk" | "block" | "slab" | "column";
+  eyesMin: number;
+  eyesMax: number;
+  eyeRBase: number;
+  eyeRVar: number;
+  exits: number;
+  coreEye?: number;
+  deadEnds?: number;
+  axis?: Vec3;
+  narrow?: boolean;
+  tangle?: boolean;
+  pores?: [number, number];
+  poreR?: [number, number];
+  tunnelR?: [number, number];
+}
+
+interface Chunk {
+  center: THREE.Vector3;
+  s: number;
+  res: number;
+  ix: number;
+  iy: number;
+  iz: number;
+  minAxis: number;
+  nOff: number;
+  amp: number;
+  planes: PlaneCut[];
+  holes: SphereCarve[];
+  tunnels: Tunnel[];
+  digs: SphereCarve[];
+  field: Float32Array | null;
+  mesh: THREE.Mesh | null;
+  biggestEye?: SphereCarve | null; // set by makeChunkData
+  zone?: ZoneName; // set by buildGoudaWorld
+}
+
+interface ChunkSpec {
+  center: THREE.Vector3;
+  s: number;
+  res: number;
+  label: string;
+  zone: ZoneName;
+  opts: ChunkOpts;
+}
+
+interface Debris {
+  center: THREE.Vector3;
+  r: number;
+  mesh: THREE.Mesh;
+}
+
+interface GoldShard {
+  mesh: THREE.Mesh;
+  radius: number;
+  speed: number;
+  phase: number;
+  tilt: number;
+}
+
+interface GoldCore {
+  group: THREE.Group;
+  core: THREE.Mesh<THREE.IcosahedronGeometry, THREE.MeshToonMaterial>;
+  light: THREE.PointLight;
+  deepGlow: THREE.PointLight;
+  shards: GoldShard[];
+}
+
 // --- Generation parameters (set per game) --------------------------------------
 
 let worldSeed = 1337;
 let difficulty = 1;
 
-const chunks = []; // each: SDF params + cached voxel field + live mesh
-const debris = []; // { center, r, mesh }
-const blastPoints = [];
-let worldGroup = null;
-let extrasGroup = null;
-let goldCore = null;
-let goldPos = null; // world position of the hidden gold
-let markerMaterial = null;
-let spawnPoint = null;
+const chunks: Chunk[] = []; // each: SDF params + cached voxel field + live mesh
+const debris: Debris[] = []; // { center, r, mesh }
+const blastPoints: Vec3[] = [];
+let worldGroup: THREE.Group | null = null;
+let extrasGroup: THREE.Group | null = null;
+let goldCore: GoldCore | null = null;
+let goldPos: Vec3 | null = null; // world position of the hidden gold
+let markerMaterial: THREE.SpriteMaterial | null = null;
+let spawnPoint: THREE.Vector3 | null = null;
 let lastCull = -1;
 
 const uGoudaTime = { value: 0 };
 
 // --- Seeded RNG ------------------------------------------------------------------
 
-function mulberry32(seed) {
+function mulberry32(seed: number): Rng {
   let a = seed >>> 0;
   return function () {
     a |= 0;
@@ -117,7 +228,7 @@ function mulberry32(seed) {
   };
 }
 
-function randDir(rng, out) {
+function randDir(rng: Rng, out: THREE.Vector3): THREE.Vector3 {
   let x, y, z, l;
   do {
     x = rng() * 2 - 1;
@@ -134,25 +245,35 @@ function randDir(rng, out) {
 
 // --- SDF primitives -----------------------------------------------------------------
 
-function fbm3(x, y, z) {
+function fbm3(x: number, y: number, z: number): number {
   return (
     noise.noise(x, y, z) +
     0.5 * noise.noise(x * 2.13 + 7.7, y * 2.13 + 3.1, z * 2.13 + 11.6)
   );
 }
 
-function smoothCut(d, cut, k) {
+function smoothCut(d: number, cut: number, k: number): number {
   const b = -cut;
   const h = Math.max(k - Math.abs(d - b), 0) / k;
   return Math.max(d, b) + h * h * k * 0.25;
 }
 
-function smoothMax(a, b, k) {
+function smoothMax(a: number, b: number, k: number): number {
   const h = Math.max(k - Math.abs(a - b), 0) / k;
   return Math.max(a, b) + h * h * k * 0.25;
 }
 
-function segDist(px, py, pz, ax, ay, az, bx, by, bz) {
+function segDist(
+  px: number,
+  py: number,
+  pz: number,
+  ax: number,
+  ay: number,
+  az: number,
+  bx: number,
+  by: number,
+  bz: number,
+): number {
   const abx = bx - ax,
     aby = by - ay,
     abz = bz - az;
@@ -160,8 +281,7 @@ function segDist(px, py, pz, ax, ay, az, bx, by, bz) {
     apy = py - ay,
     apz = pz - az;
   let t =
-    (apx * abx + apy * aby + apz * abz) /
-    (abx * abx + aby * aby + abz * abz);
+    (apx * abx + apy * aby + apz * abz) / (abx * abx + aby * aby + abz * abz);
   t = Math.max(0, Math.min(1, t));
   const dx = apx - abx * t,
     dy = apy - aby * t,
@@ -174,7 +294,7 @@ function segDist(px, py, pz, ax, ay, az, bx, by, bz) {
 // whose base distance is near zero sits on the outer waxed rind; one that is
 // DEEP INSIDE the base body (a hole, tunnel, cut face or dig) shows the
 // bright interior paste — the cheese signature.
-function baseSdf(c, x, y, z) {
+function baseSdf(c: Chunk, x: number, y: number, z: number): number {
   const ex = x * c.ix,
     ey = y * c.iy,
     ez = z * c.iz;
@@ -204,7 +324,7 @@ function baseSdf(c, x, y, z) {
 
 // The full chunk SDF in LOCAL grid space [-1,1]. Meshing, collision AND
 // digging all run through this — keep them in lockstep.
-function chunkSdf(c, x, y, z) {
+function chunkSdf(c: Chunk, x: number, y: number, z: number): number {
   let d = baseSdf(c, x, y, z);
 
   if (d > CARVE_SKIP) return d;
@@ -250,13 +370,20 @@ const _dir = new THREE.Vector3();
 const _dir2 = new THREE.Vector3();
 
 // Bent polyline tunnel. bends=0 straight, 1 winding, 2+ snaking (speleology).
-function addTunnel(c, rng, a, b, r, bends) {
+function addTunnel(
+  c: Chunk,
+  rng: Rng,
+  a: Vec3,
+  b: Vec3,
+  r: number,
+  bends: number,
+): void {
   if (!bends) {
     c.tunnels.push({ ax: a.x, ay: a.y, az: a.z, bx: b.x, by: b.y, bz: b.z, r });
     return;
   }
   const len = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
-  const pts = [a];
+  const pts: Vec3[] = [a];
   for (let i = 1; i <= bends; i++) {
     const t = i / (bends + 1);
     randDir(rng, _dir2);
@@ -284,13 +411,22 @@ function addTunnel(c, rng, a, b, r, bends) {
 // opts: kind ("wheel"|"hunk"|"block"|"slab"), eyesMin/Max, eyeRBase/Var,
 // exits, coreEye, deadEnds, axis (radial through-route), narrow, tangle,
 // pores [min,max], poreR [base,var], tunnelR [base,var]
-function makeChunkData(rng, center, s, res, opts) {
+function makeChunkData(
+  rng: Rng,
+  center: THREE.Vector3,
+  s: number,
+  res: number,
+  opts: ChunkOpts,
+): Chunk {
   const cell = 2 / res;
   const minTunnelR = (opts.narrow ? 2.2 : 2.6) * cell;
   const tunnelScale = [1.15, 1.0, 0.85][difficulty - 1] ?? 1.0;
-  const tr = (base) => Math.max(minTunnelR, base * tunnelScale);
-  const bends =
-    opts.narrow ? 2 : opts.kind === "block" || opts.kind === "slab" ? 0 : 1;
+  const tr = (base: number) => Math.max(minTunnelR, base * tunnelScale);
+  const bends = opts.narrow
+    ? 2
+    : opts.kind === "block" || opts.kind === "slab"
+      ? 0
+      : 1;
   const [trBase, trVar] = opts.tunnelR ?? [0.055, 0.04];
 
   let sx, sy, sz;
@@ -309,7 +445,7 @@ function makeChunkData(rng, center, s, res, opts) {
     sz = 0.85 + rng() * 0.35;
   }
 
-  const c = {
+  const c: Chunk = {
     center,
     s,
     res,
@@ -347,7 +483,7 @@ function makeChunkData(rng, center, s, res, opts) {
     }
   }
 
-  const eyes = [];
+  const eyes: SphereCarve[] = [];
 
   if (opts.coreEye) {
     const core = { x: 0, y: 0, z: 0, r: opts.coreEye };
@@ -376,7 +512,8 @@ function makeChunkData(rng, center, s, res, opts) {
   const nPores = pMin + Math.floor(rng() * (pMax - pMin + 1));
   for (let i = 0; i < nPores; i++) {
     randDir(rng, _dir);
-    const t = R0 * (opts.kind === "slab" ? 0.5 + 0.6 * rng() : 0.85 + 0.3 * rng());
+    const t =
+      R0 * (opts.kind === "slab" ? 0.5 + 0.6 * rng() : 0.85 + 0.3 * rng());
     c.holes.push({
       x: _dir.x * t * sx,
       y: _dir.y * t * sy,
@@ -477,7 +614,8 @@ function makeChunkData(rng, center, s, res, opts) {
   for (let k = 0; k < nDead && eyes.length >= 2; k++) {
     const start = eyes[Math.floor(rng() * eyes.length)];
     let target = eyes[Math.floor(rng() * eyes.length)];
-    if (target === start) target = eyes[(eyes.indexOf(target) + 1) % eyes.length];
+    if (target === start)
+      target = eyes[(eyes.indexOf(target) + 1) % eyes.length];
     randDir(rng, _dir);
     const chR = 0.06 + 0.05 * rng();
     const wall = 0.045 + 0.02 * rng();
@@ -512,9 +650,9 @@ function makeChunkData(rng, center, s, res, opts) {
 
 // The scratch marching-cubes instances stay alive for the whole session:
 // digging re-uses them to re-mesh single chunks on the fly.
-const mcCache = new Map();
+const mcCache = new Map<number, MarchingCubes>();
 
-function getMC(res) {
+function getMC(res: number): MarchingCubes {
   let mc = mcCache.get(res);
   if (!mc) {
     mc = new MarchingCubes(
@@ -534,7 +672,7 @@ function getMC(res) {
 // and a per-vertex RIND factor: 1 on the outer waxed crust, 0 on any carved
 // surface (holes, tunnels, cut faces, digs) — which the material renders as
 // bright interior paste. This contrast is what makes it read as CHEESE.
-function extractGeometry(mc, c) {
+function extractGeometry(mc: MarchingCubes, c: Chunk): THREE.BufferGeometry {
   const count = mc.count;
   const positions = mc.geometry.attributes.position.array.slice(0, count * 3);
   const normals = mc.geometry.attributes.normal.array.slice(0, count * 3);
@@ -568,7 +706,11 @@ function extractGeometry(mc, c) {
   return geometry;
 }
 
-function meshChunk(c, res, material) {
+function meshChunk(
+  c: Chunk,
+  res: number,
+  material: THREE.Material,
+): THREE.Mesh {
   const mc = getMC(res);
   mc.reset();
   mc.isolation = 0;
@@ -604,7 +746,7 @@ function meshChunk(c, res, material) {
 }
 
 // Re-runs marching cubes for one chunk from its cached (dug) field.
-function remeshChunk(c) {
+function remeshChunk(c: Chunk): void {
   if (!c.mesh || !c.field) return; // chunk never finished building
   const mc = getMC(c.res);
   mc.reset();
@@ -621,7 +763,7 @@ function remeshChunk(c) {
 // Carves a sphere of radius r (world units) at world point (x,y,z) out of
 // every overlapping chunk, updates their cached fields, re-meshes them, and
 // destroys small debris. Returns true if anything changed.
-export function digAt(x, y, z, r) {
+export function digAt(x: number, y: number, z: number, r: number): boolean {
   let changed = false;
 
   for (const c of chunks) {
@@ -642,9 +784,10 @@ export function digAt(x, y, z, r) {
     const half = res / 2;
     const cell = 1 / half;
     const reach = lr + SMOOTH_K + 2 * cell;
-    const min = (v) => Math.max(0, Math.floor((v - reach + 1) * half));
-    const max = (v) => Math.min(res - 1, Math.ceil((v + reach + 1) * half));
-    const field = c.field;
+    const min = (v: number) => Math.max(0, Math.floor((v - reach + 1) * half));
+    const max = (v: number) =>
+      Math.min(res - 1, Math.ceil((v + reach + 1) * half));
+    const field = c.field!;
     for (let zi = min(lz); zi <= max(lz); zi++) {
       const vz = (zi - half) / half;
       for (let yi = min(ly); yi <= max(ly); yi++) {
@@ -685,7 +828,11 @@ export function digAt(x, y, z, r) {
 
 // Sphere-traces the world SDF along a ray. Returns the hit point (just
 // outside the surface) or null. Used to aim the dig tool.
-export function raycastSolid(origin, dir, maxDist) {
+export function raycastSolid(
+  origin: Vec3,
+  dir: Vec3,
+  maxDist: number,
+): Vec3 | null {
   let t = 0;
   let x = origin.x,
     y = origin.y,
@@ -704,7 +851,7 @@ export function raycastSolid(origin, dir, maxDist) {
 
 // --- Biome materials ---------------------------------------------------------------------
 
-function vec3str(hex) {
+function vec3str(hex: number): string {
   const c = new THREE.Color(hex);
   return `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`;
 }
@@ -715,7 +862,19 @@ function vec3str(hex) {
 //   rind  — the zone's wax coating on the outer crust
 // Bioluminescent veins live in the PASTE (glowing from within); the rind
 // stays dead and dark. That contrast is the gouda signature.
-function createGoudaMaterial({ paste, rind, rough, vein, veinStrength }) {
+function createGoudaMaterial({
+  paste,
+  rind,
+  rough,
+  vein,
+  veinStrength,
+}: {
+  paste: number;
+  rind: number;
+  rough: number;
+  vein: [number, number, number];
+  veinStrength: number;
+}): THREE.MeshToonMaterial {
   // Cel-shaded cheese: MeshToonMaterial quantizes the lighting into hard
   // bands (shared gradient map, see toon.js); the custom paste/rind/vein
   // injection below rides on top unchanged. `rough` is kept for tuning
@@ -808,7 +967,7 @@ function createGoudaMaterial({ paste, rind, rough, vein, veinStrength }) {
   return material;
 }
 
-function createZoneMaterials() {
+function createZoneMaterials(): Record<ZoneName, THREE.MeshToonMaterial> {
   // Bright pale-yellow paste everywhere (that's the cheese), while each
   // biome wears its own WAX RIND — like a warehouse of differently-waxed
   // gouda wheels. Veins glow through the paste only.
@@ -899,7 +1058,12 @@ function createZoneMaterials() {
 
 // --- Gold core, boundary, blast markers ------------------------------------------------------
 
-function createGoldCore(parent, rng, pos, scale = 1) {
+function createGoldCore(
+  parent: THREE.Group,
+  rng: Rng,
+  pos: Vec3,
+  scale = 1,
+): void {
   const group = new THREE.Group();
   group.position.set(pos.x, pos.y, pos.z);
   group.scale.setScalar(scale);
@@ -916,7 +1080,7 @@ function createGoldCore(parent, rng, pos, scale = 1) {
   group.add(core);
 
   const shardGeo = new THREE.IcosahedronGeometry(0.7, 0);
-  const shards = [];
+  const shards: GoldShard[] = [];
   for (let i = 0; i < 12; i++) {
     const shard = new THREE.Mesh(shardGeo, goldMat);
     const st = {
@@ -942,7 +1106,7 @@ function createGoldCore(parent, rng, pos, scale = 1) {
   goldCore = { group, core, light, deepGlow, shards };
 }
 
-function createBoundarySphere(parent) {
+function createBoundarySphere(parent: THREE.Group): void {
   const material = new THREE.ShaderMaterial({
     transparent: true,
     depthWrite: false,
@@ -978,13 +1142,13 @@ function createBoundarySphere(parent) {
   parent.add(mesh);
 }
 
-let markerTexture = null;
-function getMarkerTexture() {
+let markerTexture: THREE.CanvasTexture | null = null;
+function getMarkerTexture(): THREE.CanvasTexture | null {
   if (markerTexture || typeof document === "undefined") return markerTexture;
   const size = 128;
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = size;
-  const ctx = canvas.getContext("2d");
+  const ctx = canvas.getContext("2d")!;
   const grad = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
   grad.addColorStop(0, "rgba(255,140,60,0.9)");
   grad.addColorStop(0.35, "rgba(255,100,40,0.25)");
@@ -1007,7 +1171,7 @@ function getMarkerTexture() {
   return markerTexture;
 }
 
-function createBlastMarkers(parent) {
+function createBlastMarkers(parent: THREE.Group): void {
   const tex = getMarkerTexture();
   if (!tex) return; // headless (tests)
   markerMaterial = new THREE.SpriteMaterial({
@@ -1028,7 +1192,11 @@ function createBlastMarkers(parent) {
 
 // --- Per-frame updates ------------------------------------------------------------------------
 
-export function updateGouda(elapsed, cameraPos = null, visibility = 90) {
+export function updateGouda(
+  elapsed: number,
+  cameraPos: THREE.Vector3 | null = null,
+  visibility = 90,
+): void {
   uGoudaTime.value = elapsed;
 
   if (goldCore) {
@@ -1064,8 +1232,8 @@ export function updateGouda(elapsed, cameraPos = null, visibility = 90) {
 
 // --- World assembly -----------------------------------------------------------------------------
 
-function placeChunks(rng) {
-  const specs = [
+function placeChunks(rng: Rng): ChunkSpec[] {
+  const specs: ChunkSpec[] = [
     {
       center: new THREE.Vector3(0, 0, 0),
       s: HEART_S,
@@ -1085,7 +1253,16 @@ function placeChunks(rng) {
     },
   ];
 
-  const tryBand = (zone, rMin, rMax, s, res, label, opts, guard) => {
+  const tryBand = (
+    zone: ZoneName,
+    rMin: number,
+    rMax: number,
+    s: number,
+    res: number,
+    label: string,
+    opts: ChunkOpts,
+    guard: number,
+  ) => {
     for (let shrink = 0; shrink < 4; shrink++, s *= 0.9) {
       for (let attempt = 0; attempt < 500; attempt++) {
         randDir(rng, _dir);
@@ -1109,7 +1286,16 @@ function placeChunks(rng) {
   };
 
   // A fibonacci shell of fused wall chunks with radial through-routes.
-  const shell = (zone, label, radius, n, sMin, sVar, res, opts) => {
+  const shell = (
+    zone: ZoneName,
+    label: string,
+    radius: number,
+    n: number,
+    sMin: number,
+    sVar: number,
+    res: number,
+    opts: ChunkOpts,
+  ) => {
     const GOLDEN = 2.399963229728653;
     for (let i = 0; i < n; i++) {
       const y = 1 - (2 * (i + 0.5)) / n;
@@ -1133,7 +1319,7 @@ function placeChunks(rng) {
     }
   };
 
-  const hollowOpts = {
+  const hollowOpts: ChunkOpts = {
     kind: "wheel",
     eyesMin: 8,
     eyesMax: 12,
@@ -1142,7 +1328,7 @@ function placeChunks(rng) {
     exits: 4,
     deadEnds: 1,
   };
-  const galleryOpts = {
+  const galleryOpts: ChunkOpts = {
     kind: "wheel",
     eyesMin: 6,
     eyesMax: 9,
@@ -1152,7 +1338,7 @@ function placeChunks(rng) {
     deadEnds: 2,
     tunnelR: [0.08, 0.04], // wide cathedral corridors
   };
-  const wallOpts = {
+  const wallOpts: ChunkOpts = {
     kind: "hunk",
     eyesMin: 12,
     eyesMax: 18,
@@ -1161,7 +1347,7 @@ function placeChunks(rng) {
     exits: 3,
     deadEnds: 1,
   };
-  const warrenOpts = {
+  const warrenOpts: ChunkOpts = {
     kind: "hunk",
     eyesMin: 18,
     eyesMax: 26,
@@ -1173,7 +1359,7 @@ function placeChunks(rng) {
     tangle: true,
     tunnelR: [0.038, 0.022],
   };
-  const blockOpts = {
+  const blockOpts: ChunkOpts = {
     kind: "block",
     eyesMin: 2,
     eyesMax: 4,
@@ -1181,7 +1367,7 @@ function placeChunks(rng) {
     eyeRVar: 0.09,
     exits: 2,
   };
-  const slabOpts = {
+  const slabOpts: ChunkOpts = {
     kind: "slab",
     eyesMin: 2,
     eyesMax: 4,
@@ -1192,7 +1378,7 @@ function placeChunks(rng) {
     poreR: [0.08, 0.09], // big clean through-holes
   };
 
-  const chimneyOpts = {
+  const chimneyOpts: ChunkOpts = {
     kind: "column",
     eyesMin: 5,
     eyesMax: 8,
@@ -1204,49 +1390,134 @@ function placeChunks(rng) {
 
   // THE HOLLOWS: cramped approach wheels around the heart.
   for (let i = 0; i < HOLLOW_COUNT; i++)
-    tryBand("hollows", 38, 60, 14 + rng() * 7, RES_MED, "the hollows", hollowOpts, 0.5);
+    tryBand(
+      "hollows",
+      38,
+      60,
+      14 + rng() * 7,
+      RES_MED,
+      "the hollows",
+      hollowOpts,
+      0.5,
+    );
 
   // THE BULWARK: sealed wall #2 — tight shell of fused hunks.
-  shell("bulwark", "the bulwark", BULWARK_R, BULWARK_N + (difficulty - 1) * 2, 44, 10, RES_WALL, wallOpts);
+  shell(
+    "bulwark",
+    "the bulwark",
+    BULWARK_R,
+    BULWARK_N + (difficulty - 1) * 2,
+    44,
+    10,
+    RES_WALL,
+    wallOpts,
+  );
 
   // THE GALLERIES: cathedral wheels between the walls.
   for (let i = 0; i < GALLERY_COUNT; i++)
-    tryBand("galleries", 100, 140, 22 + rng() * 12, RES_MED, "the galleries", galleryOpts, 0.5);
+    tryBand(
+      "galleries",
+      100,
+      140,
+      22 + rng() * 12,
+      RES_MED,
+      "the galleries",
+      galleryOpts,
+      0.5,
+    );
 
   // THE CRUST: sealed wall #1 — the big outer wall of many giant parts.
-  shell("crust", "the crust wall", CRUST_R, CRUST_N + (difficulty - 1) * 4, 60, 12, RES_WALL, wallOpts);
+  shell(
+    "crust",
+    "the crust wall",
+    CRUST_R,
+    CRUST_N + (difficulty - 1) * 4,
+    60,
+    12,
+    RES_WALL,
+    wallOpts,
+  );
 
   // THE WARRENS: speleology chunks against the crust's outer face.
   for (let i = 0; i < WARREN_COUNT; i++)
-    tryBand("warrens", 185, 225, 30 + rng() * 8, RES_WARREN, "the warrens", warrenOpts, 0.55);
+    tryBand(
+      "warrens",
+      185,
+      225,
+      30 + rng() * 8,
+      RES_WARREN,
+      "the warrens",
+      warrenOpts,
+      0.55,
+    );
 
   // THE SCREE: dense belt of small cut blocks.
   for (let i = 0; i < SCREE_COUNT; i++)
-    tryBand("scree", 230, 285, 10 + rng() * 8, RES_SMALL, "the scree", blockOpts, 0.65);
+    tryBand(
+      "scree",
+      230,
+      285,
+      10 + rng() * 8,
+      RES_SMALL,
+      "the scree",
+      blockOpts,
+      0.65,
+    );
 
   // THE CHIMNEYS: a forest of tall smoked columns — swim the vertical maze.
   for (let i = 0; i < CHIMNEY_COUNT; i++)
-    tryBand("chimneys", 285, 340, 30 + rng() * 12, RES_MED, "the chimneys", chimneyOpts, 0.5);
+    tryBand(
+      "chimneys",
+      285,
+      340,
+      30 + rng() * 12,
+      RES_MED,
+      "the chimneys",
+      chimneyOpts,
+      0.5,
+    );
 
   // THE REEF: fields of thin plates with big through-holes.
   for (let i = 0; i < REEF_COUNT; i++)
-    tryBand("reef", 335, 385, 30 + rng() * 14, RES_MED, "the reef", slabOpts, 0.55);
+    tryBand(
+      "reef",
+      335,
+      385,
+      30 + rng() * 14,
+      RES_MED,
+      "the reef",
+      slabOpts,
+      0.55,
+    );
 
   // THE DRIFT: sparse pale blocks at the very edge.
   for (let i = 0; i < DRIFT_COUNT; i++)
-    tryBand("drift", 388, WORLD_R, 11 + rng() * 8, RES_SMALL, "the drift", blockOpts, 1.2);
+    tryBand(
+      "drift",
+      388,
+      WORLD_R,
+      11 + rng() * 8,
+      RES_SMALL,
+      "the drift",
+      blockOpts,
+      1.2,
+    );
 
   return specs;
 }
 
-function makeDebrisGeometry(rng) {
+function makeDebrisGeometry(rng: Rng): THREE.IcosahedronGeometry {
   const geo = new THREE.IcosahedronGeometry(1, 3);
   const pos = geo.attributes.position;
   const off = rng() * 50;
   const v = new THREE.Vector3();
   for (let i = 0; i < pos.count; i++) {
     v.fromBufferAttribute(pos, i);
-    const n = fbm3(v.x * 1.4 + off, v.y * 1.4 + off * 2.1, v.z * 1.4 + off * 0.7);
+    const n = fbm3(
+      v.x * 1.4 + off,
+      v.y * 1.4 + off * 2.1,
+      v.z * 1.4 + off * 0.7,
+    );
     v.multiplyScalar(1 + 0.26 * n);
     pos.setXYZ(i, v.x, v.y, v.z);
   }
@@ -1254,11 +1525,15 @@ function makeDebrisGeometry(rng) {
   return geo;
 }
 
-function nextTick() {
+function nextTick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-export async function buildGoudaWorld(scene, onProgress = () => {}, opts = {}) {
+export async function buildGoudaWorld(
+  scene: THREE.Scene,
+  onProgress: (done: number, total: number, label: string) => void = () => {},
+  opts: { seed?: number; difficulty?: number } = {},
+): Promise<THREE.Group> {
   worldSeed = (opts.seed ?? worldSeed) >>> 0;
   difficulty = Math.min(3, Math.max(1, opts.difficulty ?? difficulty));
 
@@ -1307,7 +1582,11 @@ export async function buildGoudaWorld(scene, onProgress = () => {}, opts = {}) {
       const crumb = new THREE.Mesh(crumbGeos[i % 3], materials.scree);
       crumb.position.copy(p);
       crumb.scale.setScalar(s);
-      crumb.rotation.set(rng() * Math.PI * 2, rng() * Math.PI * 2, rng() * Math.PI * 2);
+      crumb.rotation.set(
+        rng() * Math.PI * 2,
+        rng() * Math.PI * 2,
+        rng() * Math.PI * 2,
+      );
       crumb.castShadow = true;
       crumb.receiveShadow = true;
       group.add(crumb);
@@ -1333,7 +1612,7 @@ export async function buildGoudaWorld(scene, onProgress = () => {}, opts = {}) {
   const host = candidates.length
     ? candidates[Math.floor(rng() * candidates.length)]
     : chunks[0];
-  const eye = host.biggestEye;
+  const eye = host.biggestEye!;
   goldPos = {
     x: host.center.x + eye.x * host.s,
     y: host.center.y + eye.y * host.s,
@@ -1351,7 +1630,8 @@ export async function buildGoudaWorld(scene, onProgress = () => {}, opts = {}) {
   // the doorway's exit corridor clear too, not just the spawn point.
   const p = new THREE.Vector3(0, 18, WORLD_R + 14);
   while (
-    (worldDistance(p.x, p.y, p.z) < 6 || worldDistance(p.x, p.y, p.z - 9) < 4) &&
+    (worldDistance(p.x, p.y, p.z) < 6 ||
+      worldDistance(p.x, p.y, p.z - 9) < 4) &&
     p.z < BOUNDARY_R - 6
   )
     p.z += 3;
@@ -1366,13 +1646,15 @@ export async function buildGoudaWorld(scene, onProgress = () => {}, opts = {}) {
   return group;
 }
 
-export function disposeWorld(scene) {
+export function disposeWorld(scene: THREE.Scene): void {
   for (const g of [worldGroup, extrasGroup]) {
     if (!g) continue;
     scene.remove(g);
-    g.traverse((child) => {
-      child.geometry?.dispose();
-      if (child.material?.dispose) child.material.dispose();
+    g.traverse((child: THREE.Object3D) => {
+      // Not every child is a Mesh — probe the properties structurally.
+      (child as { geometry?: THREE.BufferGeometry }).geometry?.dispose();
+      if ((child as { material?: THREE.Material }).material?.dispose)
+        (child as { material?: THREE.Material }).material!.dispose();
     });
   }
   worldGroup = null;
@@ -1387,21 +1669,21 @@ export function disposeWorld(scene) {
 }
 
 // Where the gold actually hides (for win-condition logic — NOT for the HUD).
-export function getGoldPos() {
+export function getGoldPos(): Vec3 | null {
   return goldPos;
 }
 
-export function getWorldSeed() {
+export function getWorldSeed(): number {
   return worldSeed;
 }
 
-export function getBlastPoints() {
+export function getBlastPoints(): Vec3[] {
   return blastPoints;
 }
 
 // --- Runtime queries -----------------------------------------------------------------------
 
-export function worldDistance(x, y, z) {
+export function worldDistance(x: number, y: number, z: number): number {
   let best = 1e9;
   for (let i = 0; i < chunks.length; i++) {
     const c = chunks[i];
@@ -1429,8 +1711,8 @@ export function worldDistance(x, y, z) {
 }
 
 const GRAD_EPS = 0.25;
-export function resolveCollision(pos, radius) {
-  let normal = null;
+export function resolveCollision(pos: Vec3, radius: number): Vec3 | null {
+  let normal: Vec3 | null = null;
   for (let iter = 0; iter < 2; iter++) {
     const d = worldDistance(pos.x, pos.y, pos.z);
     // A NaN here (degenerate SDF sample) would silently poison pos and
@@ -1464,7 +1746,11 @@ export function resolveCollision(pos, radius) {
   return normal;
 }
 
-export function findOpenSpot(near = null, minD = 0, maxD = 0) {
+export function findOpenSpot(
+  near: Vec3 | null = null,
+  minD = 0,
+  maxD = 0,
+): Vec3 {
   for (let i = 0; i < 300; i++) {
     let x, y, z;
     if (near) {
@@ -1484,6 +1770,6 @@ export function findOpenSpot(near = null, minD = 0, maxD = 0) {
   return { x: 0, y: WORLD_R + 20, z: 0 };
 }
 
-export function getSpawnPoint() {
+export function getSpawnPoint(): Vec3 {
   return spawnPoint ?? { x: 0, y: 18, z: WORLD_R + 14 };
 }

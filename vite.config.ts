@@ -1,4 +1,4 @@
-import { defineConfig } from "vite";
+import { defineConfig, type Plugin, type ViteDevServer } from "vite";
 import { fileURLToPath } from "node:url";
 
 export default defineConfig({
@@ -13,8 +13,8 @@ export default defineConfig({
     rollupOptions: {
       input: {
         main: fileURLToPath(new URL("./index.html", import.meta.url)),
-        // Model/animation bench (src/preview.js) — ships with the build so
-        // the deployed site exposes it at /preview.html too.
+        // Model/animation bench (src/bench/preview.ts) — ships with the
+        // build so the deployed site exposes it at /preview.html too.
         preview: fileURLToPath(new URL("./preview.html", import.meta.url)),
       },
     },
@@ -24,17 +24,25 @@ export default defineConfig({
 
 // Dev-only: start a local PeerJS signaling server alongside the dev server,
 // so local multiplayer testing doesn't depend on the public PeerJS cloud.
-// The client uses it automatically in dev (see src/network.js).
-let peerServerInstance = null;
-function localPeerServer() {
+// The client uses it automatically in dev (see src/net/mesh.ts).
+// (The `peer` package ships no types — the shape we rely on is tiny.)
+interface StoppablePeerServer {
+  close(): void;
+  on(event: "error", cb: (err: NodeJS.ErrnoException) => void): void;
+}
+let peerServerInstance: StoppablePeerServer | null = null;
+function localPeerServer(): Plugin {
   return {
     name: "local-peer-server",
     apply: "serve",
-    async configureServer(server) {
+    async configureServer(server: ViteDevServer) {
       if (peerServerInstance) return;
       try {
         const { PeerServer } = await import("peer");
-        const peerServer = PeerServer({ port: 9004, path: "/abyssal" });
+        const peerServer = PeerServer({
+          port: 9004,
+          path: "/abyssal",
+        }) as unknown as StoppablePeerServer;
         // Without this, a bind failure (e.g. EADDRINUSE from a stale
         // process left over by a previous crashed/killed dev server) is an
         // unhandled 'error' event that throws and crashes the whole Vite
@@ -60,11 +68,12 @@ function localPeerServer() {
           peerServerInstance = null;
         });
       } catch (err) {
+        const e = err as NodeJS.ErrnoException;
         console.warn(
           "  ➜  Local PeerJS server not started (" +
-            (err.code === "ERR_MODULE_NOT_FOUND"
+            (e.code === "ERR_MODULE_NOT_FOUND"
               ? "run: npm install"
-              : err.message) +
+              : e.message) +
             ") — falling back to the public PeerJS cloud.",
         );
       }

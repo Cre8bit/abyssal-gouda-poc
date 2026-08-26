@@ -17,7 +17,8 @@
 // preview.js drives the same code on the bench (standing rule — AGENTS.md).
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
-import { toonify } from "./toon.js";
+import { toonify } from "../render/toon.ts";
+import type { Vec3 } from "../state.ts";
 
 const MODEL_URL = `${import.meta.env.BASE_URL}models/tinBell.glb`;
 
@@ -50,12 +51,12 @@ const SILL_RANGE = 35;
 const PULSE_RATE = 0.7; // rad/s — the beacons' slow breathing
 
 // Soft round glow sprite (same canvas halo recipe as the catfish lantern).
-let glowMap = null;
+let glowMap: THREE.CanvasTexture | null = null;
 function glowTexture() {
   if (glowMap) return glowMap;
   const c = document.createElement("canvas");
   c.width = c.height = 64;
-  const ctx = c.getContext("2d");
+  const ctx = c.getContext("2d")!;
   const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
   g.addColorStop(0, "rgba(255,240,200,0.9)");
   g.addColorStop(0.4, "rgba(255,210,140,0.25)");
@@ -66,16 +67,30 @@ function glowTexture() {
   return glowMap;
 }
 
+// The shape every consumer of a bell gets back: graphics.js mounts it in
+// game, src/bench/preview.ts drives the same object on the bench.
+export interface BellVisual {
+  group: THREE.Group;
+  lamp: THREE.PointLight;
+  cabin: THREE.PointLight;
+  cable: THREE.Mesh;
+  dispose(): void;
+  update(t: number): void;
+  setLamp(on: boolean): void;
+  isLampOn(): boolean;
+}
+
 // Build one bell out of a tinBell.glb scene (or a clone of it). Group origin
 // = bell base center, hatch facing -Z; the caller decides where that sits.
-export function createBellVisual(bellScene) {
+export function createBellVisual(bellScene: THREE.Object3D): BellVisual {
   const group = new THREE.Group();
 
   toonify(bellScene); // same cel bands + ink rims as every other model
   // Divers wake up inside the shell: without backfaces the tin would be
   // invisible from within.
   bellScene.traverse((o) => {
-    if (o.isMesh) o.material.side = THREE.DoubleSide;
+    const mesh = o as THREE.Mesh;
+    if (mesh.isMesh) (mesh.material as THREE.Material).side = THREE.DoubleSide;
   });
   bellScene.scale.setScalar(BELL_SCALE);
   bellScene.rotation.y = BELL_FLIP;
@@ -90,7 +105,12 @@ export function createBellVisual(bellScene) {
   group.add(cable);
 
   // Cabin lamp under the chamber crown, with a small visible bulb.
-  const cabin = new THREE.PointLight(LAMP_COLOR, CABIN_INTENSITY, CABIN_RANGE, 2);
+  const cabin = new THREE.PointLight(
+    LAMP_COLOR,
+    CABIN_INTENSITY,
+    CABIN_RANGE,
+    2,
+  );
   cabin.position.copy(CABIN_ANCHOR);
   group.add(cabin);
 
@@ -104,7 +124,12 @@ export function createBellVisual(bellScene) {
   // Fixture beacons — a bulb the bloom can catch, a halo for the water
   // scatter, and the light itself: one on the porthole above the hatch, one
   // on the big lower porthole under the doorstep.
-  const makeBeacon = (anchor, intensity, range, haloScale) => {
+  const makeBeacon = (
+    anchor: THREE.Vector3,
+    intensity: number,
+    range: number,
+    haloScale: number,
+  ) => {
     const light = new THREE.PointLight(LAMP_COLOR, intensity, range, 2);
     light.position.copy(anchor);
     group.add(light);
@@ -156,7 +181,7 @@ export function createBellVisual(bellScene) {
         b.halo.material.dispose();
       }
     },
-    update(t) {
+    update(t: number) {
       const pulse = lampOn ? 0.82 + 0.18 * Math.sin(t * PULSE_RATE) : 0;
       for (const b of [beacon, sill]) {
         b.light.intensity = b.base * pulse;
@@ -166,7 +191,7 @@ export function createBellVisual(bellScene) {
       cabin.intensity = lampOn ? CABIN_INTENSITY : 0;
       cabinBulb.material.color.setHex(lampOn ? 0xfff1cf : 0x3a3630);
     },
-    setLamp(on) {
+    setLamp(on: boolean) {
       lampOn = on;
     },
     isLampOn: () => lampOn,
@@ -174,20 +199,16 @@ export function createBellVisual(bellScene) {
 }
 
 // --- Game-side mount ---------------------------------------------------------
-let gameScene = null;
-let template = null; // loaded gltf.scene, cloned per bell
-let loadPromise = null;
-const bells = []; // live visuals, berth order
+let gameScene: THREE.Scene | null = null;
+let template: THREE.Group | null = null; // loaded gltf.scene, cloned per bell
+let loadPromise: Promise<void> | null = null;
+const bells: BellVisual[] = []; // live visuals, berth order
 let wantCount = 1;
 const berth = new THREE.Vector3(); // bell 0 base; spawn sits at its hatch eye
 
 function berthAll() {
   for (let i = 0; i < bells.length; i++) {
-    bells[i].group.position.set(
-      berth.x + i * BERTH_SPACING,
-      berth.y,
-      berth.z,
-    );
+    bells[i].group.position.set(berth.x + i * BERTH_SPACING, berth.y, berth.z);
   }
 }
 
@@ -198,7 +219,7 @@ function syncBells() {
     gameScene.add(bells[bells.length - 1].group);
   }
   while (bells.length > wantCount) {
-    const bell = bells.pop();
+    const bell = bells.pop()!;
     gameScene.remove(bell.group);
     bell.dispose();
   }
@@ -209,7 +230,7 @@ function syncBells() {
 // bells survive them, only the spawn moves) just re-berth the row. The
 // divers spawn INSIDE bell 0: its base sinks DOOR_EYE below the spawn so
 // the spawn point sits at hatch eye height.
-export function mountBathyscaphe(scene, spawn) {
+export function mountBathyscaphe(scene: THREE.Scene, spawn: Vec3) {
   gameScene = scene;
   berth.set(spawn.x, spawn.y - DOOR_EYE, spawn.z);
   loadPromise ??= new GLTFLoader()
@@ -223,12 +244,12 @@ export function mountBathyscaphe(scene, spawn) {
 }
 
 // One berth per diver in the crew (main.js calls this on join/leave).
-export function setBellCount(n) {
+export function setBellCount(n: number) {
   wantCount = Math.max(1, n | 0);
   syncBells();
 }
 
-export function updateBathyscaphe(t) {
+export function updateBathyscaphe(t: number) {
   for (const bell of bells) bell.update(t);
 }
 
@@ -257,7 +278,7 @@ const DOOR_HALF_W = 1.3; // hatch aperture half-width (jamb faces sit at
 
 // Sphere vs solid cylinder slab: minimal axis push. Mutates lp, returns the
 // push normal or null.
-function pushSlab(lp, pr, y0, y1) {
+function pushSlab(lp: Vec3, pr: number, y0: number, y1: number): Vec3 | null {
   const r = Math.hypot(lp.x, lp.z) || 1e-6;
   if (r >= WALL_RO + pr || lp.y <= y0 - pr || lp.y >= y1 + pr) return null;
   const up = y1 + pr - lp.y;
@@ -286,7 +307,7 @@ function pushSlab(lp, pr, y0, y1) {
 // walking straight through the wall. Deep in the wall beside the door the
 // minimal push can still be sideways into the aperture, which keeps the
 // doorway forgiving to thread with mouse-look.
-function pushWall(lp, pr) {
+function pushWall(lp: Vec3, pr: number): Vec3 | null {
   if (lp.y <= FLOOR_Y - pr || lp.y >= CEIL_Y + pr) return null; // slabs' turf
   const r = Math.hypot(lp.x, lp.z) || 1e-6;
   if (r <= WALL_RI - pr || r >= WALL_RO + pr) return null;
@@ -321,10 +342,10 @@ function pushWall(lp, pr) {
 // resolveCollision: mutates pos, returns the push normal (or null) so the
 // caller can strip the into-wall velocity and slide. The returned normal is
 // a reused scratch object — read it before the next call, don't keep it.
-const _lp = { x: 0, y: 0, z: 0 };
-const _normal = { x: 0, y: 0, z: 0 };
+const _lp: Vec3 = { x: 0, y: 0, z: 0 };
+const _normal: Vec3 = { x: 0, y: 0, z: 0 };
 
-export function collideBathyscaphe(pos, radius) {
+export function collideBathyscaphe(pos: Vec3, radius: number): Vec3 | null {
   let hitAny = false;
   for (const bell of bells) {
     const b = bell.group.position;

@@ -4,19 +4,31 @@
 // remote diver's world position, with the listener at the local camera.
 // Result: your teammate gets louder (and directional) as you get closer.
 
-let audioCtx = null;
-let localStream = null;
+import type { Peer, MediaConnection } from "peerjs";
+
+export type VoiceStatus =
+  "connecting" | "on" | "muted" | "off" | "error" | "mic-denied";
+
+interface RemoteVoice {
+  source: MediaStreamAudioSourceNode;
+  panner: PannerNode;
+  el: HTMLAudioElement;
+  call: MediaConnection | null;
+}
+
+let audioCtx: AudioContext | null = null;
+let localStream: MediaStream | null = null;
 let muted = false;
-let statusCb = null;
+let statusCb: ((state: VoiceStatus) => void) | null = null;
 
-const remoteVoices = new Map(); // peerId -> { source, panner, el, call }
-const pendingCalls = new Set(); // peerIds we are currently dialing
+const remoteVoices = new Map<string, RemoteVoice>(); // peerId -> { source, panner, el, call }
+const pendingCalls = new Set<string>(); // peerIds we are currently dialing
 
-export function onVoiceStatus(fn) {
+export function onVoiceStatus(fn: (state: VoiceStatus) => void) {
   statusCb = fn;
 }
 
-function report(state) {
+function report(state: VoiceStatus) {
   statusCb?.(state);
 }
 
@@ -34,7 +46,7 @@ async function ensureMic() {
 }
 
 // Answer incoming voice calls (both host and client should install this).
-export function initVoice(peer) {
+export function initVoice(peer: Peer) {
   peer.on("call", async (call) => {
     try {
       call.answer(await ensureMic());
@@ -50,7 +62,7 @@ export function initVoice(peer) {
 // Start a voice call to a remote peer. In the mesh, only the NEWCOMER
 // initiates (network.js's `initiator` flag) — so two peers never call each
 // other simultaneously. Guarded against duplicates anyway.
-export async function callPeer(peer, remoteId) {
+export async function callPeer(peer: Peer, remoteId: string) {
   if (remoteVoices.has(remoteId) || pendingCalls.has(remoteId)) return;
   pendingCalls.add(remoteId);
   try {
@@ -63,7 +75,7 @@ export async function callPeer(peer, remoteId) {
   }
 }
 
-function attachCall(call) {
+function attachCall(call: MediaConnection) {
   call.on("stream", (stream) => {
     pendingCalls.delete(call.peer);
     setupSpatialAudio(call.peer, stream, call);
@@ -77,7 +89,7 @@ function attachCall(call) {
 }
 
 // Drop one peer's voice (mesh disconnect).
-export function hangUp(peerId) {
+export function hangUp(peerId: string) {
   pendingCalls.delete(peerId);
   const voice = remoteVoices.get(peerId);
   if (voice?.call) {
@@ -88,8 +100,16 @@ export function hangUp(peerId) {
   teardown(peerId);
 }
 
-function setupSpatialAudio(peerId, stream, call = null) {
-  audioCtx ??= new (window.AudioContext || window.webkitAudioContext)();
+function setupSpatialAudio(
+  peerId: string,
+  stream: MediaStream,
+  call: MediaConnection | null = null,
+) {
+  audioCtx ??= new (
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext: typeof AudioContext })
+      .webkitAudioContext
+  )();
   audioCtx.resume();
 
   // Chrome quirk: WebRTC audio only flows into Web Audio if the stream is
@@ -113,7 +133,7 @@ function setupSpatialAudio(peerId, stream, call = null) {
   remoteVoices.set(peerId, { source, panner, el, call });
 }
 
-function teardown(peerId) {
+function teardown(peerId: string) {
   const voice = remoteVoices.get(peerId);
   if (!voice) return;
   // Unwind the whole per-peer audio chain: a still-connected source keeps
@@ -129,7 +149,11 @@ function teardown(peerId) {
 
 // --- Per-frame spatial updates ---
 
-export function setListenerPose(pos, yaw, pitch) {
+export function setListenerPose(
+  pos: { x: number; y: number; z: number },
+  yaw: number,
+  pitch: number,
+) {
   if (!audioCtx) return;
   const l = audioCtx.listener;
   const cosP = Math.cos(pitch);
@@ -156,7 +180,12 @@ export function setListenerPose(pos, yaw, pitch) {
   }
 }
 
-export function setVoicePosition(peerId, x, y, z) {
+export function setVoicePosition(
+  peerId: string,
+  x: number,
+  y: number,
+  z: number,
+) {
   const voice = remoteVoices.get(peerId);
   if (!voice) return;
   const p = voice.panner;

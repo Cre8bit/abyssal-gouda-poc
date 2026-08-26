@@ -1,0 +1,24 @@
+{
+  // Type-check only (Vite/esbuild does the transpiling, node 24 strips types
+  // when tools run .ts directly) — hence noEmit + erasableSyntaxOnly:
+  // every .ts file must be plain JS once annotations are erased (no enums,
+  // no namespaces), so the SAME file runs in the browser, node and tsc.
+  "compilerOptions": {
+    "target": "es2022",
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "lib": ["es2022", "dom", "dom.iterable"],
+    "strict": true,
+    "noEmit": true,
+    "erasableSyntaxOnly": true,
+    // The project is 100% TypeScript; files import each other WITH the .ts
+    // extension — required for the node-run tools (tools/*.ts) and
+    // unambiguous in Vite.
+    "allowImportingTsExtensions": true,
+    "skipLibCheck": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "types": ["vite/client", "three", "node"]
+  },
+  "include": ["src", "tools", "vite.config.ts", "eslint.config.ts"]
+}

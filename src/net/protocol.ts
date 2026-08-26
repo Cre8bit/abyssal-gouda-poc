@@ -1,19 +1,47 @@
-// protocol.js — binary wire format for 30 Hz state packets. Dependency-free
+// protocol.ts — binary wire format for 30 Hz state packets. Dependency-free
 // so it can be unit-tested in plain node (tools/test-protocol.mjs).
 //
 // Layout (little-endian, 24 bytes):
 //   u8   version     (PROTO_VERSION — bump on ANY layout change, so packets
 //                     from a stale client are rejected instead of misread)
 //   u16  seq         (wrapping counter — stale packets are dropped)
-//   u8   flags       bit7 = flashlight, bits 0-6 = status mask (effects.js)
+//   u8   flags       bit7 = flashlight, bits 0-6 = status mask (effects.ts)
 //   f32  x, y, z
 //   i16  yaw, pitch, swimYaw, swimPitch   (radians wrapped to ±π, ×ANGLE_SCALE)
+
+// What a client BROADCASTS every tick (sy/sp — the lazy swim body — default
+// to yaw/pitch when omitted).
+export interface PlayerStateOut {
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  pitch: number;
+  sy?: number;
+  sp?: number;
+  light: boolean;
+  status: number; // 7-bit mask, see effects.ts STATUS
+}
+
+// What decodeState RETURNS — every field present, plus the sequence number.
+export interface PlayerStateIn {
+  seq: number;
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  pitch: number;
+  sy: number;
+  sp: number;
+  light: boolean;
+  status: number;
+}
 
 export const STATE_PACKET_BYTES = 24;
 export const PROTO_VERSION = 1;
 const ANGLE_SCALE = 32767 / Math.PI;
 
-export function wrapAngle(a) {
+export function wrapAngle(a: number): number {
   a = a % (Math.PI * 2);
   if (a > Math.PI) a -= Math.PI * 2;
   if (a < -Math.PI) a += Math.PI * 2;
@@ -24,7 +52,11 @@ export function wrapAngle(a) {
 // callers on a hot path (30 Hz broadcast) pass a scratch buffer to avoid
 // allocating per tick. RTCDataChannel.send copies synchronously, so the
 // scratch can be reused immediately after sending.
-export function encodeState(s, seq, out = null) {
+export function encodeState(
+  s: PlayerStateOut,
+  seq: number,
+  out: ArrayBuffer | null = null,
+): ArrayBuffer {
   const buf = out ?? new ArrayBuffer(STATE_PACKET_BYTES);
   const v = new DataView(buf);
   v.setUint8(0, PROTO_VERSION);
@@ -40,7 +72,9 @@ export function encodeState(s, seq, out = null) {
   return buf;
 }
 
-export function decodeState(data) {
+export function decodeState(
+  data: ArrayBuffer | ArrayBufferView,
+): PlayerStateIn | null {
   const v = ArrayBuffer.isView(data)
     ? new DataView(data.buffer, data.byteOffset, data.byteLength)
     : new DataView(data);
@@ -62,6 +96,6 @@ export function decodeState(data) {
 }
 
 // Is sequence `a` newer than `b`, with u16 wraparound?
-export function seqNewer(a, b) {
+export function seqNewer(a: number, b: number): boolean {
   return a !== b && ((a - b) & 0xffff) < 0x8000;
 }

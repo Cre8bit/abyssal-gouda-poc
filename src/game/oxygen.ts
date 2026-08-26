@@ -1,11 +1,11 @@
-// oxygen.js — the survival clock (T0.3).
+// oxygen.ts — the survival clock (T0.3).
 //
 // A full tank lasts ~10 minutes of calm swimming — matching the 10-20 min
 // target run. Sprinting and distress statuses (trapped, gassed) burn it
 // faster; the recharge zone at the spawn point (the bathyscaphe berth)
-// refills it. Hitting zero = blackout → main.js respawns the diver.
+// refills it. Hitting zero = blackout → main.ts respawns the diver.
 
-import { STATUS } from "./effects.js";
+import { STATUS, type StatusMask } from "./effects.ts";
 
 export const O2_MAX = 100;
 const BASE_DRAIN = O2_MAX / 600; // 10 min of calm swimming
@@ -16,38 +16,55 @@ const REFILL_RATE = O2_MAX / 5; // full tank in 5 s at the bathyscaphe
 
 const WARN_THRESHOLDS = [50, 25, 10]; // one-shot warnings, re-armed on refill
 
+export interface OxygenHooks {
+  onDeath?: () => void;
+  onWarn?: (threshold: number) => void;
+}
+
+export interface OxygenConditions {
+  sprinting?: boolean;
+  status?: StatusMask; // the local effects mask
+  inRefillZone?: boolean; // near the spawn/bathyscaphe
+}
+
 let o2 = O2_MAX;
 let dead = false;
-let warned = new Set();
-let onDeath = null;
-let onWarn = null; // (threshold) => void
+const warned = new Set<number>();
+let onDeath: (() => void) | null = null;
+let onWarn: ((threshold: number) => void) | null = null;
 
-export function initOxygen({ onDeath: d, onWarn: w } = {}) {
+export function initOxygen({ onDeath: d, onWarn: w }: OxygenHooks = {}): void {
   onDeath = d ?? null;
   onWarn = w ?? null;
 }
 
-export function getO2() {
+export function getO2(): number {
   return o2;
 }
 
-export function getO2Frac() {
+export function getO2Frac(): number {
   return o2 / O2_MAX;
 }
 
-export function isDead() {
+export function isDead(): boolean {
   return dead;
 }
 
-export function refillOxygen() {
+export function refillOxygen(): void {
   o2 = O2_MAX;
   dead = false;
   warned.clear();
 }
 
-// Once per frame. `status` is the local effects mask; `inRefillZone` is true
-// near the spawn/bathyscaphe. Returns the current O₂ fraction.
-export function updateOxygen(delta, { sprinting = false, status = 0, inRefillZone = false } = {}) {
+// Once per frame. Returns the current O₂ fraction.
+export function updateOxygen(
+  delta: number,
+  {
+    sprinting = false,
+    status = 0,
+    inRefillZone = false,
+  }: OxygenConditions = {},
+): number {
   if (dead) return 0;
 
   if (inRefillZone) {

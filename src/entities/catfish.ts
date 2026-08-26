@@ -15,15 +15,18 @@
 // applyCatfishState() and run "puppets" that interpolate toward the host's
 // states and mirror the bite/lantern moments. Solo players simulate locally.
 import * as THREE from "three";
-import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import {
+  GLTFLoader,
+  type GLTF,
+} from "three/examples/jsm/loaders/GLTFLoader.js";
 import { clone as cloneSkinned } from "three/examples/jsm/utils/SkeletonUtils.js";
 import {
   findOpenSpot,
   resolveCollision,
   getSpawnPoint,
   WORLD_R,
-} from "./gouda.js";
-import { toonify } from "./toon.js";
+} from "../world/gouda.ts";
+import { toonify } from "../render/toon.ts";
 
 const MODEL_URL = `${import.meta.env.BASE_URL}models/catfish_rigged.glb`;
 
@@ -44,13 +47,64 @@ const TURN_RATE = 1.8; // rad/s yaw ease (heavy, deliberate turns)
 const SAFE_RADIUS = 75; // no-hunt bubble around the player spawn point
 const SPAWN_MIN = 95; // fish first appear between these distances from
 const SPAWN_MAX = 240; // spawn — visible bulbs in the distance, not a threat
-const STATE_ID = { lurk: 0, stalk: 1, strike: 2 };
-const STATE_NAME = ["lurk", "stalk", "strike"];
+type FishState = "lurk" | "stalk" | "strike";
+type Habitat = "open" | "maze";
+type Vec3Like = { x: number; y: number; z: number };
 
-let scene = null;
-let templatePromise = null;
-const fishes = [];
-let hooks = {}; // { onBite(fishPos) }
+// Compact wire format: one [x, y, z, yaw, pitch, stateId] row per fish.
+export type CatfishWireState = [
+  number,
+  number,
+  number,
+  number,
+  number,
+  number,
+][];
+
+interface CatfishHooks {
+  onBite?(fishPos: Vec3Like): void;
+}
+
+// Puppet interpolation target (last state received from the host).
+interface FishNetTarget {
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  pitch: number;
+  state: FishState;
+}
+
+// Per-fish record: scene graph handles, animation, sim + puppet state.
+interface Fish {
+  group: THREE.Group;
+  mixer: THREE.AnimationMixer;
+  swim: THREE.AnimationAction;
+  bite: THREE.AnimationAction;
+  light: THREE.PointLight;
+  glow: THREE.Sprite;
+  pos: Vec3Like;
+  vel: Vec3Like;
+  yaw: number;
+  pitch: number;
+  roll: number;
+  animSpeed: number;
+  state: FishState;
+  habitat: Habitat;
+  waypoint: Vec3Like;
+  cooldown: number;
+  bitTimer: number;
+  seed: number;
+  net: FishNetTarget | null;
+}
+
+const STATE_ID: Record<FishState, number> = { lurk: 0, stalk: 1, strike: 2 };
+const STATE_NAME: FishState[] = ["lurk", "stalk", "strike"];
+
+let scene: THREE.Scene | null = null;
+let templatePromise: Promise<GLTF | null> | null = null;
+const fishes: Fish[] = [];
+let hooks: CatfishHooks = {}; // { onBite(fishPos) }
 let authority = true; // false = puppet mode (a host feeds us states)
 let pendingPuppets = 0; // puppet count requested before the template loaded
 // Spawn generation: bumped by every spawn/despawn. The async template load
@@ -63,13 +117,16 @@ function loadTemplate() {
     .loadAsync(MODEL_URL)
     .then((gltf) => {
       gltf.scene.traverse((o) => {
-        if (o.isMesh || o.isSkinnedMesh) {
+        if (
+          (o as THREE.Mesh).isMesh ||
+          (o as THREE.SkinnedMesh).isSkinnedMesh
+        ) {
           o.castShadow = true;
           o.frustumCulled = false; // skinned bounds don't follow the bones
         }
       });
       toonify(gltf.scene, { ink: 0.8 }); // heavy ink — it's the monster
-      return gltf;  
+      return gltf;
     })
     .catch((err) => {
       console.warn("catfish model failed to load", err);
@@ -79,12 +136,12 @@ function loadTemplate() {
 }
 
 // Soft round glow sprite for the lantern (self-contained tiny halo).
-let glowTex = null;
+let glowTex: THREE.CanvasTexture | null = null;
 function lanternGlowTexture() {
   if (glowTex) return glowTex;
   const c = document.createElement("canvas");
   c.width = c.height = 64;
-  const ctx = c.getContext("2d");
+  const ctx = c.getContext("2d")!;
   const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
   g.addColorStop(0, "rgba(255,240,200,0.9)");
   g.addColorStop(0.4, "rgba(255,210,140,0.25)");
@@ -95,7 +152,7 @@ function lanternGlowTexture() {
   return glowTex;
 }
 
-export function initCatfishSystem(sceneRef) {
+export function initCatfishSystem(sceneRef: THREE.Scene) {
   scene = sceneRef;
   loadTemplate(); // start fetching early
 }
@@ -116,7 +173,7 @@ export function despawnCatfish() {
   fishes.length = 0;
 }
 
-export function spawnCatfish(count, gameHooks = {}) {
+export function spawnCatfish(count: number, gameHooks: CatfishHooks = {}) {
   hooks = gameHooks;
   const gen = ++spawnGen;
   loadTemplate().then((gltf) => {
@@ -129,7 +186,7 @@ export function spawnCatfish(count, gameHooks = {}) {
   });
 }
 
-function distToSpawn(p) {
+function distToSpawn(p: Vec3Like) {
   const s = getSpawnPoint();
   return Math.hypot(p.x - s.x, p.y - s.y, p.z - s.z);
 }
@@ -137,7 +194,7 @@ function distToSpawn(p) {
 // A wander point in the clear ring around the ball (outside the crust,
 // inside the soft leash the player is held by) — never inside the safe
 // bubble around the player spawn.
-function openWaterSpot(near = null) {
+function openWaterSpot(near: Vec3Like | null = null): Vec3Like {
   const p = new THREE.Vector3();
   for (let tries = 0; tries < 12; tries++) {
     if (near) {
@@ -166,14 +223,14 @@ function openWaterSpot(near = null) {
   return { x: p.x, y: p.y, z: p.z };
 }
 
-function spawnOne(gltf, habitat = "open") {
+function spawnOne(gltf: GLTF, habitat: Habitat = "open") {
   const root = cloneSkinned(gltf.scene);
   const group = new THREE.Group();
   root.scale.setScalar(SCALE);
   group.add(root);
 
   // Lantern: find the bulb bone (glTF "forehead.L.017"; three strips dots).
-  let bulb = null;
+  let bulb: THREE.Object3D | null = null;
   root.traverse((o) => {
     const n = (o.name || "").toLowerCase();
     if (n.includes("forehead") && n.includes("017")) bulb = o;
@@ -191,8 +248,10 @@ function spawnOne(gltf, habitat = "open") {
   );
   glow.scale.setScalar(0.8); // bulb-local; rescaled per-frame with distance
   if (bulb) {
-    bulb.add(light);
-    bulb.add(glow);
+    // (cast: TS can't see the traverse-callback assignment above, so it
+    // still thinks `bulb` is null here)
+    (bulb as THREE.Object3D).add(light);
+    (bulb as THREE.Object3D).add(glow);
     light.position.set(0, 0.05, 0); // just past the bulb tip
     glow.position.set(0, 0.05, 0);
   } else {
@@ -203,19 +262,23 @@ function spawnOne(gltf, habitat = "open") {
 
   // Animation clips
   const mixer = new THREE.AnimationMixer(root);
-  const clip = (n) => THREE.AnimationClip.findByName(gltf.animations, n);
+  // The GLB is known to ship these clips — findByName's `null` can't happen.
+  const clip = (n: string) =>
+    THREE.AnimationClip.findByName(gltf.animations, n)!;
   const swim = mixer.clipAction(clip("swim"));
   swim.play();
   const flicker = mixer.clipAction(clip("flicker"));
   flicker.play();
   const bite = mixer.clipAction(clip("bite"));
-  bite.setLoop(THREE.LoopOnce);
+  // (typings require `repetitions`; LoopOnce never reads it — keep the
+  // runtime call byte-identical by passing the same implicit undefined)
+  bite.setLoop(THREE.LoopOnce, undefined as unknown as number);
   bite.clampWhenFinished = false;
 
   const spot = habitat === "open" ? openWaterSpot() : findOpenSpot();
   const pos = { x: spot.x, y: spot.y, z: spot.z };
   group.position.set(pos.x, pos.y, pos.z);
-  scene.add(group);
+  scene!.add(group);
 
   fishes.push({
     group,
@@ -240,11 +303,11 @@ function spawnOne(gltf, habitat = "open") {
   });
 }
 
-function nextWaypoint(from) {
+function nextWaypoint(from: Vec3Like) {
   return findOpenSpot(from, 12, 32);
 }
 
-function wanderPoint(f) {
+function wanderPoint(f: Fish) {
   return f.habitat === "open" ? openWaterSpot(f.pos) : nextWaypoint(f.pos);
 }
 
@@ -252,13 +315,13 @@ function wanderPoint(f) {
 // Network sync (host-authoritative)
 // ---------------------------------------------------------------------------
 
-export function setCatfishAuthority(a) {
+export function setCatfishAuthority(a: boolean) {
   authority = a;
 }
 
 // Compact per-fish state for the host to broadcast.
-export function getCatfishState() {
-  return fishes.map((f) => [
+export function getCatfishState(): CatfishWireState {
+  return fishes.map((f): CatfishWireState[number] => [
     +f.pos.x.toFixed(2),
     +f.pos.y.toFixed(2),
     +f.pos.z.toFixed(2),
@@ -269,7 +332,8 @@ export function getCatfishState() {
 }
 
 // Joiners: adopt the host's fish as interpolated puppets.
-export function applyCatfishState(arr) {
+// `arr` arrives straight off a network event — validated at runtime below.
+export function applyCatfishState(arr: unknown) {
   if (!Array.isArray(arr)) return;
   authority = false;
   if (fishes.length !== arr.length && pendingPuppets !== arr.length) {
@@ -290,8 +354,11 @@ export function applyCatfishState(arr) {
     const f = fishes[i];
     if (!f.net) {
       // first packet: snap into place
-      f.pos.x = x; f.pos.y = y; f.pos.z = z;
-      f.yaw = yaw; f.pitch = pitch;
+      f.pos.x = x;
+      f.pos.y = y;
+      f.pos.z = z;
+      f.yaw = yaw;
+      f.pitch = pitch;
     }
     f.net = { x, y, z, yaw, pitch, state: STATE_NAME[st] ?? "lurk" };
   }
@@ -303,7 +370,7 @@ export function applyCatfishState(arr) {
 
 const _dir = new THREE.Vector3();
 
-function shortestArc(a, b) {
+function shortestArc(a: number, b: number) {
   let d = b - a;
   while (d > Math.PI) d -= 2 * Math.PI;
   while (d < -Math.PI) d += 2 * Math.PI;
@@ -312,7 +379,12 @@ function shortestArc(a, b) {
 
 // playerPos: the LOCAL player (bite shoves apply to them only).
 // others: other players' positions — fish hunt whoever is nearest.
-export function updateCatfishSystem(delta, playerPos, elapsed = 0, others = []) {
+export function updateCatfishSystem(
+  delta: number,
+  playerPos: Vec3Like,
+  elapsed = 0,
+  others: Vec3Like[] = [],
+) {
   for (const f of fishes) {
     const localDist = Math.hypot(
       playerPos.x - f.pos.x,
@@ -343,12 +415,13 @@ export function updateCatfishSystem(delta, playerPos, elapsed = 0, others = []) 
     const jitter =
       0.78 + 0.14 * Math.sin(t * 13.7) + 0.08 * Math.sin(t * 31.3 + 1.2);
     let base;
-    if (f.state === "strike") base = 120; // white-hot flare
-    else if (f.state === "stalk") base = 18; // dimmed, sneaking
+    if (f.state === "strike")
+      base = 120; // white-hot flare
+    else if (f.state === "stalk")
+      base = 18; // dimmed, sneaking
     else base = 55;
     // occasional dropouts while stalking — a light that blinks in the murk
-    const dropout =
-      f.state === "stalk" && Math.sin(t * 2.3) > 0.86 ? 0.15 : 1;
+    const dropout = f.state === "stalk" && Math.sin(t * 2.3) > 0.86 ? 0.15 : 1;
     f.light.intensity +=
       (base * jitter * dropout - f.light.intensity) * Math.min(1, delta * 10);
     f.light.color.setHex(f.state === "strike" ? 0xfff4e0 : 0xffd9a0);
@@ -361,7 +434,13 @@ export function updateCatfishSystem(delta, playerPos, elapsed = 0, others = []) 
 }
 
 // Host/solo simulation. Returns the yaw rate (rad/s) for banking.
-function simulate(f, delta, playerPos, localDist, others) {
+function simulate(
+  f: Fish,
+  delta: number,
+  playerPos: Vec3Like,
+  localDist: number,
+  others: Vec3Like[],
+) {
   // Nearest player is the prey.
   let prey = playerPos;
   let dist = localDist;
@@ -394,14 +473,20 @@ function simulate(f, delta, playerPos, localDist, others) {
     const w = f.waypoint;
     if (Math.hypot(w.x - f.pos.x, w.y - f.pos.y, w.z - f.pos.z) < WAYPOINT_EPS)
       f.waypoint = wanderPoint(f);
-    tx = f.waypoint.x; ty = f.waypoint.y; tz = f.waypoint.z;
+    tx = f.waypoint.x;
+    ty = f.waypoint.y;
+    tz = f.waypoint.z;
     speed = LURK_SPEED;
   } else if (f.state === "stalk") {
-    tx = prey.x; ty = prey.y; tz = prey.z;
+    tx = prey.x;
+    ty = prey.y;
+    tz = prey.z;
     speed = STALK_SPEED;
   } else {
     // strike: brief coiled wind-up, then the lunge
-    tx = prey.x; ty = prey.y; tz = prey.z;
+    tx = prey.x;
+    ty = prey.y;
+    tz = prey.z;
     speed = f.bitTimer < 0.16 ? 0.4 : LUNGE_SPEED;
     f.bitTimer += delta;
     // snap moment of the bite clip — check for a hit on the LOCAL player once
@@ -462,7 +547,12 @@ function simulate(f, delta, playerPos, localDist, others) {
 
 // Joiner-side puppet: interpolate toward the host's state and mirror the
 // bite/lantern beats. Returns yaw rate for banking.
-function puppet(f, delta, playerPos, localDist) {
+function puppet(
+  f: Fish,
+  delta: number,
+  playerPos: Vec3Like,
+  localDist: number,
+) {
   const n = f.net;
   if (!n) return 0;
 

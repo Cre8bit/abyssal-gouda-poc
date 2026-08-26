@@ -33,6 +33,7 @@
 //    therefore the helmet torch — aims EXACTLY where the camera points.
 import * as THREE from "three";
 import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
+import type { GLTF } from "three/examples/jsm/loaders/GLTFLoader.js";
 
 export const DIVER_SCALE = 1.4; // template ~0.95 tall → ~1.33 world units
 // The FIRST-PERSON body renders smaller than reality: at true scale the
@@ -50,11 +51,30 @@ const FP_OFFSET = new THREE.Vector3(0, -0.5, -0.2);
 
 // Base arm poses (template-space angles), numerically solved per view:
 // the FP pose reaches further forward-down so your own hands stay in frame.
-const ARM_POSE_THIRD = { uy: 1.45, ux: -0.45, fy: 0.25, fx: -0.15, hx: 0.18 };
+interface ArmPose {
+  uy: number;
+  ux: number;
+  fy: number;
+  fx: number;
+  hx: number;
+}
+const ARM_POSE_THIRD: ArmPose = {
+  uy: 1.45,
+  ux: -0.45,
+  fy: 0.25,
+  fx: -0.15,
+  hx: 0.18,
+};
 // FP pose places the gloves+forearms (the only FP geometry) LOW and WIDE
 // (screenshot-tuned via tools/runner.mjs pose sweeps): spaced across the
 // whole view width, forearms sweeping off the bottom corners, pure-POV style.
-const ARM_POSE_FP = { uy: -0.2, ux: -0.7, fy: 1.1, fx: -0.15, hx: -0.05 };
+const ARM_POSE_FP: ArmPose = {
+  uy: -0.2,
+  ux: -0.7,
+  fy: 1.1,
+  fx: -0.15,
+  hx: -0.05,
+};
 
 // FP hands are SCREEN-ANCHORED, FPS-style: the invisible body yaws with the
 // camera and pitches with it too — `base` tips the rig so at level view only
@@ -67,7 +87,29 @@ export const FP_VIEW = { base: 0.3, follow: 0.7 };
 // from URL params, so arm placement can be swept from the screenshot runner
 // without touching code. Mutates the live objects — rigs read them by
 // reference every frame.
-export function configureFpBody({ uy, ux, fy, fx, hx, ox, oy, oz, pb, pf } = {}) {
+export function configureFpBody({
+  uy,
+  ux,
+  fy,
+  fx,
+  hx,
+  ox,
+  oy,
+  oz,
+  pb,
+  pf,
+}: {
+  uy?: number;
+  ux?: number;
+  fy?: number;
+  fx?: number;
+  hx?: number;
+  ox?: number;
+  oy?: number;
+  oz?: number;
+  pb?: number;
+  pf?: number;
+} = {}) {
   if (uy !== undefined) ARM_POSE_FP.uy = uy;
   if (ux !== undefined) ARM_POSE_FP.ux = ux;
   if (fy !== undefined) ARM_POSE_FP.fy = fy;
@@ -82,16 +124,36 @@ export function configureFpBody({ uy, ux, fy, fx, hx, ox, oy, oz, pb, pf } = {})
 
 // Only these bones are ever posed (twist helpers excluded = simplified rig).
 const ANIMATED = [
-  "L_Thigh", "R_Thigh", "L_Calf", "R_Calf", "L_Foot", "R_Foot",
-  "Waist", "Spine01", "Spine02",
-  "NeckTwist01", "NeckTwist02", "Head",
-  "L_Upperarm", "R_Upperarm", "L_Forearm", "R_Forearm", "L_Hand", "R_Hand",
+  "L_Thigh",
+  "R_Thigh",
+  "L_Calf",
+  "R_Calf",
+  "L_Foot",
+  "R_Foot",
+  "Waist",
+  "Spine01",
+  "Spine02",
+  "NeckTwist01",
+  "NeckTwist02",
+  "Head",
+  "L_Upperarm",
+  "R_Upperarm",
+  "L_Forearm",
+  "R_Forearm",
+  "L_Hand",
+  "R_Hand",
 ];
 
 // Parent chain of the head (rig-side), used to solve the head's local
 // quaternion from a desired WORLD orientation without touching matrices.
 const HEAD_CHAIN = [
-  "Root", "Hip", "Waist", "Spine01", "Spine02", "NeckTwist01", "NeckTwist02",
+  "Root",
+  "Hip",
+  "Waist",
+  "Spine01",
+  "Spine02",
+  "NeckTwist01",
+  "NeckTwist02",
 ];
 
 const _v1 = new THREE.Vector3();
@@ -102,20 +164,60 @@ const _q2 = new THREE.Quaternion();
 const _q3 = new THREE.Quaternion();
 const _qa = new THREE.Quaternion();
 
+// Per-bone prep data: rest pose + template-space axes in the bone's local frame.
+interface BoneAxes {
+  rest: THREE.Quaternion;
+  aX: THREE.Vector3;
+  aY: THREE.Vector3;
+  aZ: THREE.Vector3;
+}
+type AxisName = "aX" | "aY" | "aZ";
+
+// Shared template prep (see prepareDiverTemplate).
+export interface DiverTemplate {
+  scene: THREE.Group;
+  data: Map<string, BoneAxes>;
+  headFix: THREE.Quaternion;
+  headRest: THREE.Vector3;
+  fpGeometry: { hands: THREE.BufferGeometry };
+}
+
+// One rig instance (see createDiverRig).
+export interface DiverRig {
+  root: THREE.Group;
+  model: THREE.Object3D;
+  bones: Map<string, THREE.Object3D>;
+  data: Map<string, BoneAxes>;
+  headFix: THREE.Quaternion;
+  anchor: THREE.Vector3;
+  firstPerson: boolean;
+  armPose: ArmPose;
+  head: THREE.Object3D | null;
+  chain: THREE.Object3D[];
+  cycle: number;
+  speedSm: number;
+  leanAdj: number;
+  roll: number;
+  strafeSm: number;
+  headPos: THREE.Vector3;
+  headQuat: THREE.Quaternion;
+  lookQuat: THREE.Quaternion;
+}
+
 // One-time prep on the freshly loaded GLTF. Everything computed here is
 // shared by ALL rig instances (local body + every remote diver): per-bone
 // rest quaternions and template-space axes mapped into bone-local frames.
-export function prepareDiverTemplate(gltf) {
+export function prepareDiverTemplate(gltf: GLTF): DiverTemplate {
   const scene = gltf.scene;
   scene.traverse((obj) => {
-    if (obj.isMesh) {
+    if ((obj as THREE.Mesh).isMesh) {
       obj.castShadow = true;
       obj.frustumCulled = false; // skinned verts move; bounds don't
     }
   });
   scene.updateMatrixWorld(true);
 
-  const data = new Map();
+  const data = new Map<string, BoneAxes>();
   const q = new THREE.Quaternion();
   const inv = new THREE.Quaternion();
   for (const name of ANIMATED) {
@@ -134,7 +236,8 @@ export function prepareDiverTemplate(gltf) {
   // headFix: desiredHeadWorld = qLook * headFix. rotY(π) is "a camera
   // looking at +Z" (the template's facing); the offset from it to the head's
   // rest world orientation makes the sync exact, not just approximate.
-  const head = scene.getObjectByName("Head");
+  // (the rig is known to have a Head bone — assume it, as the code always has)
+  const head = scene.getObjectByName("Head")!;
   const headFix = head.getWorldQuaternion(new THREE.Quaternion());
   headFix.premultiply(
     q.setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI).invert(),
@@ -155,27 +258,28 @@ export function prepareDiverTemplate(gltf) {
 // cheap way to do it: one draw call on a reduced index buffer, so the GPU
 // only skins/shades the verts that are actually visible. Built once, shared
 // by FP rigs.
-function buildFpGeometry(scene) {
-  let mesh;
+function buildFpGeometry(scene: THREE.Object3D) {
+  let mesh: THREE.SkinnedMesh | undefined;
   scene.traverse((o) => {
-    if (o.isSkinnedMesh) mesh ??= o;
+    if ((o as THREE.SkinnedMesh).isSkinnedMesh) mesh ??= o as THREE.SkinnedMesh;
   });
-  const geo = mesh.geometry;
+  // (a skinned mesh is always present — assume it, as the code always has)
+  const geo = mesh!.geometry;
   const sj = geo.attributes.skinIndex;
   const sw = geo.attributes.skinWeight;
-  const handSet = new Set();
-  mesh.skeleton.bones.forEach((b, i) => {
+  const handSet = new Set<number>();
+  mesh!.skeleton.bones.forEach((b, i) => {
     if (/Hand|Forearm/.test(b.name)) handSet.add(i);
   });
-  const handW = (i) => {
+  const handW = (i: number) => {
     let w = 0;
     for (let k = 0; k < 4; k++) {
       if (handSet.has(sj.getComponent(i, k))) w += sw.getComponent(i, k);
     }
     return w;
   };
-  const index = geo.index.array;
-  const keep = [];
+  const index = geo.index!.array;
+  const keep: number[] = [];
   for (let t = 0; t < index.length; t += 3) {
     const a = index[t];
     const b = index[t + 1];
@@ -194,8 +298,8 @@ function buildFpGeometry(scene) {
 // the hollow arm. Cap every boundary loop with a triangle fan so the cuts
 // read as solid shoulder/hip mass instead of glowing rings into an empty
 // sleeve. (Winding doesn't matter: the FP material is double-sided.)
-function capOpenLoops(index) {
-  const edges = new Map(); // "lo_hi" -> count
+function capOpenLoops(index: number[]) {
+  const edges = new Map<string, number>(); // "lo_hi" -> count
   for (let t = 0; t < index.length; t += 3) {
     for (let e = 0; e < 3; e++) {
       const a = index[t + e];
@@ -204,15 +308,15 @@ function capOpenLoops(index) {
       edges.set(k, (edges.get(k) ?? 0) + 1);
     }
   }
-  const link = new Map(); // boundary vert -> neighbors along the boundary
+  const link = new Map<number, number[]>(); // boundary vert -> neighbors along the boundary
   for (const [k, count] of edges) {
     if (count !== 1) continue;
     const [a, b] = k.split("_").map(Number);
-    (link.get(a) ?? link.set(a, []).get(a)).push(b);
-    (link.get(b) ?? link.set(b, []).get(b)).push(a);
+    (link.get(a) ?? link.set(a, []).get(a)!).push(b);
+    (link.get(b) ?? link.set(b, []).get(b)!).push(a);
   }
   const capped = index.slice();
-  const seen = new Set();
+  const seen = new Set<number>();
   for (const start of link.keys()) {
     if (seen.has(start)) continue;
     const loop = [start];
@@ -238,7 +342,10 @@ function capOpenLoops(index) {
 // caller-owned yaw group + pitch pivot (the same structure remote players
 // already use). firstPerson collapses the neck so the local player's own
 // helmet never clips through the camera, and skips the head-look solve.
-export function createDiverRig(template, { firstPerson = false } = {}) {
+export function createDiverRig(
+  template: DiverTemplate,
+  { firstPerson = false }: { firstPerson?: boolean } = {},
+): DiverRig {
   const model = SkeletonUtils.clone(template.scene);
   const scale = firstPerson ? FP_SCALE : DIVER_SCALE;
   model.scale.setScalar(scale);
@@ -247,21 +354,23 @@ export function createDiverRig(template, { firstPerson = false } = {}) {
   const root = new THREE.Group(); // carries lean/roll + the eye anchor
   root.add(model);
 
-  const bones = new Map();
+  const bones = new Map<string, THREE.Object3D>();
   model.traverse((obj) => {
-    if (obj.isBone) bones.set(obj.name, obj);
+    if ((obj as THREE.Bone).isBone) bones.set(obj.name, obj);
   });
 
   if (firstPerson) {
     // FP renders ONLY the two gloves (see buildFpGeometry) — the invisible
     // arm bones still pose them, so placement is tuned via ARM_POSE_FP and
     // they keep the subtle swim drift.
-    let fpMesh = null;
+    let fpMesh: THREE.SkinnedMesh | null = null;
     model.traverse((o) => {
-      if (o.isSkinnedMesh) fpMesh ??= o;
+      if ((o as THREE.SkinnedMesh).isSkinnedMesh)
+        fpMesh ??= o as THREE.SkinnedMesh;
     });
-    fpMesh.geometry = template.fpGeometry.hands;
-    fpMesh.castShadow = false; // two floating gloves cast a nonsense shadow
+    // (skinned mesh always present — same assumption as buildFpGeometry)
+    fpMesh!.geometry = template.fpGeometry.hands;
+    fpMesh!.castShadow = false; // two floating gloves cast a nonsense shadow
   }
 
   // Head rest position, template space → rig space (rotY(π) flips x/z).
@@ -271,7 +380,7 @@ export function createDiverRig(template, { firstPerson = false } = {}) {
     -template.headRest.z,
   ).multiplyScalar(scale);
 
-  const rig = {
+  const rig: DiverRig = {
     root,
     model,
     bones,
@@ -281,7 +390,9 @@ export function createDiverRig(template, { firstPerson = false } = {}) {
     firstPerson,
     armPose: firstPerson ? ARM_POSE_FP : ARM_POSE_THIRD,
     head: bones.get("Head") ?? null,
-    chain: HEAD_CHAIN.map((n) => bones.get(n)).filter(Boolean),
+    chain: HEAD_CHAIN.map((n) => bones.get(n)).filter(
+      Boolean,
+    ) as THREE.Object3D[],
     // Per-instance smoothed state (all cached, zero per-frame allocation).
     cycle: Math.random() * 10, // desync swim cycles between divers
     speedSm: 0,
@@ -301,14 +412,14 @@ export function createDiverRig(template, { firstPerson = false } = {}) {
 // head onto the rig origin (the anchor is rotated by the same pose, so the
 // head never drifts off the camera/broadcast position however the body
 // swings beneath it). First-person bodies also get the FP_OFFSET cheat.
-function applyRootPose(rig, swayX = 0, swayZ = 0) {
+function applyRootPose(rig: DiverRig, swayX = 0, swayZ = 0) {
   rig.root.rotation.set(-LEAN + rig.leanAdj + swayX, 0, rig.roll + swayZ);
   rig.root.position.copy(rig.anchor).applyEuler(rig.root.rotation).negate();
   if (rig.firstPerson) rig.root.position.add(FP_OFFSET);
 }
 
 // Absolute pose: rest ∘ rotation about a template axis. Never accumulates.
-function pose(rig, name, axis, angle) {
+function pose(rig: DiverRig, name: string, axis: AxisName, angle: number) {
   const b = rig.bones.get(name);
   const d = rig.data.get(name);
   if (!b || !d) return;
@@ -316,7 +427,7 @@ function pose(rig, name, axis, angle) {
 }
 
 // Compose a second axis on top of the pose() set this frame.
-function poseAdd(rig, name, axis, angle) {
+function poseAdd(rig: DiverRig, name: string, axis: AxisName, angle: number) {
   const b = rig.bones.get(name);
   const d = rig.data.get(name);
   if (!b || !d) return;
@@ -330,9 +441,21 @@ function poseAdd(rig, name, axis, angle) {
 //    strafes, so the animation reads correctly swimming in any direction.
 //  - lookYaw/lookPitch aim the head (and thus the helmet torch) exactly.
 export function updateDiverRig(
-  rig,
-  dt,
-  { bodyYaw, bodyPitch, lookYaw, lookPitch, vel },
+  rig: DiverRig,
+  dt: number,
+  {
+    bodyYaw,
+    bodyPitch,
+    lookYaw,
+    lookPitch,
+    vel,
+  }: {
+    bodyYaw: number;
+    bodyPitch: number;
+    lookYaw: number;
+    lookPitch: number;
+    vel: { x: number; y: number; z: number };
+  },
 ) {
   // --- Movement analysis --------------------------------------------------
   _q1.setFromEuler(_e1.set(bodyPitch, bodyYaw, 0, "YXZ")); // body world quat
@@ -348,15 +471,14 @@ export function updateDiverRig(
   if (speed > 0.25) {
     _v2.copy(_v1).applyQuaternion(_q2.copy(_q1).invert()); // body-local dir
     const strafe = _v2.x / speed;
-    const travelPitch = Math.asin(
-      Math.max(-1, Math.min(1, _v1.y / speed)),
-    );
+    const travelPitch = Math.asin(Math.max(-1, Math.min(1, _v1.y / speed)));
     const w = Math.min(1, speed / 3);
     // Nose toward the actual travel direction (residual vs body pitch).
     // Heavily damped in first person: big body rotations while swimming
     // up/down would sweep the arm shells across the camera.
     const fp = rig.firstPerson ? 0.3 : 1;
-    leanTarget = Math.max(-0.6, Math.min(0.6, travelPitch - bodyPitch)) * w * fp;
+    leanTarget =
+      Math.max(-0.6, Math.min(0.6, travelPitch - bodyPitch)) * w * fp;
     // Bank into strafes, like the camera does.
     rollTarget = -strafe * 0.35 * w * fp;
     strafeTarget = strafe * w;
@@ -425,9 +547,19 @@ export function updateDiverRig(
   poseAdd(rig, "L_Upperarm", "aX", ap.ux + arm * 0.4 * sw2);
   pose(rig, "R_Upperarm", "aY", ap.uy - arm * 0.7 * sw + sOff);
   poseAdd(rig, "R_Upperarm", "aX", ap.ux + arm * 0.4 * sw2);
-  pose(rig, "L_Forearm", "aY", -ap.fy - arm * 0.6 * Math.max(0, sw2) + sOff * 0.6);
+  pose(
+    rig,
+    "L_Forearm",
+    "aY",
+    -ap.fy - arm * 0.6 * Math.max(0, sw2) + sOff * 0.6,
+  );
   poseAdd(rig, "L_Forearm", "aX", ap.fx);
-  pose(rig, "R_Forearm", "aY", ap.fy + arm * 0.6 * Math.max(0, sw2) + sOff * 0.6);
+  pose(
+    rig,
+    "R_Forearm",
+    "aY",
+    ap.fy + arm * 0.6 * Math.max(0, sw2) + sOff * 0.6,
+  );
   poseAdd(rig, "R_Forearm", "aX", ap.fx);
   const handWiggle = rig.firstPerson ? 0.04 : 0.16;
   pose(rig, "L_Hand", "aX", ap.hx + handWiggle * sw);

@@ -1,4 +1,9 @@
-// main.js — entry point: wires UI, graphics, network, voice, and input.
+// main.ts — entry point and orchestrator: wires UI, graphics, network, voice,
+// input, and drives the frame. Simulation slices live in src/systems/* (one
+// updateSystems() call per frame, deterministic order); session-mutable state
+// lives in state.ts; this file owns only what remains: the menu/HUD DOM, the
+// world build, movement + physics, and the world-level network events
+// (dig/tp/seed) that mutate the map itself.
 import {
   initGraphics,
   addPlayer,
@@ -13,16 +18,15 @@ import {
   rebuildWorld,
   emitBreath,
   burstAt,
-} from "./graphics.js";
+} from "./render/graphics.ts";
 import {
   initAbyssAudio,
   updateAbyssAudio,
   setExhaleListener,
   playDig,
-  playBite,
   playClick,
   playWhoosh,
-} from "./audio.js";
+} from "./audio/ambience.ts";
 import {
   resolveCollision,
   findOpenSpot,
@@ -30,25 +34,27 @@ import {
   digAt,
   raycastSolid,
   WORLD_R,
-} from "./gouda.js";
+} from "./world/gouda.ts";
 import {
   hostGame,
   joinGame,
+  onPeerConnected,
+  onPeerDisconnected,
+  isConnected,
+  getPeer,
+  getHostId,
+  getPeerIds,
+  getWorstRtt,
+  getSignalingMode,
+  type SignalingMode,
+} from "./net/mesh.ts";
+import {
   broadcastState,
   sendEvent,
   sendEventTo,
   onStateReceived,
   onEventReceived,
-  onPeerConnected,
-  onPeerDisconnected,
-  isConnected,
-  getPeer,
-  getMyId,
-  getHostId,
-  getPeerIds,
-  getWorstRtt,
-  getSignalingMode,
-} from "./network.js";
+} from "./net/sync.ts";
 import {
   initInput,
   initMouseLook,
@@ -60,18 +66,10 @@ import {
   getSwimPitch,
   getYawVelocity,
   isSprinting,
-} from "./input.js";
-import { SnapshotBuffer } from "./interpolation.js";
-import { getShotConfig, applyShot } from "./shots.js";
-import { setLook } from "./input.js";
-import {
-  spawnCatfish,
-  despawnCatfish,
-  updateCatfishSystem,
-  getCatfishState,
-  applyCatfishState,
-  setCatfishAuthority,
-} from "./catfish.js";
+} from "./input/input.ts";
+import { SnapshotBuffer } from "./net/interpolation.ts";
+import { getShotConfig, applyShot } from "./bench/shots.ts";
+import { setLook } from "./input/input.ts";
 import {
   initVoice,
   callPeer,
@@ -80,25 +78,33 @@ import {
   setListenerPose,
   setVoicePosition,
   toggleMute,
-} from "./voice.js";
+} from "./audio/voice.ts";
 import {
   STATUS,
   getLocalStatus,
   setLocalStatus,
-  updateEffects,
   onLocalStatusChange,
   setPeerStatus,
   getPeerStatus,
   clearPeerStatus,
   statusIcons,
-} from "./effects.js";
+} from "./game/effects.ts";
+import { initOxygen, refillOxygen, isDead } from "./game/oxygen.ts";
+import { setBellCount, collideBathyscaphe } from "./world/bathyscaphe.ts";
+import { game, placeAtSpawn, resetGameState, type Vec3 } from "./state.ts";
+import type { PlayerStateOut } from "./net/protocol.ts";
 import {
-  initOxygen,
-  updateOxygen,
-  refillOxygen,
-  isDead,
-} from "./oxygen.js";
-import { setBellCount, collideBathyscaphe } from "./bathyscaphe.js";
+  registerSystem,
+  updateSystems,
+  dispatchSystemEvent,
+  notifySystemsPeerDisconnected,
+  resetSystems,
+} from "./systems/registry.ts";
+import { createEffectsSystem } from "./systems/effectsSystem.ts";
+import { createOxygenSystem } from "./systems/oxygenSystem.ts";
+import { createCatfishSystem } from "./systems/catfishSystem.ts";
+import { createItemsSystem } from "./systems/itemsSystem.ts";
+import { sendItemSnapshotTo } from "./game/items.ts";
 
 const MAX_SPEED = 10.0; // units per second — brisk fins
 const SPRINT_MULT = 1.9; // hold Shift: burst of speed (descend is on C)
@@ -117,50 +123,73 @@ const DIG_COOLDOWN_MS = 400;
 
 const REMOTE_COLOR = 0x66ff99;
 
-const RECHARGE_RADIUS = 16; // O₂ refill bubble around the spawn point
 const DEATH_RESPAWN_MS = 2600; // blackout duration before waking at spawn
 
 // --- UI elements ---
-const menu = document.getElementById("menu");
-const hostBtn = document.getElementById("host-btn");
-const joinBtn = document.getElementById("join-btn");
-const statusPanel = document.getElementById("status");
-const statusText = document.getElementById("status-text");
-const peerIdText = document.getElementById("peer-id");
-const copyLinkBtn = document.getElementById("copy-link-btn");
-const miniCopyLinkBtn = document.getElementById("mini-copy-link-btn");
-const hud = document.getElementById("hud");
-const compassCanvas = document.getElementById("compass");
-const depthText = document.getElementById("depth");
-const voiceText = document.getElementById("voice-indicator");
-const scatterBtn = document.getElementById("scatter-btn");
-const eventCenter = document.getElementById("event-center");
-const o2Fill = document.getElementById("o2-fill");
-const o2Bar = document.getElementById("o2-bar");
-const pingText = document.getElementById("ping");
-const peerStatusText = document.getElementById("peer-status");
-const deathOverlay = document.getElementById("death-overlay");
+// The HUD markup is static (index.html) — a missing id is a programming
+// error, so fail fast at boot instead of null-checking every access.
+function el<T extends HTMLElement = HTMLElement>(id: string): T {
+  const node = document.getElementById(id);
+  if (!node) throw new Error(`missing #${id} in index.html`);
+  return node as T;
+}
+const menu = el("menu");
+const hostBtn = el("host-btn");
+const joinBtn = el("join-btn");
+const statusPanel = el("status");
+const statusText = el("status-text");
+const peerIdText = el("peer-id");
+const copyLinkBtn = el("copy-link-btn");
+const miniCopyLinkBtn = el("mini-copy-link-btn");
+const hud = el("hud");
+const compassCanvas = el<HTMLCanvasElement>("compass");
+const depthText = el("depth");
+const voiceText = el("voice-indicator");
+const scatterBtn = el("scatter-btn");
+const eventCenter = el("event-center");
+const o2Fill = el("o2-fill");
+const o2Bar = el("o2-bar");
+const pingText = el("ping");
+const peerStatusText = el("peer-status");
+const deathOverlay = el("death-overlay");
 
-const localPosition = { x: 0, y: 5, z: WORLD_R + 30 };
-const velocity = { x: 0, y: 0, z: 0 };
-const spawnPoint = { x: 0, y: 5, z: WORLD_R + 30 }; // bathyscaphe berth
-let networkTimer = 0;
-let fishNetTimer = 0; // authority → puppets fish-state broadcast throttle
-let hudTimer = 0; // slow HUD refresh (ping, peer statuses)
-const remotePositions = []; // rebuilt each frame — fish hunt the nearest diver
-let flashlightOn = true;
-let worldReady = false;
-let cameraRoll = 0; // eased bank angle while turning
-let fishAuthority = true; // solo & host simulate; becomes false on join
-let fishAuthorityId = null; // who currently simulates the fish (election)
-let respawnTimer = null;
+// Network events arrive as loose GameEvent records — each handled kind
+// trusts its payload shape exactly as the JS did (same-version peers).
+interface TpEvent {
+  x: number;
+  y?: number;
+  z: number;
+}
+interface DigEvent {
+  x: number;
+  y: number;
+  z: number;
+  r?: number;
+}
+interface SeedEvent {
+  seed: number;
+  d?: number;
+}
 
-const remoteBuffers = new Map(); // peerId -> SnapshotBuffer
+// PeerJS errors carry .type; DOM/JS errors carry .message — show whichever.
+function errMsg(err: unknown): string {
+  const e = err as { message?: string; type?: string } | null;
+  return e?.message ?? e?.type ?? String(err);
+}
+
+let respawnTimer: ReturnType<typeof setTimeout> | undefined;
 
 // --- Setup ---
-const canvas = initGraphics(document.getElementById("scene-container"));
+const canvas = initGraphics(el("scene-container"));
 initInput();
 initMouseLook(canvas);
+
+// Simulation systems, in explicit execution order (see systems/types.ts):
+// the loop runs them in ONE slot — after input smoothing, before physics.
+registerSystem(createEffectsSystem()); // 10 — expire timed statuses
+registerSystem(createOxygenSystem({ o2Fill, o2Bar })); // 20 — drain + HUD
+const catfishSys = registerSystem(createCatfishSystem({ showEvent })); // 30
+registerSystem(createItemsSystem()); // 40 — dynamic map objects
 
 // Procedural abyss soundscape — must boot inside a user gesture, so hook
 // every plausible first interaction (idempotent).
@@ -174,65 +203,48 @@ setExhaleListener(() => emitBreath(4 + ((Math.random() * 3) | 0)));
 // Every game gets its own seed: from the URL if present (invite links carry
 // it), otherwise random. The host's seed wins — joiners rebuild on mismatch.
 const bootParams = new URLSearchParams(location.search);
-let seed = Number.parseInt(bootParams.get("seed") ?? "", 10);
-if (!Number.isFinite(seed)) seed = (Math.random() * 2 ** 31) | 0;
-let difficulty = Math.min(
-  3,
-  Math.max(1, Number.parseInt(bootParams.get("d") ?? "1", 10) || 1),
-);
+{
+  let seed = Number.parseInt(bootParams.get("seed") ?? "", 10);
+  if (!Number.isFinite(seed)) seed = (Math.random() * 2 ** 31) | 0;
+  game.seed = seed;
+  game.difficulty = Math.min(
+    3,
+    Math.max(1, Number.parseInt(bootParams.get("d") ?? "1", 10) || 1),
+  );
+}
 
-const loaderEl = document.getElementById("loader");
-const loaderFill = document.getElementById("loader-fill");
-const loaderLabel = document.getElementById("loader-label");
+const loaderEl = el("loader");
+const loaderFill = el("loader-fill");
+const loaderLabel = el("loader-label");
 
 async function buildWorld(rebuild = false) {
-  worldReady = false;
+  // Fresh-world slate: motion, interpolation history (state.ts) + every
+  // system's own residue — statuses, oxygen, the old school, items.
+  resetGameState();
+  resetSystems();
   loaderEl.classList.remove("done");
-  const progress = (done, total, label) => {
+  const progress = (done: number, total: number, label: string) => {
     loaderFill.style.width = `${Math.round((done / total) * 100)}%`;
-    loaderLabel.textContent = `seed ${seed} · carving ${label} · ${done}/${total}`;
+    loaderLabel.textContent = `seed ${game.seed} · carving ${label} · ${done}/${total}`;
   };
   const build = rebuild ? rebuildWorld : loadWorld;
-  await build(progress, { seed, difficulty });
+  await build(progress, { seed: game.seed, difficulty: game.difficulty });
   // Spawn at the drift's edge, the whole glowing system in view (-Z).
-  // This is also the O₂ recharge zone — the future bathyscaphe berth.
-  const spawn = getSpawnPoint();
-  spawnPoint.x = spawn.x;
-  spawnPoint.y = spawn.y;
-  spawnPoint.z = spawn.z;
-  localPosition.x = spawn.x;
-  localPosition.y = spawn.y;
-  localPosition.z = spawn.z;
-  velocity.x = velocity.y = velocity.z = 0;
+  // This is also the O₂ recharge zone — the bathyscaphe berth.
+  placeAtSpawn(getSpawnPoint());
   refillOxygen();
-  for (const buffer of remoteBuffers.values()) buffer.reset();
-  worldReady = true;
+  game.worldReady = true;
   loaderEl.classList.add("done");
 
-  // Release the lantern-catfish — packs cruising the open water (plus a few
-  // in the labyrinth). Host-simulated and broadcast to joiners; solo players
-  // simulate their own.
-  despawnCatfish();
-  spawnCatfish(Math.min(8, 4 + difficulty), {
-    onBite: (fishPos) => {
-      // Shove the diver away from the snapping jaws.
-      const dx = localPosition.x - fishPos.x;
-      const dy = localPosition.y - fishPos.y;
-      const dz = localPosition.z - fishPos.z;
-      const d = Math.hypot(dx, dy, dz) || 1;
-      velocity.x += (dx / d) * 9;
-      velocity.y += (dy / d) * 9;
-      velocity.z += (dz / d) * 9;
-      playBite();
-      showEvent("🐟 A lantern-catfish snaps at you! Swim!");
-    },
-  });
+  // Release the lantern-catfish (host/solo simulate; joiners get puppets
+  // rebuilt from the authority's first fish-state broadcast).
+  catfishSys.spawn(game.difficulty);
 }
 // Headless screenshot mode (?shot=<name>, see shots.js + tools/runner.mjs):
 // once the world is up, skip the menu and pin the player to the vantage point.
 const shotConfig = getShotConfig();
 buildWorld().then(() => {
-  if (shotConfig) applyShot(shotConfig, teleportLocal, localPosition);
+  if (shotConfig) applyShot(shotConfig, teleportLocal, game.localPosition);
 });
 
 // --- UI handlers ---
@@ -240,10 +252,11 @@ hostBtn.addEventListener("click", async () => {
   showStatus("Creating game…");
   try {
     const id = await hostGame();
-    hostedId = id;
-    fishAuthority = true;
-    fishAuthorityId = id;
-    initVoice(getPeer());
+    game.hostedId = id;
+    game.fishAuthority = true;
+    game.fishAuthorityId = id;
+    const peer = getPeer();
+    if (peer) initVoice(peer); // non-null right after hostGame() resolves
     showStatus("Invite a diver:");
     peerIdText.textContent = id;
     peerIdText.classList.remove("hidden");
@@ -251,15 +264,14 @@ hostBtn.addEventListener("click", async () => {
     menu.classList.add("hidden");
     hud.classList.remove("hidden");
   } catch (err) {
-    showStatus(`Hosting failed: ${err.message ?? err.type ?? err}`);
+    showStatus(`Hosting failed: ${errMsg(err)}`);
   }
 });
 
 // Invite link: open it in another window/device to auto-join this game.
 // Includes the signaling mode so the joiner uses the SAME server as the host.
-let hostedId = null;
 function inviteUrl() {
-  return `${location.origin}${location.pathname}?join=${encodeURIComponent(hostedId)}&s=${getSignalingMode()}&seed=${seed}&d=${difficulty}`;
+  return `${location.origin}${location.pathname}?join=${encodeURIComponent(game.hostedId ?? "")}&s=${getSignalingMode()}&seed=${game.seed}&d=${game.difficulty}`;
 }
 
 copyLinkBtn.addEventListener("click", async () => {
@@ -286,20 +298,20 @@ miniCopyLinkBtn.addEventListener("click", async () => {
   setTimeout(() => (miniCopyLinkBtn.textContent = "📋"), 1500);
 });
 
-async function join(hostId, mode = null) {
+async function join(hostId: string, mode: SignalingMode | null = null) {
   showStatus("Connecting…");
   try {
     initVoiceEarly(); // install the call-answer handler before anyone dials us
     const remoteId = await joinGame(hostId.trim(), mode);
     // The host simulates the fish; we run puppets (until an election says
-    // otherwise). Voice calls are placed per-peer by onPeerConnected.
-    fishAuthority = false;
-    fishAuthorityId = remoteId;
-    setCatfishAuthority(false);
+    // otherwise — catfishSystem mirrors this flag into catfish.js). Voice
+    // calls are placed per-peer by onPeerConnected.
+    game.fishAuthority = false;
+    game.fishAuthorityId = remoteId;
     menu.classList.add("hidden");
     hud.classList.remove("hidden");
   } catch (err) {
-    showStatus(`Connection failed: ${err.message ?? err.type ?? err}`);
+    showStatus(`Connection failed: ${errMsg(err)}`);
     menu.classList.remove("hidden");
   }
 }
@@ -338,10 +350,12 @@ scatterBtn.addEventListener("click", scatter);
 // Action keys (physical positions — layout-agnostic).
 window.addEventListener("keydown", (e) => {
   if (e.code === "KeyF") {
-    flashlightOn = toggleFlashlight();
+    game.flashlightOn = toggleFlashlight();
     playClick();
     showEvent(
-      flashlightOn ? "🔦 Flashlight ON" : "🔦 Flashlight OFF — pitch black…",
+      game.flashlightOn
+        ? "🔦 Flashlight ON"
+        : "🔦 Flashlight OFF — pitch black…",
     );
     // Sync immediately so the other divers see your light die right away.
     broadcastNow();
@@ -359,7 +373,7 @@ window.addEventListener("keydown", (e) => {
 // re-runs marching cubes on just that chunk — collision follows exactly.
 let lastDigAt = 0;
 function tryDig() {
-  if (!worldReady || isDead()) return;
+  if (!game.worldReady || isDead()) return;
   const now = performance.now();
   if (now - lastDigAt < DIG_COOLDOWN_MS) return;
 
@@ -371,7 +385,7 @@ function tryDig() {
     y: Math.sin(pitch),
     z: -Math.cos(yaw) * cosP,
   };
-  const hit = raycastSolid(localPosition, dir, DIG_RANGE);
+  const hit = raycastSolid(game.localPosition, dir, DIG_RANGE);
   if (!hit) {
     showEvent("⛏ Nothing within reach");
     return;
@@ -407,13 +421,13 @@ function scatter() {
   );
 }
 
-function teleportLocal(x, y, z) {
-  localPosition.x = x;
-  localPosition.y = y;
-  localPosition.z = z;
-  velocity.x = velocity.y = velocity.z = 0;
+function teleportLocal(x: number, y: number, z: number) {
+  game.localPosition.x = x;
+  game.localPosition.y = y;
+  game.localPosition.z = z;
+  game.velocity.x = game.velocity.y = game.velocity.z = 0;
   // Forget remote history so interpolation doesn't sweep across the map.
-  for (const buffer of remoteBuffers.values()) buffer.reset();
+  for (const buffer of game.remoteBuffers.values()) buffer.reset();
   broadcastNow();
 }
 
@@ -422,7 +436,7 @@ function teleportLocal(x, y, z) {
 // instead of waiting for the next 30 Hz tick.
 // One reused state object: broadcastState() encodes it synchronously, and
 // this runs 30×/s — no need to allocate a fresh literal every tick.
-const netState = {
+const netState: PlayerStateOut = {
   x: 0,
   y: 0,
   z: 0,
@@ -434,14 +448,14 @@ const netState = {
   status: 0,
 };
 function fillNetState() {
-  netState.x = localPosition.x;
-  netState.y = localPosition.y;
-  netState.z = localPosition.z;
+  netState.x = game.localPosition.x;
+  netState.y = game.localPosition.y;
+  netState.z = game.localPosition.z;
   netState.yaw = getYaw();
   netState.pitch = getPitch();
   netState.sy = getSwimYaw();
   netState.sp = getSwimPitch();
-  netState.light = flashlightOn;
+  netState.light = game.flashlightOn;
   netState.status = getLocalStatus();
   return netState;
 }
@@ -457,37 +471,36 @@ onLocalStatusChange(() => broadcastNow());
 // Mesh: `initiator` is true when WE dialed this peer (we joined after them),
 // in which case we also place the voice call — the other side just answers.
 // Result: every pair gets exactly one data link and one voice call.
-onPeerConnected((peerId, { initiator } = {}) => {
+onPeerConnected((peerId, { initiator }) => {
   addPlayer(peerId, REMOTE_COLOR);
-  remoteBuffers.set(peerId, new SnapshotBuffer());
+  game.remoteBuffers.set(peerId, new SnapshotBuffer());
   setBellCount(1 + getPeerIds().length); // one berth per diver in the crew
-  if (initiator) callPeer(getPeer(), peerId);
-  // The host's map is the authoritative one: tell the newcomer our seed.
-  if (hostedId) sendEventTo(peerId, { kind: "seed", seed, d: difficulty });
+  if (initiator) {
+    const peer = getPeer(); // non-null: a mesh link just opened through it
+    if (peer) callPeer(peer, peerId);
+  }
+  if (game.hostedId) {
+    // The host's map is the authoritative one: tell the newcomer our seed,
+    // then every live dynamic item (light sticks, drops…).
+    sendEventTo(peerId, { kind: "seed", seed: game.seed, d: game.difficulty });
+    sendItemSnapshotTo(peerId);
+  }
   broadcastNow(); // let them place us immediately
   statusPanel.classList.add("hidden");
   scatterBtn.classList.remove("hidden");
-  if (hostedId) miniCopyLinkBtn.classList.remove("hidden"); // only the host has a link to share
+  if (game.hostedId) miniCopyLinkBtn.classList.remove("hidden"); // only the host has a link to share
 });
 
 onPeerDisconnected((peerId) => {
   removePlayer(peerId);
-  remoteBuffers.delete(peerId);
+  game.remoteBuffers.delete(peerId);
   clearPeerStatus(peerId);
   hangUp(peerId);
   setBellCount(1 + getPeerIds().length);
-  // If the fish simulator left, elect a replacement: lowest peer id among
-  // the survivors. Everyone computes the same result locally — consistent
-  // without any extra messages.
-  if (peerId === (fishAuthorityId ?? getHostId())) {
-    const candidates = [getMyId(), ...getPeerIds()].filter(Boolean).sort();
-    fishAuthorityId = candidates[0] ?? getMyId();
-    fishAuthority = fishAuthorityId === getMyId();
-    if (fishAuthority) setCatfishAuthority(true);
-  }
+  // Systems react on their own terms — catfishSystem runs the fish-authority
+  // election here (deterministic, zero coordination messages).
+  notifySystemsPeerDisconnected(peerId);
   if (getPeerIds().length === 0) {
-    fishAuthority = true;
-    setCatfishAuthority(true);
     scatterBtn.classList.add("hidden");
     miniCopyLinkBtn.classList.add("hidden");
   }
@@ -497,40 +510,43 @@ onPeerDisconnected((peerId) => {
 // Buffer remote state for interpolation — never applied directly.
 // (Flashlight + status are applied instantly: flags don't interpolate.)
 onStateReceived((peerId, { x, y, z, yaw, pitch, light, sy, sp, status }) => {
-  remoteBuffers.get(peerId)?.push({ x, y, z, yaw, pitch, sy, sp });
+  game.remoteBuffers.get(peerId)?.push({ x, y, z, yaw, pitch, sy, sp });
   setPlayerLight(peerId, light !== false);
   if (status !== undefined) setPeerStatus(peerId, status);
 });
 
 onEventReceived((peerId, data) => {
+  // Systems first (fish states, item replication…) — the registry routes by
+  // declared kind. What remains is world/orchestrator business.
+  if (dispatchSystemEvent(peerId, data.kind, data)) return;
   if (data.kind === "tp") {
-    teleportLocal(data.x, data.y ?? 5, data.z);
+    const d = data as unknown as TpEvent;
+    teleportLocal(d.x, d.y ?? 5, d.z);
     playWhoosh();
     showEvent(
       "⨨ Scattered! Find your teammates — look for their lights, listen for their voices.",
     );
   } else if (data.kind === "dig") {
     // Teammate dug somewhere: apply the same carve locally.
-    digAt(data.x, data.y, data.z, data.r ?? DIG_RADIUS);
-    burstAt(data.x, data.y, data.z);
+    const d = data as unknown as DigEvent;
+    digAt(d.x, d.y, d.z, d.r ?? DIG_RADIUS);
+    burstAt(d.x, d.y, d.z);
     // Audible only if they're digging nearby — muffled thumps through cheese.
     const dd = Math.hypot(
-      data.x - localPosition.x,
-      data.y - localPosition.y,
-      data.z - localPosition.z,
+      d.x - game.localPosition.x,
+      d.y - game.localPosition.y,
+      d.z - game.localPosition.z,
     );
     if (dd < 45) playDig();
-  } else if (data.kind === "fish" && !fishAuthority) {
-    // The authority's fish states: run them as interpolated puppets.
-    applyCatfishState(data.f);
   } else if (
     data.kind === "seed" &&
     peerId === getHostId() && // only the host's seed is authoritative
-    data.seed !== seed
+    data.seed !== game.seed
   ) {
     // Joined a host with a different map: adopt their seed and rebuild.
-    seed = data.seed >>> 0;
-    difficulty = data.d ?? difficulty;
+    const d = data as unknown as SeedEvent;
+    game.seed = d.seed >>> 0;
+    game.difficulty = d.d ?? game.difficulty;
     showEvent("🧀 Different map detected — rebuilding to the host's seed…");
     buildWorld(true);
   }
@@ -538,7 +554,7 @@ onEventReceived((peerId, data) => {
 
 // --- Voice status indicator ---
 onVoiceStatus((state) => {
-  const labels = {
+  const labels: Record<string, string> = {
     connecting: "VOICE · connecting…",
     on: "VOICE · proximity on (V to mute)",
     muted: "VOICE · muted (V)",
@@ -550,24 +566,36 @@ onVoiceStatus((state) => {
 });
 
 // --- Game loop ---
+// Frame order is fixed: input smoothing → systems (effects/oxygen/catfish/
+// items, sorted by their `order`) → physics → camera/body → audio → network
+// broadcast → remote interpolation → HUD.
 // Scratch objects for the per-frame math below — the loop must not allocate.
 const ZERO_MOVE = Object.freeze({ x: 0, y: 0, z: 0 });
 const _fwd = { x: 0, y: 0, z: 0 };
 const _right = { x: 0, z: 0 };
 const _target = { x: 0, y: 0, z: 0 };
-const remotePosPool = []; // backing objects for remotePositions, by index
+const remotePosPool: Vec3[] = []; // backing objects for remotePositions, by index
+const frameCtx = { dt: 0, now: 0, game, connected: false };
+let networkTimer = 0;
+let hudTimer = 0; // slow HUD refresh (ping, peer statuses)
+let cameraRoll = 0; // eased bank angle while turning
 renderLoop((delta) => {
-  if (!worldReady) return; // still carving the labyrinth
+  if (!game.worldReady) return; // still carving the labyrinth
+  const pos = game.localPosition;
+  const vel = game.velocity;
 
   // 1. Smooth the camera look toward the mouse target.
   updateLook(delta);
   const yaw = getYaw();
   const pitch = getPitch();
 
-  // 1b. Timed status effects expire here (poison wears off, etc.).
-  updateEffects();
+  // 2. Simulation systems, in their declared order.
+  frameCtx.dt = delta;
+  frameCtx.now = performance.now();
+  frameCtx.connected = isConnected();
+  updateSystems(frameCtx);
 
-  // 2. Desired velocity — along the lazy BODY orientation, not the raw look.
+  // 3. Desired velocity — along the lazy BODY orientation, not the raw look.
   // The body trails the head, so glancing around mid-swim doesn't zigzag
   // your trajectory; hold a direction and the body settles onto it.
   // A blacked-out diver drifts, limp — no propulsion.
@@ -586,104 +614,64 @@ renderLoop((delta) => {
   _target.y = (_fwd.y * move.z + move.y) * speedCap;
   _target.z = (_fwd.z * move.z + _right.z * move.x) * speedCap;
 
-  // 3. Water inertia.
+  // Water inertia.
   const k = 1 - Math.exp(-WATER_INERTIA * delta);
-  velocity.x += (_target.x - velocity.x) * k;
-  velocity.y += (_target.y - velocity.y) * k;
-  velocity.z += (_target.z - velocity.z) * k;
+  vel.x += (_target.x - vel.x) * k;
+  vel.y += (_target.y - vel.y) * k;
+  vel.z += (_target.z - vel.z) * k;
 
   // Move + collide in substeps of at most ~0.5 u: a stall frame (delta
   // clamped at 0.1 s) while sprinting covers 1.9 u — farther than the bell
   // wall is thick — and a single end-of-frame resolve would tunnel straight
   // through it. At normal framerates this stays a single step.
-  const frameDist =
-    Math.hypot(velocity.x, velocity.y, velocity.z) * delta;
+  const frameDist = Math.hypot(vel.x, vel.y, vel.z) * delta;
   const steps = Math.min(4, Math.max(1, Math.ceil(frameDist / 0.5)));
   const stepDelta = delta / steps;
   for (let s = 0; s < steps; s++) {
-    localPosition.x += velocity.x * stepDelta;
-    localPosition.y += velocity.y * stepDelta;
-    localPosition.z += velocity.z * stepDelta;
+    pos.x += vel.x * stepDelta;
+    pos.y += vel.y * stepDelta;
+    pos.z += vel.z * stepDelta;
 
     // Cheese collision: the SDF pushes the diver out of the walls, then the
     // velocity component pointing into the wall is removed so you slide
     // along tunnel walls instead of bouncing.
-    const hit = resolveCollision(localPosition, PLAYER_RADIUS);
+    const hit = resolveCollision(pos, PLAYER_RADIUS);
     // The tin bells are solid too (walls + floor + crown, hatch open).
-    const bellHit = collideBathyscaphe(localPosition, PLAYER_RADIUS);
+    const bellHit = collideBathyscaphe(pos, PLAYER_RADIUS);
     for (const n of [hit, bellHit]) {
       if (!n) continue;
-      const into = velocity.x * n.x + velocity.y * n.y + velocity.z * n.z;
+      const into = vel.x * n.x + vel.y * n.y + vel.z * n.z;
       if (into < 0) {
-        velocity.x -= n.x * into;
-        velocity.y -= n.y * into;
-        velocity.z -= n.z * into;
+        vel.x -= n.x * into;
+        vel.y -= n.y * into;
+        vel.z -= n.z * into;
       }
     }
   }
 
   // Soft leash: past the edge of the field, the current pushes you back.
-  const distFromCenter = Math.hypot(
-    localPosition.x,
-    localPosition.y,
-    localPosition.z,
-  );
+  const distFromCenter = Math.hypot(pos.x, pos.y, pos.z);
   if (distFromCenter > WORLD_LIMIT) {
     const pull = (distFromCenter - WORLD_LIMIT) * 0.8 * delta;
-    localPosition.x -= (localPosition.x / distFromCenter) * pull;
-    localPosition.y -= (localPosition.y / distFromCenter) * pull;
-    localPosition.z -= (localPosition.z / distFromCenter) * pull;
+    pos.x -= (pos.x / distFromCenter) * pull;
+    pos.y -= (pos.y / distFromCenter) * pull;
+    pos.z -= (pos.z / distFromCenter) * pull;
   }
 
   // 4. First-person camera (speed drives the flashlight bob) with a subtle
   // bank into turns — reads as swimming, not as a tripod spinning.
-  const speed = Math.hypot(velocity.x, velocity.y, velocity.z) / MAX_SPEED;
+  const speed = Math.hypot(vel.x, vel.y, vel.z) / MAX_SPEED;
   const rollTarget = Math.max(-0.09, Math.min(0.09, -getYawVelocity() * 0.03));
   cameraRoll += (rollTarget - cameraRoll) * Math.min(1, delta * 5);
-  updateCamera(localPosition, yaw, pitch, Math.min(speed, 1), cameraRoll);
+  updateCamera(pos, yaw, pitch, Math.min(speed, 1), cameraRoll);
 
   // 4b. First-person body: trails the lazy swim orientation while the head
   // (camera) looks around freely — arms come into view when you look down.
-  updateLocalPlayer(localPosition, yaw, pitch, swimYaw, swimPitch, velocity);
-
-  // 4c. Lantern-catfish: host/solo simulates (hunting the nearest diver),
-  // joiners interpolate the host's puppets.
-  updateCatfishSystem(
-    delta,
-    localPosition,
-    performance.now() / 1000,
-    remotePositions,
-  );
-  if (fishAuthority && isConnected()) {
-    fishNetTimer += delta;
-    if (fishNetTimer >= 0.12) {
-      fishNetTimer = 0;
-      sendEvent({ kind: "fish", f: getCatfishState() });
-    }
-  }
-
-  // 4d. Oxygen: drains while diving (faster when sprinting or in distress),
-  // refills near the spawn point — the future bathyscaphe berth.
-  const distToSpawn = Math.hypot(
-    localPosition.x - spawnPoint.x,
-    localPosition.y - spawnPoint.y,
-    localPosition.z - spawnPoint.z,
-  );
-  const o2Frac = updateOxygen(delta, {
-    sprinting: isSprinting(),
-    status: getLocalStatus(),
-    inRefillZone: distToSpawn < RECHARGE_RADIUS,
-  });
-  o2Fill.style.width = `${Math.round(o2Frac * 100)}%`;
-  o2Bar.classList.toggle("low", o2Frac < 0.25 && !isDead());
-  o2Bar.classList.toggle(
-    "refilling",
-    distToSpawn < RECHARGE_RADIUS && o2Frac < 1,
-  );
+  updateLocalPlayer(pos, yaw, pitch, swimYaw, swimPitch, vel);
 
   // 5. Spatial audio listener follows the camera; the procedural abyss
   // soundscape follows depth, speed, and effort.
-  setListenerPose(localPosition, yaw, pitch);
+  setListenerPose(pos, yaw, pitch);
   updateAbyssAudio(delta, {
     speed: Math.min(1, speed),
     radius: distFromCenter,
@@ -691,16 +679,17 @@ renderLoop((delta) => {
   });
 
   // 6. Broadcast local state, throttled — a 24-byte binary packet over the
-  // unreliable channel (see network.js): losses are replaced, never resent.
+  // unreliable channel (see network/): losses are replaced, never resent.
   networkTimer += delta;
-  if (networkTimer >= NETWORK_RATE && isConnected()) {
+  if (networkTimer >= NETWORK_RATE && frameCtx.connected) {
     networkTimer = 0;
     broadcastState(fillNetState());
   }
 
   // 7. Smooth remote players from interpolation buffers + move their voices.
+  const remotePositions = game.remotePositions;
   remotePositions.length = 0;
-  for (const [peerId, buffer] of remoteBuffers) {
+  for (const [peerId, buffer] of game.remoteBuffers) {
     const s = buffer.sample();
     if (s) {
       updatePlayerPosition(peerId, s.x, s.y, s.z, s.yaw, s.pitch, s.sy, s.sp);
@@ -721,7 +710,7 @@ renderLoop((delta) => {
   // 8. HUD. (No gold tracker: the gold is hidden — search, listen for the
   // glow leaking out of tunnel mouths.)
   drawCompass(yaw);
-  depthText.textContent = `▼ ${Math.max(0, Math.round(ABYSS_DEPTH - localPosition.y))} m`;
+  depthText.textContent = `▼ ${Math.max(0, Math.round(ABYSS_DEPTH - pos.y))} m`;
 
   // 8b. Slow HUD refresh: mesh latency + teammate status flags.
   hudTimer += delta;
@@ -756,7 +745,8 @@ initOxygen({
     setLocalStatus(STATUS.CARRYING, false);
     clearTimeout(respawnTimer);
     respawnTimer = setTimeout(() => {
-      teleportLocal(spawnPoint.x, spawnPoint.y, spawnPoint.z);
+      const s = game.spawnPoint;
+      teleportLocal(s.x, s.y, s.z);
       refillOxygen();
       deathOverlay.classList.remove("visible");
       playWhoosh();
@@ -768,21 +758,22 @@ initOxygen({
 // Dev hook: flip status bits from the console to verify T0.2's AC
 // (e.g. __abyssal.setLocalStatus(__abyssal.STATUS.TRAPPED, true, 5000)).
 if (import.meta.env.DEV) {
-  window.__abyssal = {
+  (window as unknown as { __abyssal?: unknown }).__abyssal = {
     setLocalStatus,
     STATUS,
     getPeerStatus,
     getPeerIds,
     setBellCount,
-    getLocalPos: () => ({ ...localPosition }),
+    game,
+    getLocalPos: () => ({ ...game.localPosition }),
     teleport: teleportLocal,
     setLook,
   };
 }
 
 // --- Compass strip (canvas, like a dive HUD) ---
-const compassCtx = compassCanvas.getContext("2d");
-const CARDINALS = {
+const compassCtx = compassCanvas.getContext("2d")!;
+const CARDINALS: Record<number, string> = {
   0: "N",
   45: "NE",
   90: "E",
@@ -793,7 +784,7 @@ const CARDINALS = {
   315: "NW",
 };
 
-function drawCompass(yaw) {
+function drawCompass(yaw: number) {
   const w = compassCanvas.width;
   const h = compassCanvas.height;
   const ctx = compassCtx;
@@ -831,13 +822,13 @@ function drawCompass(yaw) {
   // compass only keeps you oriented.)
 }
 
-function showStatus(text) {
+function showStatus(text: string) {
   statusPanel.classList.remove("hidden");
   statusText.textContent = text;
 }
 
 // Chat-like feed of transient toasts stacked on the side of the screen.
-function showEvent(text, duration = 2200) {
+function showEvent(text: string, duration = 2200) {
   const toast = document.createElement("div");
   toast.className = "event-toast";
   toast.textContent = text;
@@ -849,4 +840,3 @@ function showEvent(text, duration = 2200) {
     setTimeout(() => toast.remove(), 400);
   }, duration);
 }
-

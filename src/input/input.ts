@@ -1,10 +1,13 @@
-// input.js — layout-agnostic swim controls + smoothed pointer-lock mouse look.
+// input.ts — layout-agnostic swim controls + smoothed pointer-lock mouse look.
 //
 // Keys are matched by PHYSICAL position (e.code), so the same keys work as
 // WASD on QWERTY and ZQSD on AZERTY automatically — no layout detection needed.
-const keys = new Set();
+type MoveAction =
+  "forward" | "backward" | "left" | "right" | "up" | "down" | "sprint";
 
-const KEY_MAP = {
+const keys = new Set<MoveAction>();
+
+const KEY_MAP: Record<string, MoveAction> = {
   KeyW: "forward", // Z on AZERTY
   KeyS: "backward",
   KeyA: "left", // Q on AZERTY
@@ -57,7 +60,7 @@ export function initInput() {
   window.addEventListener("blur", () => keys.clear());
 }
 
-export function initMouseLook(canvas) {
+export function initMouseLook(canvas: HTMLCanvasElement) {
   if (mouseLookInstalled) return;
   mouseLookInstalled = true;
   canvas.addEventListener("click", () => canvas.requestPointerLock());
@@ -86,7 +89,7 @@ export function initMouseLook(canvas) {
 // Call once per frame: eases the camera toward the mouse target
 // (frame-rate independent exponential smoothing), then trails the swim
 // body behind the head and measures turn rate for camera banking.
-export function updateLook(delta) {
+export function updateLook(delta: number) {
   const k = 1 - Math.exp(-LOOK_SMOOTHING * delta);
   const prevYaw = yaw;
   yaw += (targetYaw - yaw) * k;
@@ -102,7 +105,7 @@ export function updateLook(delta) {
 
 // Shot harness (shots.js): snap the look — and the lazy swim body — to an
 // exact pose, bypassing the mouse smoothing entirely.
-export function setLook(newYaw, newPitch) {
+export function setLook(newYaw: number, newPitch: number) {
   targetYaw = yaw = swimYaw = newYaw;
   targetPitch = pitch = swimPitch = clamp(newPitch, -PITCH_LIMIT, PITCH_LIMIT);
 }
@@ -134,7 +137,7 @@ export function isSprinting() {
   return keys.has("sprint");
 }
 
-export function isPointerLocked(canvas) {
+export function isPointerLocked(canvas: HTMLCanvasElement) {
   return document.pointerLockElement === canvas;
 }
 
@@ -169,6 +172,6 @@ export function getMovement() {
   return _move;
 }
 
-function clamp(v, min, max) {
+function clamp(v: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, v));
 }

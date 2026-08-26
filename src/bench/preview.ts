@@ -23,24 +23,67 @@
 //   lines()/bars()  — HUD text rows / progress bars (optional)
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import {
+  GLTFLoader,
+  type GLTF,
+} from "three/examples/jsm/loaders/GLTFLoader.js";
 import {
   prepareDiverTemplate,
   createDiverRig,
   updateDiverRig,
   FP_VIEW,
-} from "./diverRig.js";
-import { toonify } from "./toon.js";
-import { createBellVisual } from "./bathyscaphe.js";
+} from "../entities/diverRig.ts";
+import { toonify } from "../render/toon.ts";
+import { createBellVisual } from "../world/bathyscaphe.ts";
 
-const $ = (id) => document.getElementById(id);
+// The instance contract documented above, as a real type: what build() must
+// return for the bench to drive it.
+export interface BenchInstance {
+  group: THREE.Group;
+  update(dt: number, t: number): void;
+  ui?(panel: HTMLElement, api: BenchUiApi): void;
+  focus?: THREE.Vector3;
+  clips?: { mixer: THREE.AnimationMixer; actions: string[] };
+  action?(): void;
+  lines?(): [string, string][];
+  bars?(): [string, number][];
+  camLocked?: boolean; // eye cam: stop the orbit auto-spin fighting the view
+}
+
+// The tiny UI kit handed to ui(panel, api).
+export interface BenchUiApi {
+  button: typeof button;
+  sliderRow: typeof sliderRow;
+  section: typeof section;
+}
+
+// One MODELS registry entry.
+export interface BenchModelDef {
+  id: string;
+  label: string;
+  url: string;
+  cam: BenchCamSpec;
+  build(gltf: GLTF): BenchInstance;
+}
+
+export interface BenchCamSpec {
+  dist: number;
+  height: number;
+  gridY: number;
+}
+
+const $ = (id: string) => document.getElementById(id) as HTMLElement;
 const BASE = import.meta.env.BASE_URL;
 
 // Mirrored game constants (module-private at their source, so re-stated
 // here — keep in sync): catfish.js SCALE / lantern moods, graphics.js
 // TORCH_OFFSET / REMOTE_LAMP_INTENSITY.
 const CATFISH_SCALE = 4;
-const LANTERN_BASE = { lurk: 55, stalk: 18, strike: 120 };
+const LANTERN_BASE: Record<string, number> = {
+  lurk: 55,
+  stalk: 18,
+  strike: 120,
+};
 const TORCH_OFFSET = new THREE.Vector3(0, 0.35, -0.14);
 const TORCH_INTENSITY = 190;
 
@@ -50,7 +93,12 @@ const WATER = 0x04141e;
 scene.background = new THREE.Color(WATER);
 scene.fog = new THREE.FogExp2(WATER, 0.018);
 
-const camera = new THREE.PerspectiveCamera(52, innerWidth / innerHeight, 0.05, 500);
+const camera = new THREE.PerspectiveCamera(
+  52,
+  innerWidth / innerHeight,
+  0.05,
+  500,
+);
 
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
@@ -85,7 +133,11 @@ grid.material.opacity = 0.35;
 scene.add(grid);
 
 // --- Tiny UI kit -----------------------------------------------------------
-function button(parent, label, onClick) {
+function button(
+  parent: HTMLElement,
+  label: string,
+  onClick: (btn: HTMLButtonElement) => void,
+) {
   const btn = document.createElement("button");
   btn.textContent = label;
   btn.addEventListener("click", () => onClick(btn));
@@ -93,12 +145,21 @@ function button(parent, label, onClick) {
   return btn;
 }
 
-function sliderRow(parent, name, min, max, step, value, onInput, fmt = (v) => v.toFixed(2)) {
+function sliderRow(
+  parent: HTMLElement,
+  name: string,
+  min: number,
+  max: number,
+  step: number,
+  value: number,
+  onInput: (v: number) => void,
+  fmt: (v: number) => string = (v) => v.toFixed(2),
+) {
   const row = document.createElement("div");
   row.className = "slider-row";
   row.innerHTML = `<span class="name">${name}</span><input type="range"><span class="val"></span>`;
-  const input = row.querySelector("input");
-  const val = row.querySelector(".val");
+  const input = row.querySelector("input")!;
+  const val = row.querySelector(".val")!;
   Object.assign(input, { min, max, step, value });
   const show = () => (val.textContent = fmt(+input.value));
   input.addEventListener("input", () => {
@@ -109,38 +170,39 @@ function sliderRow(parent, name, min, max, step, value, onInput, fmt = (v) => v.
   parent.appendChild(row);
   return {
     row,
-    set(v) {
-      input.value = v;
+    set(v: number) {
+      input.value = v as unknown as string; // DOM coerces numbers; keep the raw assign
       show();
     },
   };
 }
 
-function section(parent, label) {
+function section(parent: HTMLElement, label: string) {
   const s = document.createElement("div");
   s.className = "section";
   s.innerHTML = `<div class="label">${label}</div><div class="row"></div>`;
   parent.appendChild(s);
-  return s.querySelector(".row");
+  return s.querySelector(".row") as HTMLElement;
 }
 
 const api = { button, sliderRow, section };
 
 // Radio behavior across a set of buttons.
-function markOn(btns, active) {
-  for (const [k, b] of Object.entries(btns)) b.classList.toggle("on", k === active);
+function markOn(btns: Record<string, HTMLButtonElement>, active: string) {
+  for (const [k, b] of Object.entries(btns))
+    b.classList.toggle("on", k === active);
 }
 
 // --- Shared bits -----------------------------------------------------------
-let gltfCache = new Map(); // url → Promise<gltf>
-function loadGltf(url) {
+const gltfCache = new Map<string, Promise<GLTF>>(); // url → Promise<gltf>
+function loadGltf(url: string) {
   if (!gltfCache.has(url)) gltfCache.set(url, new GLTFLoader().loadAsync(url));
-  return gltfCache.get(url);
+  return gltfCache.get(url)!;
 }
 
 // One prepared diver template shared by the third-person and FP entries.
-let diverTemplate = null;
-function diverTemplateFrom(gltf) {
+let diverTemplate: ReturnType<typeof prepareDiverTemplate> | null = null;
+function diverTemplateFrom(gltf: GLTF) {
   if (!diverTemplate) {
     toonify(gltf.scene); // same cel pass as graphics.js
     diverTemplate = prepareDiverTemplate(gltf);
@@ -152,7 +214,7 @@ function diverTemplateFrom(gltf) {
 function glowTexture() {
   const c = document.createElement("canvas");
   c.width = c.height = 64;
-  const ctx = c.getContext("2d");
+  const ctx = c.getContext("2d")!;
   const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
   g.addColorStop(0, "rgba(255,240,200,0.9)");
   g.addColorStop(0.4, "rgba(255,210,140,0.25)");
@@ -163,7 +225,7 @@ function glowTexture() {
 }
 
 // --- Model: rat diver (third person, procedural swim) -----------------------
-function buildDiver(gltf) {
+function buildDiver(gltf: GLTF): BenchInstance {
   const template = diverTemplateFrom(gltf);
 
   const group = new THREE.Group();
@@ -177,7 +239,14 @@ function buildDiver(gltf) {
   // Helmet torch, mounted exactly like graphics.js: the light rig lives at
   // scene level and is pinned to the head's world pose every frame.
   const torch = new THREE.Group();
-  const spot = new THREE.SpotLight(0xffeec9, TORCH_INTENSITY, 50, 0.5, 0.6, 1.7);
+  const spot = new THREE.SpotLight(
+    0xffeec9,
+    TORCH_INTENSITY,
+    50,
+    0.5,
+    0.6,
+    1.7,
+  );
   spot.target.position.set(0, 0, -20);
   torch.add(spot);
   torch.add(spot.target);
@@ -198,8 +267,8 @@ function buildDiver(gltf) {
   const _v = new THREE.Vector3();
   const R = 7; // swim circle radius
 
-  let modeBtns = {};
-  const setMode = (m) => {
+  let modeBtns: Record<string, HTMLButtonElement> = {};
+  const setMode = (m: string) => {
     st.mode = m;
     markOn(modeBtns, m);
   };
@@ -207,7 +276,7 @@ function buildDiver(gltf) {
   return {
     group,
     focus,
-    update(dt, t) {
+    update(dt: number, t: number) {
       let speed;
       if (st.mode === "manual") {
         // Treadmill: body faces -Z at the origin; vel drives effort only.
@@ -238,7 +307,8 @@ function buildDiver(gltf) {
       const vlen = vel.length();
       const swimPitch = vlen > 0.3 ? Math.asin(vel.y / vlen) : 0;
       const align = Math.min(1, vlen / 2.5);
-      st.bodyPitchSm += (swimPitch * align - st.bodyPitchSm) * Math.min(1, dt * 3);
+      st.bodyPitchSm +=
+        (swimPitch * align - st.bodyPitchSm) * Math.min(1, dt * 3);
       swim.rotation.y = st.yaw;
       pivot.rotation.x = st.bodyPitchSm;
 
@@ -260,7 +330,7 @@ function buildDiver(gltf) {
 
       focus.copy(swim.position);
     },
-    ui(panel) {
+    ui(panel: HTMLElement) {
       const modes = section(panel, "Swim");
       modeBtns = {
         idle: button(modes, "idle", () => setMode("idle")),
@@ -278,7 +348,7 @@ function buildDiver(gltf) {
       }).classList.add("on");
 
       // Touching a slider is a request to stop and look → manual mode.
-      const hold = section(panel, "Hold (manual)").parentElement;
+      const hold = section(panel, "Hold (manual)").parentElement!;
       sliderRow(hold, "effort", 0, 10, 0.1, 0, (v) => {
         st.speed = v;
         setMode("manual");
@@ -301,7 +371,13 @@ function buildDiver(gltf) {
     },
     action() {
       // Space cycles the swim gears.
-      setMode(st.mode === "idle" ? "cruise" : st.mode === "cruise" ? "sprint" : "idle");
+      setMode(
+        st.mode === "idle"
+          ? "cruise"
+          : st.mode === "cruise"
+            ? "sprint"
+            : "idle",
+      );
     },
     lines: () => [
       ["mode", st.mode],
@@ -315,7 +391,7 @@ function buildDiver(gltf) {
 // The local player's own body: only the gloves + forearms survive prep
 // (diverRig.js buildFpGeometry). Use "eye cam" to judge their placement at
 // the real in-game FOV.
-function buildGloves(gltf) {
+function buildGloves(gltf: GLTF): BenchInstance {
   const template = diverTemplateFrom(gltf);
 
   const group = new THREE.Group();
@@ -325,10 +401,11 @@ function buildGloves(gltf) {
   // Same material treatment as the game's local body (createLocalBody):
   // double-sided sleeves, suit darkened below world albedo.
   rig.root.traverse((o) => {
-    if (o.isMesh) {
-      o.material = o.material.clone();
-      o.material.side = THREE.DoubleSide;
-      o.material.color?.multiplyScalar(0.58);
+    if ((o as THREE.Mesh).isMesh) {
+      const m = o as THREE.Mesh & { material: THREE.MeshStandardMaterial };
+      m.material = m.material.clone();
+      m.material.side = THREE.DoubleSide;
+      m.material.color?.multiplyScalar(0.58);
     }
   });
   pivot.add(rig.root);
@@ -337,11 +414,11 @@ function buildGloves(gltf) {
   const vel = new THREE.Vector3();
   const focus = new THREE.Vector3(0, -0.3, -0.6);
 
-  const inst = {
+  const inst: BenchInstance = {
     group,
     focus,
     camLocked: false, // eye cam: stop the orbit auto-spin fighting the view
-    update(dt) {
+    update(dt: number) {
       // Screen-anchored FPS-style: the invisible body pitches with the
       // camera via FP_VIEW — identical math to updateLocalBody.
       const bodyPitch = FP_VIEW.base + st.pitch * FP_VIEW.follow;
@@ -358,7 +435,7 @@ function buildGloves(gltf) {
       if (st.eyeCam) focus.set(0, Math.tan(-st.pitch) * 4, -4);
       else focus.set(0, -0.3, -0.6);
     },
-    ui(panel) {
+    ui(panel: HTMLElement) {
       const cams = section(panel, "Camera");
       button(cams, "eye cam (fov 72)", (b) => {
         st.eyeCam = !st.eyeCam;
@@ -375,7 +452,7 @@ function buildGloves(gltf) {
           frameCamera(ACTIVE_DEF.cam);
         }
       });
-      const hold = section(panel, "Pose").parentElement;
+      const hold = section(panel, "Pose").parentElement!;
       sliderRow(hold, "look pitch", -1.2, 1.2, 0.01, 0, (v) => {
         st.pitch = v;
         if (st.eyeCam) controls.target.set(0, Math.tan(-v) * 4, -4);
@@ -398,10 +475,11 @@ function buildGloves(gltf) {
 // --- Model: lantern-catfish ---------------------------------------------------
 // Baked clips (swim / bite / flicker) exactly as catfish.js plays them, plus
 // the lantern light logic so each mood can be judged with its clip.
-function buildCatfish(gltf) {
+function buildCatfish(gltf: GLTF): BenchInstance {
   const root = gltf.scene;
   root.traverse((o) => {
-    if (o.isMesh || o.isSkinnedMesh) o.frustumCulled = false;
+    if ((o as THREE.Mesh).isMesh || (o as THREE.SkinnedMesh).isSkinnedMesh)
+      o.frustumCulled = false;
   });
   toonify(root, { ink: 0.8 }); // heavy ink — it's the monster
   root.scale.setScalar(CATFISH_SCALE);
@@ -412,7 +490,7 @@ function buildCatfish(gltf) {
   group.add(swim);
 
   // Lantern: bulb bone + light + halo, same lookup as catfish.js spawnOne.
-  let bulb = null;
+  let bulb: THREE.Object3D | null = null;
   root.traverse((o) => {
     const n = (o.name || "").toLowerCase();
     if (n.includes("forehead") && n.includes("017")) bulb = o;
@@ -436,7 +514,7 @@ function buildCatfish(gltf) {
 
   // The three baked clips, wired like catfish.js spawnOne.
   const mixer = new THREE.AnimationMixer(root);
-  const actions = new Map();
+  const actions = new Map<string, THREE.AnimationAction>();
   for (const c of gltf.animations) actions.set(c.name, mixer.clipAction(c));
   const swimAct = actions.get("swim");
   const flicker = actions.get("flicker");
@@ -444,7 +522,13 @@ function buildCatfish(gltf) {
   swimAct?.play();
   flicker?.play();
   if (bite) {
-    bite.setLoop(THREE.LoopOnce);
+    // Typings demand a repetitions arg but LoopOnce ignores it at runtime —
+    // keep the original 1-arg call rather than invent a value.
+    (
+      bite.setLoop as (
+        mode: THREE.AnimationActionLoopStyles,
+      ) => THREE.AnimationAction
+    )(THREE.LoopOnce);
     bite.clampWhenFinished = false;
   }
 
@@ -462,8 +546,8 @@ function buildCatfish(gltf) {
   const R = 14;
   const CRUISE_SPEED = 3.6;
 
-  let moodBtns = {};
-  const setMood = (m) => {
+  let moodBtns: Record<string, HTMLButtonElement> = {};
+  const setMood = (m: string) => {
     st.mood = m;
     markOn(moodBtns, m);
   };
@@ -476,7 +560,7 @@ function buildCatfish(gltf) {
     group,
     focus,
     clips: { mixer, actions: [...actions.keys()] },
-    update(dt, t) {
+    update(dt: number, t: number) {
       if (st.cruise) {
         const yawRate = CRUISE_SPEED / R;
         st.angle += yawRate * dt;
@@ -517,12 +601,13 @@ function buildCatfish(gltf) {
 
       focus.copy(swim.position);
     },
-    ui(panel) {
+    ui(panel: HTMLElement) {
       const clipsRow = section(panel, "Clips");
       for (const [name, act] of actions) {
         if (name === "bite") continue; // one-shot, gets its own trigger
         const b = button(clipsRow, name, () => {
-          act.isRunning() ? act.stop() : act.reset().play();
+          if (act.isRunning()) act.stop();
+          else act.reset().play();
           b.classList.toggle("on", act.isRunning());
         });
         b.classList.toggle("on", act.isRunning());
@@ -546,17 +631,28 @@ function buildCatfish(gltf) {
         st.cruise = !st.cruise;
         b.classList.toggle("on", st.cruise);
       });
-      sliderRow(motion.parentElement, "swim rate", 0.2, 2.5, 0.05, 1, (v) => (st.rate = v), (v) => `${v.toFixed(2)}×`);
+      sliderRow(
+        motion.parentElement!,
+        "swim rate",
+        0.2,
+        2.5,
+        0.05,
+        1,
+        (v) => (st.rate = v),
+        (v) => `${v.toFixed(2)}×`,
+      );
     },
     action: triggerBite, // space = bite
     lines: () => [
-      ["mood", (bite?.isRunning() ? "strike" : st.mood)],
+      ["mood", bite?.isRunning() ? "strike" : st.mood],
       ["lantern", light.intensity.toFixed(0)],
     ],
     bars: () =>
-      [...actions].map(([name, act]) => [
+      [...actions].map(([name, act]): [string, number] => [
         `clip · ${name}`,
-        act.isRunning() ? (act.time % act.getClip().duration) / act.getClip().duration : 0,
+        act.isRunning()
+          ? (act.time % act.getClip().duration) / act.getClip().duration
+          : 0,
       ]),
   };
 }
@@ -567,15 +663,15 @@ function buildCatfish(gltf) {
 // beacon) is the game's real bathyscaphe.js code; the bench just lets you
 // orbit it and toggle the parts. The O₂ recharge zone it marks is main.js
 // logic, not part of the model.
-function buildBell(gltf) {
+function buildBell(gltf: GLTF): BenchInstance {
   const bell = createBellVisual(gltf.scene);
 
   return {
     group: bell.group,
-    update(_dt, t) {
+    update(_dt: number, t: number) {
       bell.update(t);
     },
-    ui(panel) {
+    ui(panel: HTMLElement) {
       const parts = section(panel, "Berth");
       button(parts, "lamp", (b) => {
         bell.setLamp(!bell.isLampOn());
@@ -604,7 +700,7 @@ function buildBell(gltf) {
 
 // --- Registry ----------------------------------------------------------------
 // ⚠ Standing rule: every new game model gets an entry here (see AGENTS.md).
-const MODELS = [
+const MODELS: BenchModelDef[] = [
   {
     id: "diver",
     label: "rat diver",
@@ -636,24 +732,24 @@ const MODELS = [
 ];
 
 // --- Bench state ---------------------------------------------------------------
-let ACTIVE = null; // active instance
+let ACTIVE: BenchInstance | null = null; // active instance
 let ACTIVE_DEF = MODELS[0];
-const instances = new Map(); // id → instance
-const skeletons = new Map(); // id → SkeletonHelper
+const instances = new Map<string, BenchInstance>(); // id → instance
+const skeletons = new Map<string, THREE.SkeletonHelper>(); // id → SkeletonHelper
 let rate = 1;
 let paused = false;
 let spin = true;
 let showBones = false;
 let wire = false;
 
-function frameCamera(cam) {
+function frameCamera(cam: BenchCamSpec) {
   camera.fov = 52;
   camera.updateProjectionMatrix();
   camera.position.set(cam.dist, cam.height + cam.dist * 0.45, cam.dist * 1.25);
   controls.target.set(0, cam.height, 0);
 }
 
-async function activate(def) {
+async function activate(def: BenchModelDef) {
   ACTIVE_DEF = def;
   markOn(modelBtns, def.id);
   if (ACTIVE) scene.remove(ACTIVE.group);
@@ -676,7 +772,7 @@ async function activate(def) {
   // A slow click-race: only mount if we're still the requested model.
   if (ACTIVE_DEF !== def) return;
 
-  const inst = instances.get(def.id);
+  const inst = instances.get(def.id)!;
   ACTIVE = inst;
   scene.add(inst.group);
   $("loading").style.display = "none";
@@ -703,12 +799,14 @@ async function activate(def) {
 
 function applyWire() {
   ACTIVE?.group.traverse((o) => {
-    if (o.isMesh || o.isSkinnedMesh) o.material.wireframe = wire;
+    const m = o as THREE.Mesh & { material: THREE.MeshStandardMaterial };
+    if (m.isMesh || (o as THREE.SkinnedMesh).isSkinnedMesh)
+      m.material.wireframe = wire;
   });
 }
 
 // --- Global UI ---------------------------------------------------------------
-const modelBtns = {};
+const modelBtns: Record<string, HTMLButtonElement> = {};
 for (const def of MODELS) {
   modelBtns[def.id] = button($("models"), def.label, () => activate(def));
 }
@@ -718,10 +816,23 @@ $("btn-pause").addEventListener("click", () => {
   $("btn-pause").classList.toggle("on", paused);
   $("btn-pause").textContent = paused ? "resume" : "pause";
 });
-sliderRow($("global-sliders"), "rate", 0.1, 2, 0.1, 1, (v) => (rate = v), (v) => `${v.toFixed(1)}×`);
+sliderRow(
+  $("global-sliders"),
+  "rate",
+  0.1,
+  2,
+  0.1,
+  1,
+  (v) => (rate = v),
+  (v) => `${v.toFixed(1)}×`,
+);
 
 const toggles = $("toggles");
-const toggle = (label, onClick, initial = false) => {
+const toggle = (
+  label: string,
+  onClick: (on: boolean) => void,
+  initial = false,
+) => {
   const btn = button(toggles, label, (b) => {
     const on = !b.classList.contains("on");
     b.classList.toggle("on", on);
@@ -739,17 +850,22 @@ toggle("wireframe", (on) => {
   applyWire();
 });
 toggle("spin", (on) => (spin = on), true);
-toggle("fog", (on) => {
-  scene.fog = on ? new THREE.FogExp2(WATER, 0.018) : null;
-  scene.background = new THREE.Color(on ? WATER : 0x070d12);
-  // Fog is a compile-time define: every cached material needs a rebuild.
-  scene.traverse((o) => {
-    if (o.material && "fog" in o.material) {
-      o.material.fog = on;
-      o.material.needsUpdate = true;
-    }
-  });
-}, true);
+toggle(
+  "fog",
+  (on) => {
+    scene.fog = on ? new THREE.FogExp2(WATER, 0.018) : null;
+    scene.background = new THREE.Color(on ? WATER : 0x070d12);
+    // Fog is a compile-time define: every cached material needs a rebuild.
+    scene.traverse((o) => {
+      const mat = (o as THREE.Mesh).material as THREE.Material | undefined;
+      if (mat && "fog" in mat) {
+        mat.fog = on;
+        mat.needsUpdate = true;
+      }
+    });
+  },
+  true,
+);
 toggle("grid", (on) => (grid.visible = on), true);
 
 addEventListener("keydown", (e) => {
@@ -767,9 +883,9 @@ addEventListener("resize", () => {
 });
 
 // --- HUD -----------------------------------------------------------------------
-let hudLines = [];
-let hudBars = [];
-function buildHud(inst) {
+let hudLines: HTMLElement[] = [];
+let hudBars: HTMLElement[] = [];
+function buildHud(inst: BenchInstance) {
   const body = $("hud-body");
   body.innerHTML = "";
   hudLines = [];
@@ -779,8 +895,13 @@ function buildHud(inst) {
   let bones = 0;
   let tris = 0;
   inst.group.traverse((o) => {
-    if (o.isBone) bones++;
-    if ((o.isMesh || o.isSkinnedMesh) && o.geometry?.index) tris += o.geometry.index.count / 3;
+    const m = o as THREE.Mesh;
+    if ((o as THREE.Bone).isBone) bones++;
+    if (
+      (m.isMesh || (o as THREE.SkinnedMesh).isSkinnedMesh) &&
+      m.geometry?.index
+    )
+      tris += m.geometry.index.count / 3;
   });
   for (const [k, v] of [
     ["bones", String(bones)],
@@ -797,14 +918,14 @@ function buildHud(inst) {
     div.className = "hud-line";
     div.innerHTML = `<span class="k">${label}</span><span class="v">—</span>`;
     body.appendChild(div);
-    hudLines.push(div.querySelector(".v"));
+    hudLines.push(div.querySelector<HTMLElement>(".v")!);
   }
   for (const [label] of inst.bars?.() ?? []) {
     const div = document.createElement("div");
     div.className = "hud-bar";
     div.innerHTML = `<div class="k">${label}</div><div class="track"><div class="fill"></div></div>`;
     body.appendChild(div);
-    hudBars.push(div.querySelector(".fill"));
+    hudBars.push(div.querySelector<HTMLElement>(".fill")!);
   }
 }
 

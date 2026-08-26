@@ -20,8 +20,8 @@ import {
   disposeWorld,
   updateGouda,
   getSpawnPoint,
-} from "./gouda.js";
-import { mountBathyscaphe, updateBathyscaphe } from "./bathyscaphe.js";
+} from "../world/gouda.ts";
+import { mountBathyscaphe, updateBathyscaphe } from "../world/bathyscaphe.ts";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import {
@@ -29,14 +29,85 @@ import {
   createDiverRig,
   updateDiverRig,
   FP_VIEW,
-} from "./diverRig.js";
-import { initCatfishSystem } from "./catfish.js";
-import { toonify } from "./toon.js";
+} from "../entities/diverRig.ts";
+import { initCatfishSystem } from "../entities/catfish.ts";
+import { toonify } from "./toon.ts";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
+import type { Vec3 } from "../state.ts";
+
+// Shapes inferred from diverRig.ts / gouda.ts (typed in parallel) — derive
+// them so this file tracks those modules' own annotations automatically.
+type DiverTemplate = ReturnType<typeof prepareDiverTemplate>;
+type DiverRig = ReturnType<typeof createDiverRig>;
+type WorldProgress = (done: number, total: number, label: string) => void;
+interface WorldOptions {
+  seed?: number;
+  difficulty?: number;
+}
+
+// Params for the volumetric beam builders.
+interface BeamOptions {
+  length: number;
+  endRadius: number;
+  tint: THREE.ColorRepresentation;
+  strength: number;
+  falloffPow?: number;
+}
+
+interface BurstState {
+  origin: THREE.Vector3;
+  age: number;
+  duration: number;
+}
+
+interface BreathState {
+  x: number;
+  y: number;
+  z: number;
+  age: number;
+  seed: number;
+}
+
+interface Flashlight {
+  group: THREE.Group;
+  spot: THREE.SpotLight;
+  spill: THREE.SpotLight;
+  fill: THREE.PointLight;
+  on: boolean;
+}
+
+// Per-remote-player record (see addPlayer).
+interface RemotePlayer {
+  group: THREE.Group;
+  pivot: THREE.Group;
+  placeholder: THREE.Group;
+  spot: THREE.SpotLight;
+  beam: THREE.Group;
+  halo: THREE.Sprite;
+  glow: THREE.PointLight;
+  color: THREE.ColorRepresentation;
+  rig: DiverRig | null;
+  torch: THREE.Group | null;
+  headGlow: THREE.Group | null;
+  lookYaw: number;
+  lookPitch: number;
+  swimYaw: number;
+  swimPitch: number;
+  bodyPitchSm: number;
+  velEst: THREE.Vector3;
+  lastPos: THREE.Vector3;
+  hasLast: boolean;
+}
+
+// traverse() hands back plain Object3Ds; disposables are found by probing.
+type SceneChild = THREE.Object3D & {
+  geometry?: THREE.BufferGeometry;
+  material?: THREE.Material;
+};
 
 // DEEP TEAL-BLUE ABYSS — water, not space. The key anti-space cues:
 // the void is never pure black (a faint blue-teal ambient floor — light
@@ -89,32 +160,42 @@ const DIVER_MODEL_URL = `${import.meta.env.BASE_URL}models/ratdiverAbyssalGouda.
 // head joint at (0.009, 0.634, 0.079), flipped and scaled.
 const TORCH_OFFSET = new THREE.Vector3(0, 0.35, -0.14);
 
-let scene;
-let camera;
-let renderer;
-let composer;
-let horrorPass;
-let snow;
-let bubbles;
-let bursts; // { points, states: [{origin, age, duration, delay}] }
-let plankton; // bioluminescent drifters, blinking cyan in the dark
-let breath; // { points, states } — the diver's own exhaled bubbles
-let flashlight; // { group, spot, spill, beam, halo, on } — helmet-mounted
+let scene: THREE.Scene;
+let camera: THREE.PerspectiveCamera;
+let renderer: THREE.WebGLRenderer;
+let composer: EffectComposer;
+let horrorPass: ShaderPass;
+let snow: THREE.Points<THREE.BufferGeometry, THREE.ShaderMaterial>;
+let bubbles: THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial>;
+// { points, states: [{origin, age, duration, delay}] }
+let bursts: {
+  points: THREE.Points<THREE.BufferGeometry, THREE.ShaderMaterial>;
+  states: BurstState[];
+};
+// bioluminescent drifters, blinking cyan in the dark
+let plankton: THREE.Points<THREE.BufferGeometry, THREE.ShaderMaterial>;
+// { points, states } — the diver's own exhaled bubbles
+let breath: {
+  points: THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial>;
+  states: BreathState[];
+  cursor: number;
+};
+let flashlight: Flashlight; // { group, spot, spill, beam, halo, on } — helmet-mounted
 let elapsed = 0;
 let moveFactor = 0;
-let resizeFrame = null;
+let resizeFrame: number | null = null;
 
-const players = new Map();
+const players = new Map<string, RemotePlayer>();
 const noise = new ImprovedNoise();
-const beamMaterials = []; // all volumetric beam materials (share uTime)
+const beamMaterials: THREE.ShaderMaterial[] = []; // all volumetric beam materials (share uTime)
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
 
 // The GLB is fetched, parsed, and prepped exactly ONCE — the prepared
 // template (rest pose, per-bone axes, head fix) is shared by the local
 // first-person body and every remote diver clone.
-let diverTemplatePromise = null;
-function loadDiverTemplate() {
+let diverTemplatePromise: Promise<DiverTemplate | null> | null = null;
+function loadDiverTemplate(): Promise<DiverTemplate | null> {
   diverTemplatePromise ??= new GLTFLoader()
     .loadAsync(DIVER_MODEL_URL)
     .then((gltf) => {
@@ -133,7 +214,11 @@ function loadDiverTemplate() {
 // --- Local first-person body: just your two gloves, visible looking down. ---
 // Pure POV: no body is rendered at all. The gloves ride the (invisible) arm
 // bones and enter the frame only on a steep look down.
-let localBody = null; // { group, pivot, rig }
+let localBody: {
+  group: THREE.Group;
+  pivot: THREE.Group;
+  rig: DiverRig;
+} | null = null; // { group, pivot, rig }
 const localState = {
   active: false,
   pos: new THREE.Vector3(),
@@ -154,17 +239,21 @@ function createLocalBody() {
     const pivot = new THREE.Group();
     group.add(pivot);
     const rig = createDiverRig(template, { firstPerson: true });
-    rig.root.traverse((obj) => {
-      if (obj.isMesh) {
-        obj.material = obj.material.clone();
+    rig.root.traverse((obj: THREE.Object3D) => {
+      if ((obj as THREE.Mesh).isMesh) {
+        const mesh = obj as THREE.Mesh<
+          THREE.BufferGeometry,
+          THREE.Material & { color?: THREE.Color }
+        >;
+        mesh.material = mesh.material.clone();
         // Double-sided: with the arms reaching forward the wrist/shoulder
         // tube cuts are seen end-on, and a culled backface there reads as a
         // severed arm. A dark interior wall reads as the sleeve's inside.
-        obj.material.side = THREE.DoubleSide;
+        mesh.material.side = THREE.DoubleSide;
         // Your own suit soaks the torch: darkened below the world's albedo
         // so arms/gloves never blow out inside the beam core, but with
         // enough albedo left to keep material definition.
-        obj.material.color?.multiplyScalar(0.58);
+        mesh.material.color?.multiplyScalar(0.58);
       }
     });
     pivot.add(rig.root);
@@ -174,7 +263,14 @@ function createLocalBody() {
 }
 
 // Called by main.js every frame with the freshest simulation state.
-export function updateLocalPlayer(pos, yaw, pitch, swimYaw, swimPitch, vel) {
+export function updateLocalPlayer(
+  pos: Vec3,
+  yaw: number,
+  pitch: number,
+  swimYaw: number,
+  swimPitch: number,
+  vel: Vec3,
+): void {
   localState.active = true;
   localState.pos.set(pos.x, pos.y, pos.z);
   localState.yaw = yaw;
@@ -184,7 +280,7 @@ export function updateLocalPlayer(pos, yaw, pitch, swimYaw, swimPitch, vel) {
   localState.vel.set(vel.x, vel.y, vel.z);
 }
 
-function updateLocalBody(delta) {
+function updateLocalBody(delta: number): void {
   if (!localBody || !localState.active) return;
 
   // The gloves are SCREEN-ANCHORED, FPS-style: the invisible body yaws and
@@ -206,11 +302,11 @@ function updateLocalBody(delta) {
   });
 }
 
-function renderPixelRatio() {
+function renderPixelRatio(): number {
   return Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO);
 }
 
-export function initGraphics(container) {
+export function initGraphics(container: HTMLElement): HTMLCanvasElement {
   scene = new THREE.Scene();
   scene.background = new THREE.Color(ABYSS_COLOR);
   scene.fog = new THREE.FogExp2(ABYSS_COLOR, FOG_DENSITY);
@@ -269,7 +365,10 @@ export function initGraphics(container) {
 // Generates the gouda labyrinth asynchronously (chunk by chunk) so the
 // loading screen can track progress. Call after initGraphics, await before
 // spawning the player. opts: { seed, difficulty }.
-export function loadWorld(onProgress, opts) {
+export function loadWorld(
+  onProgress: WorldProgress,
+  opts: WorldOptions,
+): ReturnType<typeof buildGoudaWorld> {
   return buildGoudaWorld(scene, onProgress, opts).then((world) => {
     // The tin bell berths over the spawn — the O₂ recharge zone gets a body.
     mountBathyscaphe(scene, getSpawnPoint());
@@ -279,7 +378,10 @@ export function loadWorld(onProgress, opts) {
 
 // Tears down the current world and builds a new one (e.g. adopting the
 // host's seed after joining).
-export function rebuildWorld(onProgress, opts) {
+export function rebuildWorld(
+  onProgress: WorldProgress,
+  opts: WorldOptions,
+): ReturnType<typeof buildGoudaWorld> {
   disposeWorld(scene);
   return buildGoudaWorld(scene, onProgress, opts).then((world) => {
     mountBathyscaphe(scene, getSpawnPoint()); // re-berth over the new spawn
@@ -289,7 +391,7 @@ export function rebuildWorld(onProgress, opts) {
 
 // Smoothly retunes the fog to the player's current layer. Returns current
 // visibility (used for fog-aware culling).
-function fogDensityFor(radius) {
+function fogDensityFor(radius: number): number {
   const bands = FOG_BANDS;
   if (radius <= bands[0][0]) return bands[0][1];
   for (let i = 1; i < bands.length; i++) {
@@ -303,11 +405,12 @@ function fogDensityFor(radius) {
   return bands[bands.length - 1][1];
 }
 
-function updateAtmosphere(delta) {
+function updateAtmosphere(delta: number): number {
   const radius = camera.position.length();
   const target = fogDensityFor(radius);
   const k = Math.min(1, delta * 0.7); // slow, diver-paced transition
-  scene.fog.density += (target - scene.fog.density) * k;
+  const fog = scene.fog as THREE.FogExp2; // set in initGraphics
+  fog.density += (target - fog.density) * k;
 
   // Depth-graded water column: the fog (and the void behind it) is a ghost
   // of teal when you're high in the water, and crushes toward blue-black as
@@ -318,10 +421,10 @@ function updateAtmosphere(delta) {
   t = Math.max(0, Math.min(1, t));
   t = t * t * (3 - 2 * t);
   _fogColor.copy(ABYSS_DEEP).lerp(ABYSS_SHALLOW, t);
-  scene.fog.color.lerp(_fogColor, k);
-  scene.background.copy(scene.fog.color);
+  fog.color.lerp(_fogColor, k);
+  (scene.background as THREE.Color).copy(fog.color);
 
-  return 3 / scene.fog.density; // ~visibility in world units
+  return 3 / fog.density; // ~visibility in world units
 }
 
 function setupPostProcessing() {
@@ -409,7 +512,13 @@ function setupPostProcessing() {
 // Fresnel-soft additive cone with distance falloff and drifting wisps.
 // `falloffPow` shapes how quickly it dims with distance: high (~1.6) for a
 // tight bright core, low (~0.6) for a slow-dimming diffuse haze.
-function createBeam({ length, endRadius, tint, strength, falloffPow = 1.6 }) {
+function createBeam({
+  length,
+  endRadius,
+  tint,
+  strength,
+  falloffPow = 1.6,
+}: BeamOptions): THREE.Mesh<THREE.CylinderGeometry, THREE.ShaderMaterial> {
   const geo = new THREE.CylinderGeometry(0.03, endRadius, length, 32, 8, true);
   geo.translate(0, -length / 2, 0);
   geo.rotateX(Math.PI / 2); // extend along -Z
@@ -474,13 +583,13 @@ function createBeam({ length, endRadius, tint, strength, falloffPow = 1.6 }) {
   return new THREE.Mesh(geo, material);
 }
 
-let haloTexture = null;
-function getHaloTexture() {
+let haloTexture: THREE.CanvasTexture | null = null;
+function getHaloTexture(): THREE.CanvasTexture {
   if (haloTexture) return haloTexture;
   const size = 128;
   const canvas = document.createElement("canvas");
   canvas.width = canvas.height = size;
-  const ctx = canvas.getContext("2d");
+  const ctx = canvas.getContext("2d")!;
   const grad = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
   grad.addColorStop(0, "rgba(255,252,240,0.9)");
   grad.addColorStop(0.25, "rgba(255,238,200,0.35)");
@@ -493,7 +602,11 @@ function getHaloTexture() {
 }
 
 // Soft scatter glow around a lamp — light bleeding into the murk.
-function createHalo(size, opacity, color = 0xf2e6c2) {
+function createHalo(
+  size: number,
+  opacity: number,
+  color: THREE.ColorRepresentation = 0xf2e6c2,
+): THREE.Sprite {
   const sprite = new THREE.Sprite(
     new THREE.SpriteMaterial({
       map: getHaloTexture(),
@@ -513,7 +626,12 @@ function createHalo(size, opacity, color = 0xf2e6c2) {
 // and camera-facing glow puffs spaced along the axis. The puffs shrink and
 // dim with distance, giving a clear read on how far the light throws and
 // how much it has dispersed even when no floor or wall is in view to catch it.
-function createVolumetricLight({ length, endRadius, tint, strength }) {
+function createVolumetricLight({
+  length,
+  endRadius,
+  tint,
+  strength,
+}: BeamOptions) {
   const group = new THREE.Group();
 
   const beam = createBeam({ length, endRadius, tint, strength });
@@ -550,7 +668,7 @@ function createVolumetricLight({ length, endRadius, tint, strength }) {
 // Instead: a wide soft-edged hot cone, a broad spill that washes the whole
 // view ("halo where I look"), and a short-range fill so your own hands and
 // the wall in front of your face are never pitch black.
-function createFlashlight() {
+function createFlashlight(): void {
   const group = new THREE.Group();
 
   // Hot core: wide and soft-edged, shadow-casting. Warm dive-torch tint.
@@ -610,11 +728,11 @@ function createFlashlight() {
 
 // Shot harness (shots.js, ?light=N): flat inspection light so first-person
 // geometry reads clearly in screenshots. Never used in a real session.
-export function addShotLight(intensity = 1.5) {
+export function addShotLight(intensity: number = 1.5): void {
   scene.add(new THREE.HemisphereLight(0xbfd8e0, 0x4a4236, intensity));
 }
 
-export function toggleFlashlight() {
+export function toggleFlashlight(): boolean {
   flashlight.on = !flashlight.on;
   flashlight.spot.visible = flashlight.on;
   flashlight.spill.visible = flashlight.on;
@@ -625,7 +743,7 @@ export function toggleFlashlight() {
 // --- Particles ---------------------------------------------------------
 
 // Marine snow, LIT by up to two beam cones (local + remote flashlight).
-function createSnow() {
+function createSnow(): void {
   const positions = new Float32Array(SNOW_COUNT * 3);
   const scales = new Float32Array(SNOW_COUNT);
   const offsets = new Float32Array(SNOW_COUNT);
@@ -709,7 +827,7 @@ function createSnow() {
   scene.add(snow);
 }
 
-function createBubbles() {
+function createBubbles(): void {
   const positions = new Float32Array(BUBBLE_COUNT * 3);
   for (let i = 0; i < BUBBLE_COUNT; i++) {
     positions[i * 3] = (Math.random() - 0.5) * 2 * BUBBLE_RADIUS;
@@ -732,7 +850,7 @@ function createBubbles() {
 }
 
 // Occasional bubble bursts: a vent exhales, a cluster races for the surface.
-function createBursts() {
+function createBursts(): void {
   const total = BURSTS * BURST_PARTICLES;
   const positions = new Float32Array(total * 3);
   const seeds = new Float32Array(total);
@@ -783,7 +901,7 @@ function createBursts() {
   points.frustumCulled = false;
   scene.add(points);
 
-  const states = [];
+  const states: BurstState[] = [];
   for (let i = 0; i < BURSTS; i++) {
     states.push({
       origin: new THREE.Vector3(),
@@ -796,18 +914,18 @@ function createBursts() {
 
 // Fire a bubble burst on demand (e.g. a dig tearing gas pockets out of the
 // cheese). Steals the burst slot that's furthest from being visible.
-export function burstAt(x, y, z) {
+export function burstAt(x: number, y: number, z: number): void {
   if (!bursts) return;
-  let best = null;
+  let best: BurstState | null = null;
   for (const s of bursts.states) {
     if (best === null || s.age < best.age) best = s;
   }
-  best.origin.set(x, y, z);
-  best.age = 0;
-  best.duration = 2.2 + Math.random();
+  best!.origin.set(x, y, z);
+  best!.age = 0;
+  best!.duration = 2.2 + Math.random();
 }
 
-function respawnBurst(state) {
+function respawnBurst(state: BurstState): void {
   // A pocket of gas escaping the cheese somewhere below/around the diver.
   const angle = Math.random() * Math.PI * 2;
   const dist = 5 + Math.random() * 13;
@@ -819,7 +937,7 @@ function respawnBurst(state) {
   state.duration = 3.2 + Math.random() * 1.6;
 }
 
-function updateBursts(delta) {
+function updateBursts(delta: number): void {
   const positions = bursts.points.geometry.attributes.position;
   const seeds = bursts.points.geometry.attributes.aSeed;
   const alphas = bursts.points.material.uniforms.uAlphas.value;
@@ -862,7 +980,7 @@ function updateBursts(delta) {
 // nearly invisible; each one blinks awake on its own slow cycle — tiny cyan
 // lives in the dark. Nothing says "you are in water" like the water being
 // inhabited.
-function createPlankton() {
+function createPlankton(): void {
   const positions = new Float32Array(PLANKTON_COUNT * 3);
   const seeds = new Float32Array(PLANKTON_COUNT);
   for (let i = 0; i < PLANKTON_COUNT; i++) {
@@ -923,7 +1041,7 @@ function createPlankton() {
 // --- Breath bubbles: your own exhale. A slot ring of bubbles; emitBreath()
 // (driven by the audio engine's breathing cycle, or a fallback timer)
 // releases a small cluster just behind the visor that wobbles surfaceward.
-function createBreath() {
+function createBreath(): void {
   const positions = new Float32Array(BREATH_COUNT * 3);
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
@@ -940,7 +1058,7 @@ function createBreath() {
   points.frustumCulled = false;
   scene.add(points);
 
-  const states = [];
+  const states: BreathState[] = [];
   for (let i = 0; i < BREATH_COUNT; i++) {
     states.push({ x: 0, y: -9999, z: 0, age: 99, seed: Math.random() });
   }
@@ -948,7 +1066,7 @@ function createBreath() {
 }
 
 // Release a cluster of exhale bubbles at the diver's helmet.
-export function emitBreath(count = 5) {
+export function emitBreath(count: number = 5): void {
   if (!breath) return;
   camera.getWorldPosition(_v1);
   for (let n = 0; n < count; n++) {
@@ -962,7 +1080,7 @@ export function emitBreath(count = 5) {
   }
 }
 
-function updateBreath(delta) {
+function updateBreath(delta: number): void {
   const positions = breath.points.geometry.attributes.position;
   for (let i = 0; i < BREATH_COUNT; i++) {
     const s = breath.states[i];
@@ -985,7 +1103,7 @@ function updateBreath(delta) {
 // Slow-changing current direction (Perlin-driven), with occasional gusts.
 // Returns a reused scratch object — called once per frame from renderLoop.
 const _drift = { x: 0, z: 0 };
-function currentDrift() {
+function currentDrift(): { x: number; z: number } {
   const gust =
     Math.pow(Math.max(0, noise.noise(elapsed * 0.07, 5.5, 0)), 2) * 3;
   _drift.x = noise.noise(elapsed * 0.04, 11.3, 0) * (0.6 + gust);
@@ -993,7 +1111,13 @@ function currentDrift() {
   return _drift;
 }
 
-function wrapAroundCamera(points, radius, fall, delta, drift) {
+function wrapAroundCamera(
+  points: THREE.Points,
+  radius: number,
+  fall: number,
+  delta: number,
+  drift: { x: number; z: number },
+): void {
   const positions = points.geometry.attributes.position;
   const c = camera.position;
   const size = radius * 2;
@@ -1016,7 +1140,10 @@ function wrapAroundCamera(points, radius, fall, delta, drift) {
 
 // --- Remote divers -------------------------------------------------------
 
-export function addPlayer(id, color) {
+export function addPlayer(
+  id: string,
+  color: THREE.ColorRepresentation,
+): THREE.Group | RemotePlayer | undefined {
   if (players.has(id)) return players.get(id);
 
   const group = new THREE.Group();
@@ -1083,7 +1210,7 @@ export function addPlayer(id, color) {
   pivot.add(glow);
 
   scene.add(group);
-  const player = {
+  const player: RemotePlayer = {
     group,
     pivot,
     placeholder,
@@ -1147,7 +1274,7 @@ export function addPlayer(id, color) {
 
 // --- Remote diver per-frame update: estimate velocity, run the procedural
 // swim (diverRig.js), then pin the helmet torch + glow to the head.
-function updateRemoteDiver(player, delta) {
+function updateRemoteDiver(player: RemotePlayer, delta: number): void {
   const rig = player.rig;
   if (!rig) return;
 
@@ -1180,47 +1307,51 @@ function updateRemoteDiver(player, delta) {
   });
 
   // Torch beam leaves the helmet along the exact look direction.
+  // (torch/headGlow are created in the same then() that set `rig`.)
   _v1.copy(TORCH_OFFSET).applyQuaternion(rig.lookQuat);
-  player.torch.position.copy(rig.headPos).add(_v1);
-  player.torch.quaternion.copy(rig.lookQuat);
+  player.torch!.position.copy(rig.headPos).add(_v1);
+  player.torch!.quaternion.copy(rig.lookQuat);
 
-  player.headGlow.position.copy(rig.headPos);
+  player.headGlow!.position.copy(rig.headPos);
 }
 
-export function removePlayer(id) {
+export function removePlayer(id: string): void {
   const player = players.get(id);
   if (!player) return;
   for (const obj of [player.group, player.torch, player.headGlow]) {
     if (!obj) continue;
     scene.remove(obj);
-    obj.traverse((child) => {
+    obj.traverse((child: SceneChild) => {
       child.geometry?.dispose();
       if (child.material?.dispose) {
         child.material.dispose();
         // The volumetric beam registered its material for the shared uTime
         // update — unregister, or the render loop feeds disposed materials
         // forever (and the array grows with every join).
-        const bi = beamMaterials.indexOf(child.material);
+        const bi = beamMaterials.indexOf(
+          child.material as THREE.ShaderMaterial,
+        );
         if (bi !== -1) beamMaterials.splice(bi, 1);
       }
       // Lights own GPU-side shadow maps (the spot's 512² depth target) that
       // material/geometry disposal doesn't touch.
-      if (child.isLight) child.dispose();
+      if ((child as unknown as THREE.Light).isLight)
+        (child as unknown as THREE.Light).dispose();
     });
   }
   players.delete(id);
 }
 
 export function updatePlayerPosition(
-  id,
-  x,
-  y,
-  z,
-  yaw = null,
-  pitch = null,
-  swimYaw = null,
-  swimPitch = null,
-) {
+  id: string,
+  x: number,
+  y: number,
+  z: number,
+  yaw: number | null = null,
+  pitch: number | null = null,
+  swimYaw: number | null = null,
+  swimPitch: number | null = null,
+): void {
   const player = players.get(id);
   if (!player) return;
   player.group.position.set(x, y, z);
@@ -1232,7 +1363,7 @@ export function updatePlayerPosition(
   player.swimPitch = swimPitch ?? pitch ?? player.swimPitch;
 }
 
-export function setPlayerLight(id, on) {
+export function setPlayerLight(id: string, on: boolean): void {
   const player = players.get(id);
   if (!player) return;
   player.spot.visible = on;
@@ -1240,12 +1371,19 @@ export function setPlayerLight(id, on) {
   player.halo.visible = on;
 }
 
-export function updateCamera(playerPos, yaw, pitch, speed = 0, roll = 0) {
+export function updateCamera(
+  playerPos: Vec3,
+  yaw: number,
+  pitch: number,
+  speed: number = 0,
+  roll: number = 0,
+): void {
   // BUOYANCY — a visual-only sway layered on the simulated position. Water
   // never holds you perfectly still: a slow vertical heave, a hint of side
   // drift, and a breathing roll. Fades as swim speed takes over.
   const idle = 1 - Math.min(1, moveFactor * 2.5);
-  const heave = Math.sin(elapsed * 0.45) * 0.05 + Math.sin(elapsed * 0.9) * 0.02;
+  const heave =
+    Math.sin(elapsed * 0.45) * 0.05 + Math.sin(elapsed * 0.9) * 0.02;
   const surgeX = Math.sin(elapsed * 0.31 + 1.7) * 0.03;
   camera.position.set(
     playerPos.x + surgeX * idle,
@@ -1261,7 +1399,7 @@ export function updateCamera(playerPos, yaw, pitch, speed = 0, roll = 0) {
 
 // Helmet-mounted = much steadier than the old hand-held sway: just a faint
 // breathing bob, growing slightly with swim speed.
-function animateFlashlight() {
+function animateFlashlight(): void {
   if (!flashlight) return;
   const t = elapsed;
   const bob = 1 + moveFactor * 2;
@@ -1272,7 +1410,7 @@ function animateFlashlight() {
 }
 
 // Feed the snow shader the two beam poses (local + first remote).
-function updateSnowLightUniforms() {
+function updateSnowLightUniforms(): void {
   const u = snow.material.uniforms;
 
   flashlight.spot.getWorldPosition(u.uLightPos.value[0]);
@@ -1292,7 +1430,7 @@ function updateSnowLightUniforms() {
   u.uLightOn.value[1] = remoteLit;
 }
 
-function applyResize() {
+function applyResize(): void {
   resizeFrame = null;
   const width = window.innerWidth;
   const height = window.innerHeight;
@@ -1308,12 +1446,12 @@ function applyResize() {
   composer.setSize(width, height);
 }
 
-function onResize() {
+function onResize(): void {
   if (resizeFrame !== null) return;
   resizeFrame = requestAnimationFrame(applyResize);
 }
 
-export function renderLoop(onFrame) {
+export function renderLoop(onFrame?: (delta: number) => void): void {
   const clock = new THREE.Clock();
 
   renderer.setAnimationLoop(() => {

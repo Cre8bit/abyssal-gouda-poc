@@ -1,4 +1,4 @@
-// interpolation.js — snapshot buffer for smooth remote player movement.
+// interpolation.ts — snapshot buffer for smooth remote player movement.
 //
 // Remote state arrives in discrete packets (~20/s) with network jitter.
 // Instead of teleporting the remote player on every packet, we buffer
@@ -10,20 +10,52 @@ const RENDER_DELAY_MS = 120; // ~2.5 packets of headroom at 20 Hz
 const MAX_EXTRAPOLATION_MS = 200; // cap prediction when packets stop
 const BUFFER_TTL_MS = 1000;
 
+// What the network layer pushes (a decoded pose — angles may be absent from
+// older peers) and what sample() hands back (all fields resolved).
+export interface PoseSnapshot {
+  x: number;
+  y: number;
+  z: number;
+  yaw?: number;
+  pitch?: number;
+  sy?: number;
+  sp?: number;
+}
+
+export interface SampledPose {
+  x: number;
+  y: number;
+  z: number;
+  yaw: number;
+  pitch: number;
+  sy: number;
+  sp: number;
+}
+
+interface TimedSnapshot extends PoseSnapshot {
+  t: number;
+}
+
 export class SnapshotBuffer {
-  constructor() {
-    this.snapshots = []; // [{ t, x, y, z, yaw, pitch }]
-    // sample() returns this reused object (one per buffer, refilled every
-    // frame) — consume it before the next sample() call, don't store it.
-    this._out = { x: 0, y: 0, z: 0, yaw: 0, pitch: 0, sy: 0, sp: 0 };
-  }
+  snapshots: TimedSnapshot[] = [];
+  // sample() returns this reused object (one per buffer, refilled every
+  // frame) — consume it before the next sample() call, don't store it.
+  private _out: SampledPose = {
+    x: 0,
+    y: 0,
+    z: 0,
+    yaw: 0,
+    pitch: 0,
+    sy: 0,
+    sp: 0,
+  };
 
   // Call on teleports: forget history so we don't interpolate across the map.
-  reset() {
+  reset(): void {
     this.snapshots.length = 0;
   }
 
-  push(state) {
+  push(state: PoseSnapshot): void {
     this.snapshots.push({ t: performance.now(), ...state });
     // Drop stale history.
     const cutoff = performance.now() - BUFFER_TTL_MS;
@@ -33,7 +65,7 @@ export class SnapshotBuffer {
   }
 
   // Returns the interpolated state at (now - RENDER_DELAY_MS), or null.
-  sample() {
+  sample(): PoseSnapshot | null {
     const snaps = this.snapshots;
     if (snaps.length === 0) return null;
 
@@ -84,12 +116,12 @@ export class SnapshotBuffer {
   }
 }
 
-function lerp(a, b, t) {
+function lerp(a: number, b: number, t: number): number {
   return a + (b - a) * t;
 }
 
 // Interpolates angles along the shortest arc (handles the ±π wrap).
-function lerpAngle(a, b, t) {
+function lerpAngle(a: number, b: number, t: number): number {
   let diff = (b - a) % (Math.PI * 2);
   if (diff > Math.PI) diff -= Math.PI * 2;
   if (diff < -Math.PI) diff += Math.PI * 2;

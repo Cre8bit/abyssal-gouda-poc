@@ -13,9 +13,13 @@
 // name ("fp-down-60") or { "name": "fp-down-60", "params": { "pitch": -1.2 } }
 // — params become extra query-string overrides (see src/shots.js).
 import { spawn } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
+
+// A request.json entry: a shot name, or a name plus query-string overrides.
+type ShotEntry = string | { name: string; params?: Record<string, unknown> };
 
 const ROOT = path.resolve(import.meta.dirname, "..");
 const SHOTS = path.join(ROOT, "shots");
@@ -39,7 +43,7 @@ const [WIDTH, HEIGHT] = SIZE.split(",").map(Number);
 const INTERESTING =
   /error|Uncaught|Unhandled|THREE\.|shader|GL ERROR|ERR_CONNECTION|net::/i;
 
-function shotUrl(entry) {
+function shotUrl(entry: ShotEntry) {
   const name = typeof entry === "string" ? entry : entry.name;
   const q = new URLSearchParams({ shot: name, seed: SEED });
   if (typeof entry === "object" && entry.params) {
@@ -49,7 +53,7 @@ function shotUrl(entry) {
 }
 
 // Parameterized variants of the same shot get distinct filenames.
-function fileName(entry) {
+function fileName(entry: ShotEntry): string {
   if (typeof entry === "string") return entry;
   const parts = Object.entries(entry.params ?? {}).map(
     ([k, v]) => `${k}${String(v).replace(/[^\w.-]+/g, "_")}`,
@@ -59,15 +63,36 @@ function fileName(entry) {
 
 // --- minimal DevTools-protocol client over Node's built-in WebSocket -------
 
+// A parsed DevTools message: a command response (id + result/error) or an
+// event (method + params). Payloads stay loosely typed on purpose — the
+// runner touches a handful of fields; full CDP typings aren't worth it here.
+type CDPMessage = {
+  id?: number;
+  method?: string;
+  sessionId?: string;
+  params?: CDPPayload;
+  result?: CDPPayload;
+  error?: { message: string };
+};
+
+// CDP payloads are protocol-defined and destructured ad hoc at each call
+// site — typing the DevTools protocol here would be pure ceremony.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type CDPPayload = any;
+
 class CDP {
   #id = 0;
-  #pending = new Map();
-  #listeners = new Set();
+  #pending = new Map<
+    number,
+    { resolve: (result: CDPPayload) => void; reject: (err: Error) => void }
+  >();
+  #listeners = new Set<(msg: CDPMessage) => void>();
+  declare ws: WebSocket;
 
-  constructor(ws) {
+  constructor(ws: WebSocket) {
     this.ws = ws;
     ws.addEventListener("message", (ev) => {
-      const msg = JSON.parse(ev.data);
+      const msg: CDPMessage = JSON.parse(ev.data);
       if (msg.id !== undefined) {
         const p = this.#pending.get(msg.id);
         if (!p) return;
@@ -85,13 +110,17 @@ class CDP {
     });
   }
 
-  static connect(url) {
+  static connect(url: string): Promise<CDP> {
     return new Promise((resolve, reject) => {
       const ws = new WebSocket(url);
       ws.addEventListener("open", () => resolve(new CDP(ws)), { once: true });
-      ws.addEventListener("error", () => reject(new Error(`cannot reach ${url}`)), {
-        once: true,
-      });
+      ws.addEventListener(
+        "error",
+        () => reject(new Error(`cannot reach ${url}`)),
+        {
+          once: true,
+        },
+      );
     });
   }
 
@@ -99,7 +128,11 @@ class CDP {
     return this.ws.readyState === WebSocket.OPEN;
   }
 
-  send(method, params = {}, sessionId) {
+  send(
+    method: string,
+    params: Record<string, unknown> = {},
+    sessionId?: string,
+  ): Promise<CDPPayload> {
     const id = ++this.#id;
     return new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
@@ -107,14 +140,19 @@ class CDP {
     });
   }
 
-  onEvent(fn) {
+  onEvent(fn: (msg: CDPMessage) => void): () => void {
     this.#listeners.add(fn);
     return () => this.#listeners.delete(fn);
   }
 }
 
 // Resolves true when the event arrives, false on wall-clock timeout.
-function waitForEvent(cdp, sessionId, method, timeoutMs) {
+function waitForEvent(
+  cdp: CDP,
+  sessionId: string,
+  method: string,
+  timeoutMs: number,
+): Promise<boolean> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
       off();
@@ -132,10 +170,12 @@ function waitForEvent(cdp, sessionId, method, timeoutMs) {
 
 // --- warm browser lifecycle -------------------------------------------------
 
-let browser = null; // { proc, cdp }
+type Browser = { proc: ChildProcessWithoutNullStreams; cdp: CDP };
+
+let browser: Browser | null = null;
 let lastUse = 0;
 
-async function launchBrowser() {
+async function launchBrowser(): Promise<Browser> {
   const proc = spawn(CHROME, [
     "--headless=new",
     "--no-sandbox",
@@ -146,9 +186,9 @@ async function launchBrowser() {
     "--remote-debugging-port=0",
     "about:blank",
   ]);
-  const wsUrl = await new Promise((resolve, reject) => {
+  const wsUrl = await new Promise<string>((resolve, reject) => {
     let err = "";
-    const onData = (d) => {
+    const onData = (d: Buffer) => {
       err += d;
       const m = err.match(/DevTools listening on (ws:\/\/\S+)/);
       if (m) {
@@ -165,7 +205,10 @@ async function launchBrowser() {
         ),
       ),
     );
-    setTimeout(() => reject(new Error("timed out waiting for DevTools endpoint")), 15000);
+    setTimeout(
+      () => reject(new Error("timed out waiting for DevTools endpoint")),
+      15000,
+    );
   });
   const cdp = await CDP.connect(wsUrl);
   const b = { proc, cdp };
@@ -185,7 +228,7 @@ async function ensureBrowser() {
   return browser;
 }
 
-function killBrowser(reason) {
+function killBrowser(reason?: string) {
   if (!browser) return;
   browser.proc.kill();
   browser = null;
@@ -206,18 +249,27 @@ process.on("exit", () => killBrowser());
 // to raise window.__shotReady (world built, pose applied, a few frames
 // rendered — see src/shots.js), screenshot, close the tab. Page console and
 // errors are collected per tab via CDP events. BUDGET caps the whole wait.
-async function captureShot(cdp, url, file) {
-  const { targetId } = await cdp.send("Target.createTarget", { url: "about:blank" });
+async function captureShot(
+  cdp: CDP,
+  url: string,
+  file: string,
+): Promise<string[]> {
+  const { targetId } = await cdp.send("Target.createTarget", {
+    url: "about:blank",
+  });
   const { sessionId } = await cdp.send("Target.attachToTarget", {
     targetId,
     flatten: true,
   });
-  const lines = [];
+  const lines: string[] = [];
   const off = cdp.onEvent((msg) => {
     if (msg.sessionId !== sessionId) return;
     if (msg.method === "Runtime.consoleAPICalled") {
       const text = msg.params.args
-        .map((a) => a.value ?? a.description ?? a.type)
+        .map(
+          (a: { value?: unknown; description?: string; type: string }) =>
+            a.value ?? a.description ?? a.type,
+        )
         .join(" ");
       lines.push(`console.${msg.params.type}: ${text}`);
     } else if (msg.method === "Runtime.exceptionThrown") {
@@ -264,7 +316,11 @@ async function captureShot(cdp, url, file) {
       lines.push(
         `runner: shot never signalled ready (${ready?.error ?? "timed out"}); captured anyway`,
       );
-    const { data } = await cdp.send("Page.captureScreenshot", { format: "png" }, sessionId);
+    const { data } = await cdp.send(
+      "Page.captureScreenshot",
+      { format: "png" },
+      sessionId,
+    );
     await writeFile(file, Buffer.from(data, "base64"));
     return lines;
   } finally {
@@ -273,9 +329,14 @@ async function captureShot(cdp, url, file) {
   }
 }
 
-async function processRun(shots) {
+type ShotResult = {
+  file: { name: string; file: string; ok: boolean };
+  log: { shot: string; ok: boolean; lines: string[] } | null;
+};
+
+async function processRun(shots: ShotEntry[]): Promise<ShotResult[]> {
   const { cdp } = await ensureBrowser();
-  const results = new Array(shots.length);
+  const results: ShotResult[] = new Array(shots.length);
   let next = 0;
   const workers = Array.from(
     { length: Math.min(CONCURRENCY, shots.length) },
@@ -285,11 +346,11 @@ async function processRun(shots) {
         const { name, url, file: base } = shotUrl(shots[i]);
         const file = path.join(SHOTS, `${base}.png`);
         await rm(file, { force: true });
-        let lines = [];
+        let lines: string[] = [];
         try {
           lines = await captureShot(cdp, url, file);
         } catch (e) {
-          lines.push(`runner: ${e.message}`);
+          lines.push(`runner: ${(e as Error).message}`);
         }
         const ok = existsSync(file);
         // On success, keep only the interesting lines. On failure, hand back
@@ -299,7 +360,9 @@ async function processRun(shots) {
           : lines.slice(-8);
         results[i] = {
           file: { name, file: path.relative(ROOT, file), ok },
-          log: kept.length ? { shot: base, ok, lines: kept.slice(0, 15) } : null,
+          log: kept.length
+            ? { shot: base, ok, lines: kept.slice(0, 15) }
+            : null,
         };
         console.log(`  ${ok ? "✔" : "✘"} ${base}`);
       }
@@ -312,11 +375,11 @@ async function processRun(shots) {
 
 // status.json is written LAST and in one go, so "run went up" can only ever
 // mean every PNG is finished and closed.
-async function writeStatus(payload) {
+async function writeStatus(payload: Record<string, unknown>) {
   await writeFile(STATUS, JSON.stringify(payload, null, 2));
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 let run = 0;
 await mkdir(SHOTS, { recursive: true });
@@ -333,7 +396,7 @@ console.log("Ctrl+C to stop.\n");
 
 for (;;) {
   if (existsSync(REQUEST)) {
-    let shots;
+    let shots: ShotEntry[];
     try {
       shots = JSON.parse(await readFile(REQUEST, "utf8")).shots ?? [];
     } catch (e) {
@@ -341,7 +404,7 @@ for (;;) {
       await writeStatus({
         run,
         state: "done",
-        error: `bad request: ${e.message}`,
+        error: `bad request: ${(e as Error).message}`,
       });
       continue;
     }
@@ -351,13 +414,13 @@ for (;;) {
     await writeStatus({ run, state: "capturing", shots });
     console.log(`run ${run}: ${shots.map((s) => fileName(s)).join(", ")}`);
 
-    let results;
+    let results: ShotResult[];
     try {
       results = await processRun(shots);
     } catch (e) {
       killBrowser("run failed");
-      await writeStatus({ run, state: "done", error: e.message });
-      console.log(`run ${run} failed: ${e.message}\n`);
+      await writeStatus({ run, state: "done", error: (e as Error).message });
+      console.log(`run ${run} failed: ${(e as Error).message}\n`);
       continue;
     }
     const files = results.map((r) => r.file);

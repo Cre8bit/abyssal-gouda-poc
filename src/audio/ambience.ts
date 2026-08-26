@@ -16,12 +16,15 @@
 // negligible next to rendering, and nothing here touches the WebRTC voice
 // path (voice.js keeps its own context and HRTF panners).
 
-let ctx = null;
-let master, muffle, reverbSend, reverbOut;
-let droneGain, subGain;
-let breathBus;
-let noiseBuffer = null; // 2 s of white noise, shared by everything
-let brownBuffer = null; // 2 s of brown noise — the low rumble bed
+let ctx: AudioContext | null = null;
+let master: GainNode,
+  muffle: BiquadFilterNode,
+  reverbSend: GainNode,
+  reverbOut: GainNode;
+let droneGain: GainNode, subGain: GainNode;
+let breathBus: GainNode;
+let noiseBuffer: AudioBuffer | null = null; // 2 s of white noise, shared by everything
+let brownBuffer: AudioBuffer | null = null; // 2 s of brown noise — the low rumble bed
 
 let breathTimer = 0;
 let breathPeriod = 5.2;
@@ -29,19 +32,19 @@ let creakTimer = 8; // first creak comes early — set the tone
 let ghostTimer = 6; // sparse tonal swells replace any constant drone note
 let bedTime = 0;
 let effortSm = 0;
-let onExhale = null;
+let onExhale: (() => void) | null = null;
 
 export function isAudioReady() {
   return ctx !== null;
 }
 
-export function setExhaleListener(fn) {
+export function setExhaleListener(fn: () => void) {
   onExhale = fn;
 }
 
-function makeNoise(color) {
-  const len = ctx.sampleRate * 2;
-  const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+function makeNoise(color: "white" | "brown") {
+  const len = ctx!.sampleRate * 2;
+  const buf = ctx!.createBuffer(1, len, ctx!.sampleRate);
   const data = buf.getChannelData(0);
   if (color === "brown") {
     let last = 0;
@@ -56,8 +59,8 @@ function makeNoise(color) {
   return buf;
 }
 
-function loopNoise(buffer) {
-  const src = ctx.createBufferSource();
+function loopNoise(buffer: AudioBuffer) {
+  const src = ctx!.createBufferSource();
   src.buffer = buffer;
   src.loop = true;
   src.start();
@@ -71,7 +74,11 @@ export function initAbyssAudio() {
     if (ctx.state === "suspended") ctx.resume();
     return;
   }
-  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  ctx = new (
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext: typeof AudioContext })
+      .webkitAudioContext
+  )();
 
   // --- Master chain: everything → muffle low-pass → compressor → out.
   const comp = ctx.createDynamicsCompressor();
@@ -163,6 +170,19 @@ export function initAbyssAudio() {
 
 // --- One-shot helpers ------------------------------------------------------
 
+interface NoiseBurstOpts {
+  duration: number;
+  type?: BiquadFilterType;
+  from: number;
+  to: number;
+  q?: number;
+  gain: number;
+  color?: "white" | "brown";
+  dest?: AudioNode;
+  reverb?: number;
+  attack?: number;
+}
+
 function noiseBurst({
   duration,
   type = "bandpass",
@@ -174,17 +194,17 @@ function noiseBurst({
   dest = master,
   reverb = 0,
   attack = 0.01,
-}) {
-  const t = ctx.currentTime;
-  const src = ctx.createBufferSource();
+}: NoiseBurstOpts) {
+  const t = ctx!.currentTime;
+  const src = ctx!.createBufferSource();
   src.buffer = color === "brown" ? brownBuffer : noiseBuffer;
   src.loop = true;
-  const f = ctx.createBiquadFilter();
+  const f = ctx!.createBiquadFilter();
   f.type = type;
   f.Q.value = q;
   f.frequency.setValueAtTime(from, t);
   f.frequency.exponentialRampToValueAtTime(Math.max(20, to), t + duration);
-  const g = ctx.createGain();
+  const g = ctx!.createGain();
   g.gain.setValueAtTime(0.0001, t);
   g.gain.exponentialRampToValueAtTime(gain, t + attack);
   g.gain.exponentialRampToValueAtTime(0.0001, t + duration);
@@ -192,13 +212,25 @@ function noiseBurst({
   f.connect(g);
   g.connect(dest);
   if (reverb > 0) {
-    const send = ctx.createGain();
+    const send = ctx!.createGain();
     send.gain.value = reverb;
     g.connect(send);
     send.connect(reverbSend);
   }
   src.start(t);
   src.stop(t + duration + 0.05);
+}
+
+interface ToneOpts {
+  duration: number;
+  type?: OscillatorType;
+  from: number;
+  to?: number;
+  gain: number;
+  dest?: AudioNode;
+  reverb?: number;
+  attack?: number;
+  vibrato?: number;
 }
 
 function tone({
@@ -211,28 +243,28 @@ function tone({
   reverb = 0,
   attack = 0.02,
   vibrato = 0,
-}) {
-  const t = ctx.currentTime;
-  const osc = ctx.createOscillator();
+}: ToneOpts) {
+  const t = ctx!.currentTime;
+  const osc = ctx!.createOscillator();
   osc.type = type;
   osc.frequency.setValueAtTime(from, t);
   osc.frequency.exponentialRampToValueAtTime(Math.max(20, to), t + duration);
-  const g = ctx.createGain();
+  const g = ctx!.createGain();
   g.gain.setValueAtTime(0.0001, t);
   g.gain.exponentialRampToValueAtTime(gain, t + attack);
   g.gain.exponentialRampToValueAtTime(0.0001, t + duration);
   osc.connect(g);
   g.connect(dest);
   if (reverb > 0) {
-    const send = ctx.createGain();
+    const send = ctx!.createGain();
     send.gain.value = reverb;
     g.connect(send);
     send.connect(reverbSend);
   }
   if (vibrato > 0) {
-    const lfo = ctx.createOscillator();
+    const lfo = ctx!.createOscillator();
     lfo.frequency.value = 3.3;
-    const lg = ctx.createGain();
+    const lg = ctx!.createGain();
     lg.gain.value = vibrato;
     lfo.connect(lg);
     lg.connect(osc.frequency);
@@ -245,7 +277,7 @@ function tone({
 
 // --- The breathing cycle -----------------------------------------------------
 
-function exhale(effort) {
+function exhale(effort: number) {
   // Bubbles leaving the regulator: a descending gurgle plus a few rising
   // pitch-blips (individual bubbles breaking away).
   noiseBurst({
@@ -278,7 +310,7 @@ function exhale(effort) {
   onExhale?.();
 }
 
-function inhale(effort) {
+function inhale(effort: number) {
   noiseBurst({
     duration: 0.9,
     from: 400,
@@ -295,9 +327,10 @@ function inhale(effort) {
 // seconds, drifts slightly flat, and dissolves into the cave reverb. Random
 // pitch from a sparse low set — never a chord, never a rhythm, never long
 // enough to read as machinery.
-function ghostTone(depth01) {
+function ghostTone(depth01: number) {
   const set = [55, 69, 82, 98, 110, 147];
-  const f0 = set[(Math.random() * set.length) | 0] * (0.99 + Math.random() * 0.02);
+  const f0 =
+    set[(Math.random() * set.length) | 0] * (0.99 + Math.random() * 0.02);
   tone({
     duration: 8 + Math.random() * 7,
     from: f0,
@@ -311,7 +344,7 @@ function ghostTone(depth01) {
 
 // --- Random abyss voices ------------------------------------------------------
 
-function distantVoice(depth01) {
+function distantVoice(depth01: number) {
   const roll = Math.random();
   if (roll < 0.45) {
     // Hull-creak: a strained metallic groan, close-ish. Pressure works on
@@ -429,7 +462,13 @@ export function playBite() {
 
 export function playClick() {
   if (!ctx) return;
-  tone({ duration: 0.03, type: "square", from: 1400, gain: 0.012, attack: 0.002 });
+  tone({
+    duration: 0.03,
+    type: "square",
+    from: 1400,
+    gain: 0.012,
+    attack: 0.002,
+  });
 }
 
 // Teleport/scatter: a rushing whoosh, disorienting.
@@ -448,7 +487,14 @@ export function playWhoosh() {
 
 // --- Per-frame update ------------------------------------------------------------
 // opts: { speed (0..1), radius (dist from map center), sprinting }
-export function updateAbyssAudio(delta, { speed = 0, radius = 420, sprinting = false } = {}) {
+export function updateAbyssAudio(
+  delta: number,
+  {
+    speed = 0,
+    radius = 420,
+    sprinting = false,
+  }: { speed?: number; radius?: number; sprinting?: boolean } = {},
+) {
   if (!ctx || ctx.state !== "running") return;
 
   // Depth into the labyrinth, 0 at the drift edge → 1 at the heart.
