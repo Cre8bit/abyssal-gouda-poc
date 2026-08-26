@@ -63,6 +63,7 @@ import {
 } from "./input.js";
 import { SnapshotBuffer } from "./interpolation.js";
 import { getShotConfig, applyShot } from "./shots.js";
+import { setLook } from "./input.js";
 import {
   spawnCatfish,
   despawnCatfish,
@@ -97,6 +98,7 @@ import {
   refillOxygen,
   isDead,
 } from "./oxygen.js";
+import { setBellCount, collideBathyscaphe } from "./bathyscaphe.js";
 
 const MAX_SPEED = 10.0; // units per second — brisk fins
 const SPRINT_MULT = 1.9; // hold Shift: burst of speed (descend is on C)
@@ -141,7 +143,7 @@ const deathOverlay = document.getElementById("death-overlay");
 
 const localPosition = { x: 0, y: 5, z: WORLD_R + 30 };
 const velocity = { x: 0, y: 0, z: 0 };
-const spawnPoint = { x: 0, y: 5, z: WORLD_R + 30 }; // future bathyscaphe berth
+const spawnPoint = { x: 0, y: 5, z: WORLD_R + 30 }; // bathyscaphe berth
 let networkTimer = 0;
 let fishNetTimer = 0; // authority → puppets fish-state broadcast throttle
 let hudTimer = 0; // slow HUD refresh (ping, peer statuses)
@@ -439,6 +441,7 @@ onLocalStatusChange(() => broadcastNow());
 onPeerConnected((peerId, { initiator } = {}) => {
   addPlayer(peerId, REMOTE_COLOR);
   remoteBuffers.set(peerId, new SnapshotBuffer());
+  setBellCount(1 + getPeerIds().length); // one berth per diver in the crew
   if (initiator) callPeer(getPeer(), peerId);
   // The host's map is the authoritative one: tell the newcomer our seed.
   if (hostedId) sendEventTo(peerId, { kind: "seed", seed, d: difficulty });
@@ -453,6 +456,7 @@ onPeerDisconnected((peerId) => {
   remoteBuffers.delete(peerId);
   clearPeerStatus(peerId);
   hangUp(peerId);
+  setBellCount(1 + getPeerIds().length);
   // If the fish simulator left, elect a replacement: lowest peer id among
   // the survivors. Everyone computes the same result locally — consistent
   // without any extra messages.
@@ -566,20 +570,33 @@ renderLoop((delta) => {
   velocity.y += (target.y - velocity.y) * k;
   velocity.z += (target.z - velocity.z) * k;
 
-  localPosition.x += velocity.x * delta;
-  localPosition.y += velocity.y * delta;
-  localPosition.z += velocity.z * delta;
+  // Move + collide in substeps of at most ~0.5 u: a stall frame (delta
+  // clamped at 0.1 s) while sprinting covers 1.9 u — farther than the bell
+  // wall is thick — and a single end-of-frame resolve would tunnel straight
+  // through it. At normal framerates this stays a single step.
+  const frameDist =
+    Math.hypot(velocity.x, velocity.y, velocity.z) * delta;
+  const steps = Math.min(4, Math.max(1, Math.ceil(frameDist / 0.5)));
+  const stepDelta = delta / steps;
+  for (let s = 0; s < steps; s++) {
+    localPosition.x += velocity.x * stepDelta;
+    localPosition.y += velocity.y * stepDelta;
+    localPosition.z += velocity.z * stepDelta;
 
-  // Cheese collision: the SDF pushes the diver out of the walls, then the
-  // velocity component pointing into the wall is removed so you slide along
-  // tunnel walls instead of bouncing.
-  const hit = resolveCollision(localPosition, PLAYER_RADIUS);
-  if (hit) {
-    const into = velocity.x * hit.x + velocity.y * hit.y + velocity.z * hit.z;
-    if (into < 0) {
-      velocity.x -= hit.x * into;
-      velocity.y -= hit.y * into;
-      velocity.z -= hit.z * into;
+    // Cheese collision: the SDF pushes the diver out of the walls, then the
+    // velocity component pointing into the wall is removed so you slide
+    // along tunnel walls instead of bouncing.
+    const hit = resolveCollision(localPosition, PLAYER_RADIUS);
+    // The tin bells are solid too (walls + floor + crown, hatch open).
+    const bellHit = collideBathyscaphe(localPosition, PLAYER_RADIUS);
+    for (const n of [hit, bellHit]) {
+      if (!n) continue;
+      const into = velocity.x * n.x + velocity.y * n.y + velocity.z * n.z;
+      if (into < 0) {
+        velocity.x -= n.x * into;
+        velocity.y -= n.y * into;
+        velocity.z -= n.z * into;
+      }
     }
   }
 
@@ -730,7 +747,16 @@ initOxygen({
 // Dev hook: flip status bits from the console to verify T0.2's AC
 // (e.g. __abyssal.setLocalStatus(__abyssal.STATUS.TRAPPED, true, 5000)).
 if (import.meta.env.DEV) {
-  window.__abyssal = { setLocalStatus, STATUS, getPeerStatus, getPeerIds };
+  window.__abyssal = {
+    setLocalStatus,
+    STATUS,
+    getPeerStatus,
+    getPeerIds,
+    setBellCount,
+    getLocalPos: () => ({ ...localPosition }),
+    teleport: teleportLocal,
+    setLook,
+  };
 }
 
 // --- Compass strip (canvas, like a dive HUD) ---

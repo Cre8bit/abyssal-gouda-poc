@@ -2,7 +2,7 @@
 //
 // A full tank lasts ~10 minutes of calm swimming — matching the 10-20 min
 // target run. Sprinting and distress statuses (trapped, gassed) burn it
-// faster; the recharge zone at the spawn point (the future bathyscaphe)
+// faster; the recharge zone at the spawn point (the bathyscaphe berth)
 // refills it. Hitting zero = blackout → main.js respawns the diver.
 
 import { STATUS } from "./effects.js";

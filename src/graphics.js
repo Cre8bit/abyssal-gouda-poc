@@ -15,7 +15,13 @@
 //  - The world itself is the procedural gouda labyrinth (see gouda.js):
 //    marching-cubes chunks with real enterable holes and tunnel systems
 import * as THREE from "three";
-import { buildGoudaWorld, disposeWorld, updateGouda } from "./gouda.js";
+import {
+  buildGoudaWorld,
+  disposeWorld,
+  updateGouda,
+  getSpawnPoint,
+} from "./gouda.js";
+import { mountBathyscaphe, updateBathyscaphe } from "./bathyscaphe.js";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import {
@@ -259,14 +265,21 @@ export function initGraphics(container) {
 // loading screen can track progress. Call after initGraphics, await before
 // spawning the player. opts: { seed, difficulty }.
 export function loadWorld(onProgress, opts) {
-  return buildGoudaWorld(scene, onProgress, opts);
+  return buildGoudaWorld(scene, onProgress, opts).then((world) => {
+    // The tin bell berths over the spawn — the O₂ recharge zone gets a body.
+    mountBathyscaphe(scene, getSpawnPoint());
+    return world;
+  });
 }
 
 // Tears down the current world and builds a new one (e.g. adopting the
 // host's seed after joining).
 export function rebuildWorld(onProgress, opts) {
   disposeWorld(scene);
-  return buildGoudaWorld(scene, onProgress, opts);
+  return buildGoudaWorld(scene, onProgress, opts).then((world) => {
+    mountBathyscaphe(scene, getSpawnPoint()); // re-berth over the new spawn
+    return world;
+  });
 }
 
 // Smoothly retunes the fog to the player's current layer. Returns current
@@ -1313,6 +1326,7 @@ export function renderLoop(onFrame) {
     // then feed the beam poses to the snow shader.
     const visibility = updateAtmosphere(delta);
     updateGouda(elapsed, camera.position, visibility);
+    updateBathyscaphe(elapsed);
     updateLocalBody(delta);
     for (const player of players.values()) updateRemoteDiver(player, delta);
     updateSnowLightUniforms();

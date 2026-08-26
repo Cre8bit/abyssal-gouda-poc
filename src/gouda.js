@@ -1345,9 +1345,15 @@ export async function buildGoudaWorld(scene, onProgress = () => {}, opts = {}) {
   createBlastMarkers(extrasGroup);
   scene.add(extrasGroup);
 
-  // Spawn at the drift's edge with the whole glowing ball in view.
+  // Spawn at the drift's edge with the whole glowing ball in view. The
+  // bathyscaphe berths here with its hatch facing the cheese (-Z), so keep
+  // the doorway's exit corridor clear too, not just the spawn point.
   const p = new THREE.Vector3(0, 18, WORLD_R + 14);
-  while (worldDistance(p.x, p.y, p.z) < 6 && p.z < BOUNDARY_R - 6) p.z += 3;
+  while (
+    (worldDistance(p.x, p.y, p.z) < 6 || worldDistance(p.x, p.y, p.z - 9) < 4) &&
+    p.z < BOUNDARY_R - 6
+  )
+    p.z += 3;
   spawnPoint = p;
 
   onProgress(total, total, "gold");

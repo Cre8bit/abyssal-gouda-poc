@@ -10,6 +10,7 @@
 import { setLook } from "./input.js";
 import { configureFpBody } from "./diverRig.js";
 import { addShotLight } from "./graphics.js";
+import { setBellCount } from "./bathyscaphe.js";
 
 // pitch/yaw in radians. keys = e.code values held for the whole capture.
 // Positions omitted = stay at the world spawn (open water, labyrinth in view).
@@ -26,6 +27,11 @@ const SHOTS = {
   "fp-swim-sprint": { pitch: -0.35, keys: ["KeyW", "ShiftLeft"] },
   // Establishing shot: the glowing gouda system from the drift.
   world: { pitch: 0.05 },
+  // The tin bell berthed at the spawn (default spawn ≈ (0, 18, 434); the
+  // spawn sits at hatch eye height INSIDE it — see bathyscaphe.js), seen
+  // from the gouda side so the hatch doorway + entry beacon are in frame.
+  // &bells=N previews the multi-diver berth row.
+  bell: { x: 10, y: 20, z: 414, yaw: 2.68, pitch: -0.06 },
 };
 
 export function getShotConfig() {
@@ -56,6 +62,7 @@ export function getShotConfig() {
     pitch: num("pitch", base.pitch ?? 0),
     keys: p.get("keys")?.split(",").filter(Boolean) ?? base.keys ?? [],
     light: num("light", 0),
+    bells: num("bells", 0),
     settle: num("settle", 30),
   };
 }
@@ -69,6 +76,7 @@ export function applyShot(cfg, teleport, position) {
   const loader = document.getElementById("loader");
   if (loader) loader.style.display = "none";
   if (cfg.light) addShotLight(cfg.light);
+  if (cfg.bells) setBellCount(cfg.bells); // preview the multi-diver berth row
 
   teleport(cfg.x ?? position.x, cfg.y ?? position.y, cfg.z ?? position.z);
   setLook(cfg.yaw, cfg.pitch);

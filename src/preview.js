@@ -31,6 +31,7 @@ import {
   FP_VIEW,
 } from "./diverRig.js";
 import { toonify } from "./toon.js";
+import { createBellVisual } from "./bathyscaphe.js";
 
 const $ = (id) => document.getElementById(id);
 const BASE = import.meta.env.BASE_URL;
@@ -560,6 +561,47 @@ function buildCatfish(gltf) {
   };
 }
 
+// --- Model: tin bell (bathyscaphe) --------------------------------------------
+// Static prop: the diving bell berthed at the spawn point (T0.4). No clips —
+// the whole builder (scale, hatch flip, cable, cabin lamp + breathing entry
+// beacon) is the game's real bathyscaphe.js code; the bench just lets you
+// orbit it and toggle the parts. The O₂ recharge zone it marks is main.js
+// logic, not part of the model.
+function buildBell(gltf) {
+  const bell = createBellVisual(gltf.scene);
+
+  return {
+    group: bell.group,
+    update(_dt, t) {
+      bell.update(t);
+    },
+    ui(panel) {
+      const parts = section(panel, "Berth");
+      button(parts, "lamp", (b) => {
+        bell.setLamp(!bell.isLampOn());
+        b.classList.toggle("on", bell.isLampOn());
+      }).classList.add("on");
+      button(parts, "cable", (b) => {
+        bell.cable.visible = !bell.cable.visible;
+        b.classList.toggle("on", bell.cable.visible);
+      }).classList.add("on");
+      const note = document.createElement("div");
+      note.className = "hint";
+      note.textContent =
+        "in game divers wake INSIDE the chamber at hatch eye height, facing out the doorway (-Z); one bell is berthed per diver. The beacon pulse is the one licensed non-steady light";
+      panel.appendChild(note);
+    },
+    action() {
+      // Space toggles the lamp — quickest way to judge the wash on the grid.
+      bell.setLamp(!bell.isLampOn());
+    },
+    lines: () => [
+      ["beacon", bell.lamp.intensity.toFixed(0)],
+      ["cabin", bell.cabin.intensity.toFixed(0)],
+    ],
+  };
+}
+
 // --- Registry ----------------------------------------------------------------
 // ⚠ Standing rule: every new game model gets an entry here (see AGENTS.md).
 const MODELS = [
@@ -583,6 +625,13 @@ const MODELS = [
     url: `${BASE}models/catfish_rigged.glb`,
     cam: { dist: 11, height: 1, gridY: -5 },
     build: buildCatfish,
+  },
+  {
+    id: "bell",
+    label: "tin bell",
+    url: `${BASE}models/tinBell.glb`,
+    cam: { dist: 14, height: 4.5, gridY: 0 },
+    build: buildBell,
   },
 ];
 

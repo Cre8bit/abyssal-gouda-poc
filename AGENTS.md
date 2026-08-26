@@ -18,7 +18,7 @@ procedural rigs.
 
 Current entries: rat diver (procedural swim, `diverRig.js`), first-person
 gloves (the local player's FP body), lantern-catfish (baked swim/bite/flicker
-clips + lantern moods).
+clips + lantern moods), tin bell (the bathyscaphe prop, `bathyscaphe.js`).
 
 ### Capturing the bench headlessly
 
