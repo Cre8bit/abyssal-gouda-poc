@@ -18,16 +18,33 @@ const STATUS = path.join(SHOTS, "status.json");
 const CHROME =
   process.env.CHROME_PATH ??
   "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
-const BASE = process.env.SHOT_URL ?? "http://localhost:5173";
 const SIZE = process.env.SHOT_SIZE ?? "1440,810";
 const BUDGET = 6000; // ms of page time Chrome runs before it grabs the frame
 const POLL = 1000;
+
+// Vite steps to the next free port when another project already holds 5173, so
+// a fixed guess can quietly screenshot somebody else's app instead — which looks
+// exactly like a successful run. Find the port serving THIS game.
+const MARKER = 'id="scene-container"';
+async function findGame() {
+  if (process.env.SHOT_URL) return process.env.SHOT_URL;
+  for (let port = 5173; port <= 5180; port++) {
+    const base = `http://localhost:${port}`;
+    try {
+      const html = await fetch(base, { signal: AbortSignal.timeout(1200) }).then((r) => r.text());
+      if (html.includes(MARKER)) return base;
+    } catch {
+      /* nothing listening there */
+    }
+  }
+  return null;
+}
 
 // Lines worth handing back: page errors, and anything about shaders or GL.
 const INTERESTING =
   /CONSOLE|Uncaught|Unhandled|THREE\.|shader|GL ERROR|ERR_CONNECTION|net::/i;
 
-function capture(name, file) {
+function capture(name, base, file) {
   return new Promise((resolve) => {
     const proc = spawn(CHROME, [
       "--headless=new",
@@ -40,7 +57,7 @@ function capture(name, file) {
       `--window-size=${SIZE}`,
       `--virtual-time-budget=${BUDGET}`,
       `--screenshot=${file}`,
-      `${BASE}/?shot=${encodeURIComponent(name)}`,
+      `${base}/?shot=${encodeURIComponent(name)}`,
     ]);
     let err = "";
     proc.stderr.on("data", (d) => (err += d));
@@ -67,7 +84,7 @@ if (!existsSync(CHROME)) {
   process.exit(1);
 }
 
-console.log(`runner ready · ${BASE} · waiting for shots/request.json`);
+console.log(`runner ready · waiting for shots/request.json`);
 console.log("Ctrl+C to stop.\n");
 
 for (;;) {
@@ -83,15 +100,25 @@ for (;;) {
     await rm(REQUEST, { force: true });
 
     run++;
-    await writeStatus({ run, state: "capturing", shots });
-    console.log(`run ${run}: ${shots.join(", ")}`);
+    const base = await findGame();
+    if (!base) {
+      await writeStatus({
+        run,
+        state: "done",
+        error: "no dev server on 5173-5180 is serving this game — is `npm run dev` up?",
+      });
+      console.log(`run ${run}: no game found\n`);
+      continue;
+    }
+    await writeStatus({ run, state: "capturing", base, shots });
+    console.log(`run ${run} · ${base}: ${shots.join(", ")}`);
 
     const files = [];
     const logs = [];
     for (const name of shots) {
       const file = path.join(SHOTS, `${name}.png`);
       await rm(file, { force: true });
-      const stderr = await capture(name, file);
+      const stderr = await capture(name, base, file);
       const ok = existsSync(file);
       files.push({ name, file: path.relative(ROOT, file), ok });
       // On success, keep only the interesting lines. On failure, hand back the

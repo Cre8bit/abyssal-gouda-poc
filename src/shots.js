@@ -7,6 +7,11 @@ import { biolumeFor, FIELD_RADIUS } from "./biolume.js";
 
 // Offsets are relative to the bell, which always sits at x=0, z=0 at its
 // level's depth — so one entry works at any level.
+//
+// Shared vantage for the fix-map shots: the diver hovers on their own shell,
+// clear of every beacon below, looking out into open water.
+const FIX_VIEW = { level: 1, off: [70, 0, 70], yaw: 2.4, pitch: 0, hud: true };
+
 const VIEWS = {
   "bell-close": { level: 1, off: [0, 3, 14], yaw: 0, pitch: -0.06 },
   "bell-far": { level: 1, off: [0, 8, 58], yaw: 0, pitch: -0.1 },
@@ -58,6 +63,22 @@ const VIEWS = {
   "maw-lunge": {
     level: 2, off: [30, 4, 30], yaw: 2.4, pitch: 0,
     angler: "lunge", anglerDist: 26,
+  },
+  // The Chorus, one rung per shot. `beacons` are offsets from the bell, each a
+  // legal plant (about 100 m out, more than 50 m apart); the diver stands on
+  // their own shell so the panel shows the ready state. HUD on, since the fix
+  // map IS the subject.
+  "fix-shell": { ...FIX_VIEW, beacons: [[100, 0, 0]] },
+  "fix-ring": { ...FIX_VIEW, beacons: [[100, 0, 0], [0, 0, 100]] },
+  "fix-twins": { ...FIX_VIEW, beacons: [[100, 0, 0], [0, 0, 100], [0, 100, 0]] },
+  "fix-lock": {
+    ...FIX_VIEW,
+    beacons: [[100, 0, 0], [0, 0, 100], [0, 100, 0], [-58, -58, -58]],
+  },
+  // Four beacons all at one depth: the layout that cannot resolve the mirror.
+  "fix-flat": {
+    ...FIX_VIEW,
+    beacons: [[92, 40, 0], [0, 40, 92], [-92, 40, 0], [0, 40, -92]],
   },
 };
 
@@ -130,6 +151,8 @@ export function getShot() {
     wake: view.wake === true,
     current: view.current === true,
     creature: view.creature === true,
+    hud: view.hud === true,
+    beacons: view.beacons ?? null,
   };
 }
 

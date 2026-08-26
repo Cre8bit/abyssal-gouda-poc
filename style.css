@@ -215,10 +215,18 @@ button:active {
   opacity: 0.8;
 }
 
-/* The Chorus: triangulation readout, tucked under the bell radar. */
-#triangulation {
+/* The Chorus: the fix map, then its readout, stacked under the bell radar. */
+#fix-map {
   position: absolute;
   top: 14.3rem;
+  right: 1.5rem;
+  opacity: 0.92;
+  border-radius: 5px;
+}
+
+#triangulation {
+  position: absolute;
+  top: 24.6rem;
   right: 1.5rem;
   width: 9.6rem;
   padding: 0.5rem 0.6rem;
@@ -227,6 +235,12 @@ button:active {
   border-radius: 5px;
   font-size: 0.7rem;
   letter-spacing: 0.06em;
+}
+
+/* On the shell: the one moment a beacon will take. */
+#triangulation[data-ready="1"] {
+  border-color: rgba(98, 255, 208, 0.75);
+  box-shadow: 0 0 12px rgba(98, 255, 208, 0.25);
 }
 
 #tri-head {

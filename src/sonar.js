@@ -505,6 +505,22 @@ export function playAntenna() {
   }
 }
 
+// The shell chime: the antenna's entire vocabulary. Not a range, not a
+// direction — just "the bell is on your shell, plant it here". Two clean fifths
+// so it cannot be mistaken for the bell's own amber ping or the lure's copy.
+export function playShellChime(strong = false) {
+  if (!ctx) return;
+  const at = ctx.currentTime;
+  for (const [delay, freq] of strong ? [[0, 784], [0.11, 1176]] : [[0, 784]]) {
+    const osc = ctx.createOscillator();
+    osc.type = "sine";
+    osc.frequency.value = freq;
+    osc.connect(envelope(at + delay, strong ? 0.26 : 0.12, 0.004, 0.22)).connect(master);
+    osc.start(at + delay);
+    osc.stop(at + delay + 0.3);
+  }
+}
+
 // Climbing a rung — SHELL → RING → TWINS → LOCK. A chord whose voices and
 // brightness grow with the stage, so the crew *hears* the fix sharpen: one
 // note for a shell, a full shining triad the instant it locks.

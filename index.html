@@ -47,15 +47,21 @@
       <canvas id="compass" width="420" height="26"></canvas>
       <canvas id="minimap" width="104" height="104" title="Teammates"></canvas>
       <canvas id="bell-radar" width="104" height="104" title="Bell"></canvas>
-      <!-- The Chorus: range-only triangulation of the bell -->
-      <div id="triangulation" title="Triangulation (T to sound the antenna)">
+      <!-- The Chorus: what the planted beacons have narrowed the bell down to -->
+      <canvas
+        id="fix-map"
+        width="152"
+        height="152"
+        title="Fix map — where the bell can still be"
+      ></canvas>
+      <div id="triangulation" title="Beacons (T to plant one on the shell chime)">
         <div id="tri-head">
           <span id="tri-label">◎ CHORUS</span>
           <span id="tri-count">0 ✦</span>
         </div>
-        <div id="tri-stage" data-stage="0">NO SIGNAL</div>
+        <div id="tri-stage" data-stage="0">NO FIX</div>
         <div id="tri-quality"><div id="tri-quality-fill"></div></div>
-        <div id="tri-hint">T — take a reading.</div>
+        <div id="tri-hint">Swim until the antenna chimes.</div>
       </div>
       <div id="oxygen">
         <span id="oxygen-text">O₂ 180s</span>
@@ -80,9 +86,9 @@
         <button id="join-btn">Join Game</button>
         <p class="hint">
           Click the scene to look around · ZQSD/WASD to swim<br />Space rise ·
-          Ctrl sink · Shift sprint · F flashlight · V mute<br />G flare · T
-          antenna reading (triangulate the bell) · E hook on / release<br />R
-          restart · Esc to release the mouse
+          Ctrl sink · Shift sprint · F flashlight · V mute<br />G flare · T plant
+          a beacon (when the antenna chimes) · E hook on / release<br />R restart
+          · Esc to release the mouse
         </p>
       </div>
 

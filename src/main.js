@@ -29,17 +29,21 @@ import {
   clearResonance,
 } from "./graphics.js";
 import {
-  measureRange,
-  addReading,
-  clearReadings,
-  baselineOK,
-  getReadings,
-  readingCount,
+  clearBeacons,
+  getBeacons,
+  beaconCount,
+  placeBeacon,
+  onShell,
+  shellOffset,
+  separationOK,
+  distToNearest,
   solve,
-  nextSeq,
   STAGE_NAME,
-  READING_COOLDOWN,
+  BEACON_RANGE,
+  MIN_SEPARATION,
+  MAX_BEACONS,
 } from "./triangulation.js";
+import { initFixMap, drawFixMap } from "./fixmap.js";
 import {
   hostGame,
   joinGame,
@@ -96,6 +100,7 @@ import {
   playMawRoar,
   playSwallow,
   playAntenna,
+  playShellChime,
   playFix,
 } from "./sonar.js";
 import {
@@ -147,6 +152,8 @@ const triStage = document.getElementById("tri-stage");
 const triQualityFill = document.getElementById("tri-quality-fill");
 const triCount = document.getElementById("tri-count");
 const triHint = document.getElementById("tri-hint");
+const triangulationPanel = document.getElementById("triangulation");
+initFixMap(document.getElementById("fix-map"));
 
 const localPosition = { x: 0, y: 2, z: 8 };
 const velocity = { x: 0, y: 0, z: 0 };
@@ -161,8 +168,9 @@ let settleTimer = -1; // counts down between the bell's stop and the ejection
 let alarmTimer = ALARM_PERIOD;
 let creakTimer = 12;
 let flareCooldown = 0; // the flare is the one thing that buys you a look
-let readingCooldown = 0; // the antenna needs a beat to recharge between reads
-let triStageSeen = 0; // last fix rung, to chime only when the crew climbs one
+let onShellNow = false; // is the bell on my shell this frame?
+let chimeTimer = 0; // paces the shell chime while you hold the band
+let triStageSeen = 0; // last fix rung, to chime only when the diver climbs one
 const currentNoise = new ImprovedNoise();
 const drift = { x: 0, y: 0, z: 0 }; // push from whatever current has hold of you
 let inCurrent = false;
@@ -200,6 +208,14 @@ if (shot) {
   localPosition.z = shot.z;
   setLook(shot.yaw, shot.pitch);
   if (!shot.torch) flashlightOn = toggleFlashlight();
+  // The fix map only has anything to show once beacons exist, so a shot can
+  // plant them: offsets from the bell, with the range the antenna would have
+  // heard there. The HUD stays hidden unless the shot is about the HUD.
+  for (const off of shot.beacons ?? []) {
+    const at = { x: off[0], y: getBell().y + off[1], z: off[2] };
+    placeBeacon(at, Math.hypot(off[0], off[1], off[2]));
+  }
+  if (shot.hud) hud.classList.remove("hidden");
   setFixedStep(true);
 }
 let shotFrame = 0;
@@ -313,7 +329,7 @@ window.addEventListener("keydown", (e) => {
   } else if (e.code === "KeyG") {
     throwFlare();
   } else if (e.code === "KeyT") {
-    takeReading();
+    plantBeacon();
   } else if (e.code === "KeyE") {
     if (!eaten) toggleAttach();
   } else if (e.code === "KeyR") {
@@ -341,45 +357,43 @@ function throwFlare() {
   showEvent("✷ Flare away.");
 }
 
-// --- The Chorus: the antenna reading ---------------------------------------
+// --- The Chorus: planting a beacon -----------------------------------------
 //
-// One press, one sphere. The antenna hears how FAR the bell is, never which
-// way — so a single reading is a whole sphere of maybe, and the only way to a
-// point is more spheres, taken from places far enough apart to disagree. A
-// lone diver swims the baseline; a crew fans out and gets there four times as
-// fast. Either way it is a choice against the oxygen clock, never a chore.
-function takeReading() {
+// The antenna will not tell you how far the bell is or which way it lies. It
+// chimes, and only when the bell is exactly on your own 100 m shell. Plant a
+// beacon on that chime and you have pinned one fact; plant four of them far
+// enough apart and the facts cross at one point. So the work is swimming — out
+// to the shell, then along it — against the oxygen clock, and every beacon is a
+// place you chose to be rather than a button you pressed.
+function plantBeacon() {
   if (eaten) return;
   if (attached) {
-    showEvent("Antenna stows while you ride the bell — release to sound.");
+    showEvent("The antenna stows while you ride the bell — release to plant.");
     return;
   }
-  if (readingCooldown > 0) {
-    showEvent(`Antenna recharging — ${readingCooldown.toFixed(1)}s`);
+  if (beaconCount() >= MAX_BEACONS) {
+    showEvent("✦ Beacon belt empty.");
     return;
   }
-  if (!baselineOK(myId(), localPosition)) {
-    showEvent("≈ Too close to your last reading — swim wide for a new angle.");
+  const range = distanceToBell(localPosition);
+  if (!onShell(range)) {
+    // Never name the range: the chime is the only thing the antenna reports.
+    showEvent(
+      shellOffset(range) > 0
+        ? "≈ Silence — the bell lies beyond your shell. Swim towards it."
+        : "≈ Silence — the bell lies inside your shell. Swim away from it.",
+    );
     return;
   }
-  const bell = getBell();
-  const r = measureRange(localPosition, { x: 0, y: bell.y, z: 0 }, bell.level);
-  const reading = {
-    id: myId(),
-    x: localPosition.x,
-    y: localPosition.y,
-    z: localPosition.z,
-    r,
-    seq: nextSeq(),
-  };
-  addReading(reading);
-  readingCooldown = READING_COOLDOWN;
+  if (!separationOK(localPosition)) {
+    showEvent(
+      `✦ Too near your beacon at ${Math.round(distToNearest(localPosition))} m — carry it ${MIN_SEPARATION} m along the shell.`,
+    );
+    return;
+  }
+  placeBeacon(localPosition, range);
   playAntenna();
-  // A client's reading only reaches the host; the host fans it out to everyone
-  // (and back to the author, where the seq dedupe drops it) so all windows
-  // fuse the identical set of spheres.
-  sendEvent({ kind: "reading", ...reading });
-  showEvent(`◎ Reading taken — ${Math.round(r)} m to the bell. Share it.`);
+  showEvent(`✦ Beacon ${beaconCount()} planted.`);
 }
 
 function broadcastNow() {
@@ -434,10 +448,10 @@ function restart() {
   eaten = false;
   eatenTimer = 0;
   despawnAngler();
-  clearReadings();
+  clearBeacons();
   clearResonance();
   triStageSeen = 0;
-  readingCooldown = 0;
+  onShellNow = false;
   for (const peerId of remoteAttached.keys()) remoteAttached.set(peerId, true);
   for (const peerId of remoteEaten.keys()) remoteEaten.set(peerId, false);
   for (const buffer of remoteBuffers.values()) buffer.reset();
@@ -587,12 +601,8 @@ onEventReceived((peerId, data) => {
   if (data.kind === "drop") {
     startDrop(data.level);
     playDescent(DROP_DURATION);
-    clearReadings(); // the bell has moved — every old sphere is a lie now
+    clearBeacons(); // the bell has moved — every planted beacon is a lie now
     showEvent(`▼ The bell drops to level ${data.level}…`);
-  } else if (data.kind === "reading") {
-    // A peer sounded their antenna. Fuse it, and if we're the host, relay it
-    // on to the rest of the crew (the author gets it back but dedupes it).
-    if (addReading(data) && isHost) sendEvent(data);
   } else if (data.kind === "sync") {
     snapToLevel(data.level);
     attached = true;
@@ -669,7 +679,7 @@ renderLoop((delta) => {
     const level = bell.level + 1;
     startDrop(level);
     playDescent(DROP_DURATION);
-    clearReadings(); // the bell has moved — every old sphere is a lie now
+    clearBeacons(); // the bell has moved — every planted beacon is a lie now
     sendEvent({ kind: "drop", level });
     showEvent(`▼ The bell drops to level ${level}…`);
   }
@@ -831,7 +841,6 @@ renderLoop((delta) => {
   if (!shot) updateCurrent(delta, localPosition, currentNoise);
   if (shot?.current) updateCurrent(0, localPosition, currentNoise);
   if (flareCooldown > 0) flareCooldown = Math.max(0, flareCooldown - delta);
-  if (readingCooldown > 0) readingCooldown = Math.max(0, readingCooldown - delta);
   creakTimer -= shot ? 0 : delta;
   if (creakTimer <= 0) {
     creakTimer = 9 + Math.random() * 22;
@@ -862,11 +871,31 @@ renderLoop((delta) => {
     }
   }
 
-  // 11.5 The Chorus: fuse every anchored reading into the crew's current fix,
-  //      give it a body in the water, and chime whenever a new rung is reached.
+  // 11.5 The Chorus: sound the shell you are standing on, then carve the beacons
+  //      already planted down to a shape and give that shape a body.
+  //
+  // The chime is the antenna's whole vocabulary, so it has to be unmistakable:
+  // silence everywhere off the shell, a double note the instant you cross into
+  // the band, and a single note holding under you while you stay in it — a diver
+  // who looks away from the HUD must still hear that they can plant.
+  const wasOnShell = onShellNow;
+  onShellNow = !attached && !eaten && onShell(bellDist);
+  if (!shot) {
+    if (onShellNow && !wasOnShell) {
+      playShellChime(true);
+      chimeTimer = SHELL_CHIME_PERIOD;
+    } else if (onShellNow) {
+      chimeTimer -= delta;
+      if (chimeTimer <= 0) {
+        chimeTimer = SHELL_CHIME_PERIOD;
+        playShellChime(false);
+      }
+    }
+  }
+
   const fix = solve();
   setResonance(fix);
-  setResonanceBuoys(getReadings());
+  setResonanceBuoys(getBeacons());
   if (fix.stage > triStageSeen) {
     playFix(fix.stage);
     showEvent(STAGE_TOAST[fix.stage], 3000);
@@ -878,6 +907,7 @@ renderLoop((delta) => {
   drawCompass(yaw);
   drawMinimap(yaw);
   drawBellRadar(yaw, bellDist);
+  drawFixMap({ fix, beacons: getBeacons(), player: localPosition, yaw });
 
   const o2 = oxygen / O2_SECONDS;
   oxygenFill.style.width = `${(o2 * 100).toFixed(1)}%`;
@@ -1073,39 +1103,50 @@ function showEvent(text, duration = 2200) {
   }, duration);
 }
 
-// What each rung of the fix feels like, called out the moment the crew reaches
-// it — the granularity of the knowledge, narrated.
+// What each rung of the fix means, called out the moment the diver reaches it —
+// the granularity of the knowledge, narrated.
 const STAGE_TOAST = {
   1: "◎ SHELL — the bell is somewhere on this sphere.",
-  2: "◎ RING — two soundings agree: swim the glowing hoop.",
+  2: "◎ RING — two beacons agree: it lies on this hoop.",
   3: "◎ TWINS — two candidates now. One of them is a ghost.",
   4: "◉ LOCK — the bell has an address. Follow the beam.",
 };
+
+const SHELL_CHIME_PERIOD = 1.1; // seconds between held chimes inside the band
 
 function updateTriangulationHud(fix) {
   if (!triStage) return;
   triStage.textContent = STAGE_NAME[fix.stage];
   triStage.dataset.stage = String(fix.stage);
-  triCount.textContent = `${readingCount()} ✦`;
+  triCount.textContent = `${beaconCount()} ✦`;
 
   const q = Math.round((fix.quality ?? 0) * 100);
   triQualityFill.style.width = `${q}%`;
   triQualityFill.style.background =
     q > 66 ? "#62ffd0" : q > 33 ? "#ffe08a" : "#ff8a6a";
 
+  // Exactly one gate can block the next beacon, so name that one and nothing
+  // else — a diver reading three conditions at once reads none of them.
+  const ready = onShellNow && separationOK(localPosition) && beaconCount() < MAX_BEACONS;
+  triangulationPanel.dataset.ready = ready ? "1" : "0";
+
   let hint;
   if (eaten) {
     hint = "Antenna dark — swallowed.";
   } else if (attached) {
-    hint = "Release (E) to sound the antenna.";
-  } else if (readingCooldown > 0) {
-    hint = `Recharging… ${readingCooldown.toFixed(1)}s`;
-  } else if (!baselineOK(myId(), localPosition)) {
-    hint = "Swim wide for a new angle, then T.";
-  } else if (fix.stage >= 4) {
-    hint = "Locked — T to sharpen, or follow the beam.";
+    hint = "Release (E) to unstow the antenna.";
+  } else if (beaconCount() >= MAX_BEACONS) {
+    hint = "Belt empty — follow what you have.";
+  } else if (ready) {
+    hint = `T — plant beacon ${beaconCount() + 1}.`;
+  } else if (onShellNow) {
+    hint = `On the shell, too near beacon ${beaconCount()} — carry it ${MIN_SEPARATION} m along.`;
+  } else if (fix.stage === 3 && fix.flat) {
+    hint = "Every beacon at one depth — take the next one higher or lower.";
+  } else if (shellOffset(distanceToBell(localPosition)) > 0) {
+    hint = `Silence — the bell is beyond your ${BEACON_RANGE} m shell. Close in.`;
   } else {
-    hint = "T — take a reading.";
+    hint = `Silence — the bell is inside your ${BEACON_RANGE} m shell. Back off.`;
   }
   triHint.textContent = hint;
 }

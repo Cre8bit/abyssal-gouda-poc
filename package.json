@@ -8,7 +8,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "runner": "node tools/runner.mjs",
-    "angler": "node tools/angler-harness.mjs"
+    "angler": "node tools/angler-harness.mjs",
+    "chorus": "node tools/chorus-harness.mjs"
   },
   "dependencies": {
     "peerjs": "^1.5.4",
