@@ -24,7 +24,12 @@
 // RESILIENCE — per-peer ping/pong over the events channel measures RTT
 // (exposed via getRtt/getWorstRtt) and doubles as a keep-alive.
 import Peer from "peerjs";
-import { encodeState, decodeState, seqNewer } from "./protocol.js";
+import {
+  encodeState,
+  decodeState,
+  seqNewer,
+  STATE_PACKET_BYTES,
+} from "./protocol.js";
 
 const STATE_CHANNEL_ID = 99; // negotiated id — clear of PeerJS's own channel
 const PING_INTERVAL_MS = 2000;
@@ -285,6 +290,12 @@ function dropPeer(peerId) {
   try {
     rec.state?.close();
   } catch {}
+  // Close the DataConnection too (idempotent if we got here from its own
+  // close/error event) — this releases the underlying RTCPeerConnection
+  // instead of leaving a half-dead pair holding sockets and ICE candidates.
+  try {
+    rec.conn.close();
+  } catch {}
   peers.delete(peerId);
   callbacks.onPeerDisconnected?.(peerId);
 }
@@ -349,10 +360,22 @@ function attachStateChannel(rec) {
 
 // --- State packet intake (codec lives in protocol.js) -----------------------
 
+let badPacketWarned = false;
 function handleStatePacket(peerId, data) {
   const rec = peers.get(peerId);
+  if (!rec) return;
   const s = decodeState(data);
-  if (!rec || !s) return;
+  if (!s) {
+    // Otherwise a protocol-version mismatch is a SILENT desync: every state
+    // packet dropped, remote divers frozen, no error anywhere.
+    if (!badPacketWarned) {
+      badPacketWarned = true;
+      console.warn(
+        `[net] dropping undecodable state packets from ${peerId.slice(0, 6)} — protocol version mismatch? Both players should reload to the latest build.`,
+      );
+    }
+    return;
+  }
   if (rec.seqIn >= 0 && !seqNewer(s.seq, rec.seqIn)) return; // stale — drop
   rec.seqIn = s.seq;
   callbacks.onStateReceived?.(peerId, s);
@@ -366,10 +389,13 @@ function rawSend(rec, payload) {
 
 // Broadcast the local pose + flags to every peer, over the unreliable
 // channel when up (reliable fallback otherwise). ~24 bytes × peers × 30 Hz.
+// One scratch buffer, reused every tick: channel .send() copies the bytes
+// synchronously, so nothing downstream holds a reference to it.
+const stateScratch = new ArrayBuffer(STATE_PACKET_BYTES);
 export function broadcastState(s) {
   if (peers.size === 0) return;
   seqOut = (seqOut + 1) & 0xffff;
-  const packet = encodeState(s, seqOut);
+  const packet = encodeState(s, seqOut, stateScratch);
   for (const rec of peers.values()) {
     if (rec.state?.readyState === "open") {
       try {

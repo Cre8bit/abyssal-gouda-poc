@@ -605,6 +605,7 @@ function meshChunk(c, res, material) {
 
 // Re-runs marching cubes for one chunk from its cached (dug) field.
 function remeshChunk(c) {
+  if (!c.mesh || !c.field) return; // chunk never finished building
   const mc = getMC(c.res);
   mc.reset();
   mc.isolation = 0;
@@ -1432,6 +1433,9 @@ export function resolveCollision(pos, radius) {
   let normal = null;
   for (let iter = 0; iter < 2; iter++) {
     const d = worldDistance(pos.x, pos.y, pos.z);
+    // A NaN here (degenerate SDF sample) would silently poison pos and
+    // teleport/trap the player — bail and keep last frame's position.
+    if (!Number.isFinite(d)) break;
     if (d >= radius) break;
     let nx =
       worldDistance(pos.x + GRAD_EPS, pos.y, pos.z) -

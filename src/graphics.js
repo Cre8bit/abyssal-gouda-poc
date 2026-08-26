@@ -121,7 +121,12 @@ function loadDiverTemplate() {
       toonify(gltf.scene); // cel-shaded diver, same maps
       return prepareDiverTemplate(gltf);
     })
-    .catch(() => null);
+    .catch((err) => {
+      // Degrade loudly, not silently: remote divers keep their placeholder
+      // capsule, the local FP gloves just never appear.
+      console.warn("diver model failed to load — using placeholders", err);
+      return null;
+    });
   return diverTemplatePromise;
 }
 
@@ -978,13 +983,14 @@ function updateBreath(delta) {
 }
 
 // Slow-changing current direction (Perlin-driven), with occasional gusts.
+// Returns a reused scratch object — called once per frame from renderLoop.
+const _drift = { x: 0, z: 0 };
 function currentDrift() {
   const gust =
     Math.pow(Math.max(0, noise.noise(elapsed * 0.07, 5.5, 0)), 2) * 3;
-  return {
-    x: noise.noise(elapsed * 0.04, 11.3, 0) * (0.6 + gust),
-    z: noise.noise(elapsed * 0.04, 29.1, 0) * (0.6 + gust),
-  };
+  _drift.x = noise.noise(elapsed * 0.04, 11.3, 0) * (0.6 + gust);
+  _drift.z = noise.noise(elapsed * 0.04, 29.1, 0) * (0.6 + gust);
+  return _drift;
 }
 
 function wrapAroundCamera(points, radius, fall, delta, drift) {
@@ -1189,7 +1195,17 @@ export function removePlayer(id) {
     scene.remove(obj);
     obj.traverse((child) => {
       child.geometry?.dispose();
-      if (child.material?.dispose) child.material.dispose();
+      if (child.material?.dispose) {
+        child.material.dispose();
+        // The volumetric beam registered its material for the shared uTime
+        // update — unregister, or the render loop feeds disposed materials
+        // forever (and the array grows with every join).
+        const bi = beamMaterials.indexOf(child.material);
+        if (bi !== -1) beamMaterials.splice(bi, 1);
+      }
+      // Lights own GPU-side shadow maps (the spot's 512² depth target) that
+      // material/geometry disposal doesn't touch.
+      if (child.isLight) child.dispose();
     });
   }
   players.delete(id);

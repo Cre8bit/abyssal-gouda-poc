@@ -25,7 +25,6 @@ let brownBuffer = null; // 2 s of brown noise — the low rumble bed
 
 let breathTimer = 0;
 let breathPeriod = 5.2;
-let breathPhase = 0; // counts up; exhale fires at each cycle start
 let creakTimer = 8; // first creak comes early — set the tone
 let ghostTimer = 6; // sparse tonal swells replace any constant drone note
 let bedTime = 0;
@@ -230,9 +229,8 @@ function tone({
     g.connect(send);
     send.connect(reverbSend);
   }
-  let lfo = null;
   if (vibrato > 0) {
-    lfo = ctx.createOscillator();
+    const lfo = ctx.createOscillator();
     lfo.frequency.value = 3.3;
     const lg = ctx.createGain();
     lg.gain.value = vibrato;
@@ -486,7 +484,6 @@ export function updateAbyssAudio(delta, { speed = 0, radius = 420, sprinting = f
   breathTimer += delta;
   if (breathTimer >= breathPeriod) {
     breathTimer = 0;
-    breathPhase++;
     exhale(effortSm);
     // Inhale comes just after the exhale settles.
     const eff = effortSm;

@@ -139,6 +139,23 @@ export function createBellVisual(bellScene) {
     lamp: beacon.light,
     cabin,
     cable,
+    // Frees only what THIS bell created: cable, bulbs, halos, lights. The
+    // GLB clone shares geometry/materials with the loaded template (reused
+    // by the next bell) and the halo map is the shared cached glow texture —
+    // neither is disposed here.
+    dispose() {
+      cable.geometry.dispose();
+      cable.material.dispose();
+      cabin.dispose();
+      cabinBulb.geometry.dispose();
+      cabinBulb.material.dispose();
+      for (const b of [beacon, sill]) {
+        b.light.dispose();
+        b.bulb.geometry.dispose();
+        b.bulb.material.dispose();
+        b.halo.material.dispose();
+      }
+    },
     update(t) {
       const pulse = lampOn ? 0.82 + 0.18 * Math.sin(t * PULSE_RATE) : 0;
       for (const b of [beacon, sill]) {
@@ -181,7 +198,9 @@ function syncBells() {
     gameScene.add(bells[bells.length - 1].group);
   }
   while (bells.length > wantCount) {
-    gameScene.remove(bells.pop().group);
+    const bell = bells.pop();
+    gameScene.remove(bell.group);
+    bell.dispose();
   }
   berthAll();
 }

@@ -9,7 +9,7 @@ let localStream = null;
 let muted = false;
 let statusCb = null;
 
-const remoteVoices = new Map(); // peerId -> { panner, el, call }
+const remoteVoices = new Map(); // peerId -> { source, panner, el, call }
 const pendingCalls = new Set(); // peerIds we are currently dialing
 
 export function onVoiceStatus(fn) {
@@ -110,13 +110,17 @@ function setupSpatialAudio(peerId, stream, call = null) {
   source.connect(panner);
   panner.connect(audioCtx.destination);
 
-  remoteVoices.set(peerId, { panner, el, call });
+  remoteVoices.set(peerId, { source, panner, el, call });
 }
 
 function teardown(peerId) {
   const voice = remoteVoices.get(peerId);
   if (!voice) return;
+  // Unwind the whole per-peer audio chain: a still-connected source keeps
+  // the panner (and the remote MediaStream) alive across joins/leaves.
+  voice.source.disconnect();
   voice.panner.disconnect();
+  voice.el.pause();
   voice.el.srcObject = null;
   remoteVoices.delete(peerId);
   // Only report silence when the LAST voice is gone (mesh: several peers).

@@ -33,7 +33,15 @@ let swimYaw = 0;
 let swimPitch = 0;
 let yawVelocity = 0; // smoothed, for camera banking into turns
 
+// Idempotent: a second init (e.g. a future lobby → game → lobby flow) must
+// not stack a second set of listeners — keys would register twice and mouse
+// deltas would apply twice.
+let inputInstalled = false;
+let mouseLookInstalled = false;
+
 export function initInput() {
+  if (inputInstalled) return;
+  inputInstalled = true;
   window.addEventListener("keydown", (e) => {
     const dir = KEY_MAP[e.code];
     if (dir) {
@@ -50,6 +58,8 @@ export function initInput() {
 }
 
 export function initMouseLook(canvas) {
+  if (mouseLookInstalled) return;
+  mouseLookInstalled = true;
   canvas.addEventListener("click", () => canvas.requestPointerLock());
 
   document.addEventListener("mousemove", (e) => {
@@ -130,6 +140,9 @@ export function isPointerLocked(canvas) {
 
 // Normalized movement intent for this frame:
 // { x: strafe right, y: up, z: forward }, each in [-1, 1].
+// Returns a REUSED scratch object (called every frame — don't keep it
+// across frames, read it before the next call).
+const _move = { x: 0, y: 0, z: 0 };
 export function getMovement() {
   let x = 0;
   let y = 0;
@@ -150,7 +163,10 @@ export function getMovement() {
     z /= len;
   }
 
-  return { x, y, z };
+  _move.x = x;
+  _move.y = y;
+  _move.z = z;
+  return _move;
 }
 
 function clamp(v, min, max) {

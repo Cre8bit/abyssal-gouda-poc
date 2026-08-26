@@ -305,12 +305,16 @@ async function join(hostId, mode = null) {
 }
 
 // initVoice needs the Peer object, which only exists after joinGame() starts
-// creating it — but incoming calls can race us. Poll briefly until it's up.
+// creating it — but incoming calls can race us. Poll briefly until it's up,
+// with a cap: if the join failed, the peer never appears and an uncapped
+// poll would spin forever.
 function initVoiceEarly() {
+  let tries = 0;
   const tryInit = () => {
     const p = getPeer();
     if (p) initVoice(p);
-    else setTimeout(tryInit, 200);
+    else if (++tries < 50) setTimeout(tryInit, 200);
+    else console.warn("voice: peer never came up — voice stays off");
   };
   tryInit();
 }
@@ -416,19 +420,34 @@ function teleportLocal(x, y, z) {
 // Immediate state broadcast — used on discrete changes (light toggled,
 // status flag flipped, teleport) so peers see them well under 100 ms
 // instead of waiting for the next 30 Hz tick.
+// One reused state object: broadcastState() encodes it synchronously, and
+// this runs 30×/s — no need to allocate a fresh literal every tick.
+const netState = {
+  x: 0,
+  y: 0,
+  z: 0,
+  yaw: 0,
+  pitch: 0,
+  sy: 0,
+  sp: 0,
+  light: true,
+  status: 0,
+};
+function fillNetState() {
+  netState.x = localPosition.x;
+  netState.y = localPosition.y;
+  netState.z = localPosition.z;
+  netState.yaw = getYaw();
+  netState.pitch = getPitch();
+  netState.sy = getSwimYaw();
+  netState.sp = getSwimPitch();
+  netState.light = flashlightOn;
+  netState.status = getLocalStatus();
+  return netState;
+}
 function broadcastNow() {
   if (!isConnected()) return;
-  broadcastState({
-    x: localPosition.x,
-    y: localPosition.y,
-    z: localPosition.z,
-    yaw: getYaw(),
-    pitch: getPitch(),
-    sy: getSwimYaw(),
-    sp: getSwimPitch(),
-    light: flashlightOn,
-    status: getLocalStatus(),
-  });
+  broadcastState(fillNetState());
 }
 
 // Any local status change (trapped, poisoned…) ships instantly (T0.2 AC).
@@ -531,6 +550,12 @@ onVoiceStatus((state) => {
 });
 
 // --- Game loop ---
+// Scratch objects for the per-frame math below — the loop must not allocate.
+const ZERO_MOVE = Object.freeze({ x: 0, y: 0, z: 0 });
+const _fwd = { x: 0, y: 0, z: 0 };
+const _right = { x: 0, z: 0 };
+const _target = { x: 0, y: 0, z: 0 };
+const remotePosPool = []; // backing objects for remotePositions, by index
 renderLoop((delta) => {
   if (!worldReady) return; // still carving the labyrinth
 
@@ -546,29 +571,26 @@ renderLoop((delta) => {
   // The body trails the head, so glancing around mid-swim doesn't zigzag
   // your trajectory; hold a direction and the body settles onto it.
   // A blacked-out diver drifts, limp — no propulsion.
-  const move = isDead() ? { x: 0, y: 0, z: 0 } : getMovement();
+  const move = isDead() ? ZERO_MOVE : getMovement();
   const swimYaw = getSwimYaw();
   const swimPitch = getSwimPitch();
   const cosP = Math.cos(swimPitch);
-  const fwd = {
-    x: -Math.sin(swimYaw) * cosP,
-    y: Math.sin(swimPitch),
-    z: -Math.cos(swimYaw) * cosP,
-  };
-  const right = { x: Math.cos(swimYaw), z: -Math.sin(swimYaw) };
+  _fwd.x = -Math.sin(swimYaw) * cosP;
+  _fwd.y = Math.sin(swimPitch);
+  _fwd.z = -Math.cos(swimYaw) * cosP;
+  _right.x = Math.cos(swimYaw);
+  _right.z = -Math.sin(swimYaw);
 
   const speedCap = MAX_SPEED * (isSprinting() ? SPRINT_MULT : 1);
-  const target = {
-    x: (fwd.x * move.z + right.x * move.x) * speedCap,
-    y: (fwd.y * move.z + move.y) * speedCap,
-    z: (fwd.z * move.z + right.z * move.x) * speedCap,
-  };
+  _target.x = (_fwd.x * move.z + _right.x * move.x) * speedCap;
+  _target.y = (_fwd.y * move.z + move.y) * speedCap;
+  _target.z = (_fwd.z * move.z + _right.z * move.x) * speedCap;
 
   // 3. Water inertia.
   const k = 1 - Math.exp(-WATER_INERTIA * delta);
-  velocity.x += (target.x - velocity.x) * k;
-  velocity.y += (target.y - velocity.y) * k;
-  velocity.z += (target.z - velocity.z) * k;
+  velocity.x += (_target.x - velocity.x) * k;
+  velocity.y += (_target.y - velocity.y) * k;
+  velocity.z += (_target.z - velocity.z) * k;
 
   // Move + collide in substeps of at most ~0.5 u: a stall frame (delta
   // clamped at 0.1 s) while sprinting covers 1.9 u — farther than the bell
@@ -673,17 +695,7 @@ renderLoop((delta) => {
   networkTimer += delta;
   if (networkTimer >= NETWORK_RATE && isConnected()) {
     networkTimer = 0;
-    broadcastState({
-      x: localPosition.x,
-      y: localPosition.y,
-      z: localPosition.z,
-      yaw,
-      pitch,
-      sy: swimYaw,
-      sp: swimPitch,
-      light: flashlightOn,
-      status: getLocalStatus(),
-    });
+    broadcastState(fillNetState());
   }
 
   // 7. Smooth remote players from interpolation buffers + move their voices.
@@ -693,7 +705,16 @@ renderLoop((delta) => {
     if (s) {
       updatePlayerPosition(peerId, s.x, s.y, s.z, s.yaw, s.pitch, s.sy, s.sp);
       setVoicePosition(peerId, s.x, s.y, s.z);
-      remotePositions.push({ x: s.x, y: s.y, z: s.z });
+      // Pooled by index — same objects reused every frame, no per-peer churn.
+      let entry = remotePosPool[remotePositions.length];
+      if (!entry) {
+        entry = { x: 0, y: 0, z: 0 };
+        remotePosPool[remotePositions.length] = entry;
+      }
+      entry.x = s.x;
+      entry.y = s.y;
+      entry.z = s.z;
+      remotePositions.push(entry);
     }
   }
 
@@ -829,6 +850,3 @@ function showEvent(text, duration = 2200) {
   }, duration);
 }
 
-function clamp(v, min, max) {
-  return Math.max(min, Math.min(max, v));
-}

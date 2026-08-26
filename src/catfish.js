@@ -53,6 +53,10 @@ const fishes = [];
 let hooks = {}; // { onBite(fishPos) }
 let authority = true; // false = puppet mode (a host feeds us states)
 let pendingPuppets = 0; // puppet count requested before the template loaded
+// Spawn generation: bumped by every spawn/despawn. The async template load
+// checks it before adding fish, so a world rebuild that despawns while a
+// previous spawnCatfish() is still loading can't double the school.
+let spawnGen = 0;
 
 function loadTemplate() {
   templatePromise ??= new GLTFLoader()
@@ -97,19 +101,26 @@ export function initCatfishSystem(sceneRef) {
 }
 
 export function despawnCatfish() {
+  spawnGen++;
   for (const f of fishes) {
     scene?.remove(f.group);
-    f.group.traverse((o) => {
-      o.geometry?.dispose();
-      if (o.material?.dispose) o.material.dispose();
-    });
+    // The skinned clone SHARES the template's geometry/materials (they are
+    // reused by the next spawn — don't dispose them). Only the per-fish
+    // resources go: the glow sprite's material (its texture is the shared
+    // cached halo), the lantern light, and the mixer's binding caches.
+    f.glow.material.dispose();
+    f.light.dispose();
+    f.mixer.stopAllAction();
+    f.mixer.uncacheRoot(f.mixer.getRoot());
   }
   fishes.length = 0;
 }
 
 export function spawnCatfish(count, gameHooks = {}) {
   hooks = gameHooks;
+  const gen = ++spawnGen;
   loadTemplate().then((gltf) => {
+    if (gen !== spawnGen) return; // a rebuild superseded this spawn
     if (!gltf || !scene || !authority) return;
     // Mostly OPEN-WATER hunters (visible from the drift as distant bulbs);
     // every 4th one haunts a pocket inside the labyrinth.
@@ -265,7 +276,9 @@ export function applyCatfishState(arr) {
     // (Re)build the school to match the host's count.
     pendingPuppets = arr.length;
     despawnCatfish();
+    const gen = spawnGen; // despawn just bumped it — adopt that generation
     loadTemplate().then((gltf) => {
+      if (gen !== spawnGen) return; // superseded by a newer spawn/despawn
       if (!gltf || !scene || pendingPuppets === 0) return;
       const n = pendingPuppets;
       pendingPuppets = 0;
@@ -307,12 +320,9 @@ export function updateCatfishSystem(delta, playerPos, elapsed = 0, others = []) 
       playerPos.z - f.pos.z,
     );
 
-    let yawRate = 0;
-    if (authority) {
-      yawRate = simulate(f, delta, playerPos, localDist, others);
-    } else {
-      yawRate = puppet(f, delta, playerPos, localDist);
-    }
+    const yawRate = authority
+      ? simulate(f, delta, playerPos, localDist, others)
+      : puppet(f, delta, playerPos, localDist);
 
     // ---- shared presentation ----
     // Bank into turns — a heavy body rolling through the water, not a turret.

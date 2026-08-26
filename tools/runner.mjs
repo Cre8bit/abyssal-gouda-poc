@@ -333,7 +333,7 @@ console.log("Ctrl+C to stop.\n");
 
 for (;;) {
   if (existsSync(REQUEST)) {
-    let shots = [];
+    let shots;
     try {
       shots = JSON.parse(await readFile(REQUEST, "utf8")).shots ?? [];
     } catch (e) {

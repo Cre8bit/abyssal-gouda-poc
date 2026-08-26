@@ -13,6 +13,9 @@ const BUFFER_TTL_MS = 1000;
 export class SnapshotBuffer {
   constructor() {
     this.snapshots = []; // [{ t, x, y, z, yaw, pitch }]
+    // sample() returns this reused object (one per buffer, refilled every
+    // frame) — consume it before the next sample() call, don't store it.
+    this._out = { x: 0, y: 0, z: 0, yaw: 0, pitch: 0, sy: 0, sp: 0 };
   }
 
   // Call on teleports: forget history so we don't interpolate across the map.
@@ -45,33 +48,37 @@ export class SnapshotBuffer {
       const b = snaps[i + 1];
       if (renderT >= a.t && renderT <= b.t) {
         const alpha = (renderT - a.t) / Math.max(b.t - a.t, 1e-6);
-        return {
-          x: lerp(a.x, b.x, alpha),
-          y: lerp(a.y, b.y, alpha),
-          z: lerp(a.z, b.z, alpha),
-          yaw: lerpAngle(a.yaw ?? 0, b.yaw ?? 0, alpha),
-          pitch: lerp(a.pitch ?? 0, b.pitch ?? 0, alpha),
-          // Lazy body orientation (may be absent from older peers).
-          sy: lerpAngle(a.sy ?? a.yaw ?? 0, b.sy ?? b.yaw ?? 0, alpha),
-          sp: lerp(a.sp ?? a.pitch ?? 0, b.sp ?? b.pitch ?? 0, alpha),
-        };
+        const out = this._out;
+        out.x = lerp(a.x, b.x, alpha);
+        out.y = lerp(a.y, b.y, alpha);
+        out.z = lerp(a.z, b.z, alpha);
+        out.yaw = lerpAngle(a.yaw ?? 0, b.yaw ?? 0, alpha);
+        out.pitch = lerp(a.pitch ?? 0, b.pitch ?? 0, alpha);
+        // Lazy body orientation (may be absent from older peers).
+        out.sy = lerpAngle(a.sy ?? a.yaw ?? 0, b.sy ?? b.yaw ?? 0, alpha);
+        out.sp = lerp(a.sp ?? a.pitch ?? 0, b.sp ?? b.pitch ?? 0, alpha);
+        return out;
       }
     }
 
-    // Past the newest snapshot: extrapolate briefly, then hold.
+    // Past the newest snapshot: extrapolate the position briefly, then hold.
+    // Angles (including the lazy body sy/sp) HOLD rather than extrapolate —
+    // a predicted spin looks worse than a paused one.
     const last = snaps[snaps.length - 1];
     if (snaps.length >= 2) {
       const prev = snaps[snaps.length - 2];
       const dt = Math.max(last.t - prev.t, 1e-6);
       const overshoot = Math.min(renderT - last.t, MAX_EXTRAPOLATION_MS);
       const alpha = overshoot / dt;
-      return {
-        x: last.x + (last.x - prev.x) * alpha,
-        y: last.y + (last.y - prev.y) * alpha,
-        z: last.z + (last.z - prev.z) * alpha,
-        yaw: last.yaw ?? 0,
-        pitch: last.pitch ?? 0,
-      };
+      const out = this._out;
+      out.x = last.x + (last.x - prev.x) * alpha;
+      out.y = last.y + (last.y - prev.y) * alpha;
+      out.z = last.z + (last.z - prev.z) * alpha;
+      out.yaw = last.yaw ?? 0;
+      out.pitch = last.pitch ?? 0;
+      out.sy = last.sy ?? last.yaw ?? 0;
+      out.sp = last.sp ?? last.pitch ?? 0;
+      return out;
     }
     return last;
   }

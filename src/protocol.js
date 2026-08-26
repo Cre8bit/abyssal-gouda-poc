@@ -2,13 +2,15 @@
 // so it can be unit-tested in plain node (tools/test-protocol.mjs).
 //
 // Layout (little-endian, 24 bytes):
-//   u8   type        (1 = state)
+//   u8   version     (PROTO_VERSION — bump on ANY layout change, so packets
+//                     from a stale client are rejected instead of misread)
 //   u16  seq         (wrapping counter — stale packets are dropped)
 //   u8   flags       bit7 = flashlight, bits 0-6 = status mask (effects.js)
 //   f32  x, y, z
 //   i16  yaw, pitch, swimYaw, swimPitch   (radians wrapped to ±π, ×ANGLE_SCALE)
 
 export const STATE_PACKET_BYTES = 24;
+export const PROTO_VERSION = 1;
 const ANGLE_SCALE = 32767 / Math.PI;
 
 export function wrapAngle(a) {
@@ -18,10 +20,14 @@ export function wrapAngle(a) {
   return a;
 }
 
-export function encodeState(s, seq) {
-  const buf = new ArrayBuffer(STATE_PACKET_BYTES);
+// `out` (optional): an ArrayBuffer(STATE_PACKET_BYTES) to encode into —
+// callers on a hot path (30 Hz broadcast) pass a scratch buffer to avoid
+// allocating per tick. RTCDataChannel.send copies synchronously, so the
+// scratch can be reused immediately after sending.
+export function encodeState(s, seq, out = null) {
+  const buf = out ?? new ArrayBuffer(STATE_PACKET_BYTES);
   const v = new DataView(buf);
-  v.setUint8(0, 1);
+  v.setUint8(0, PROTO_VERSION);
   v.setUint16(1, seq & 0xffff, true);
   v.setUint8(3, ((s.light ? 1 : 0) << 7) | (s.status & 0x7f));
   v.setFloat32(4, s.x, true);
@@ -38,7 +44,8 @@ export function decodeState(data) {
   const v = ArrayBuffer.isView(data)
     ? new DataView(data.buffer, data.byteOffset, data.byteLength)
     : new DataView(data);
-  if (v.byteLength < STATE_PACKET_BYTES || v.getUint8(0) !== 1) return null;
+  if (v.byteLength < STATE_PACKET_BYTES || v.getUint8(0) !== PROTO_VERSION)
+    return null;
   const flags = v.getUint8(3);
   return {
     seq: v.getUint16(1, true),
