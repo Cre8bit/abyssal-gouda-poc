@@ -44,18 +44,25 @@ Strip the haul to the bone so biome work has cargo to be judged against. No
 throwing, no polish, no world-change. Just: the Gouda is heavy and it has to
 get home.
 
-**M1.1 · Transport spike** *(1 d)* — **the open question (register G2).**
-Prototype and pick, in the bench or a debug scene:
+**M1.1 · Carry in arms, with hand-off and drop** *(1 d)*
 
-| Scheme | Feel | Risk |
-|---|---|---|
-| **Held** — clamped in front, first-person, constant drag | Simple, readable, always works | Least interesting; the Gouda becomes a stat |
-| **Towed** — on a line behind you; two rats can pull together and go faster | Cooperative, physical, snags on geometry in a good way | Rope physics in tunnels; needs care |
-| **Shoved** — a buoyant physics body you push along | Comedic, chaotic, great in open water | Miserable in the warrens; may fight the SDF collider |
-| **Harnessed** — strapped on, hands free, heavy | Keeps the pickaxe usable while carrying | Removes the "your hands are full" tension |
+You hold the Gouda in front of you, visible and heavy. Movement is slower,
+pickaxe is unavailable. The Gouda is yours to manage, not a passive load.
 
-*Decide by feel, not by spec.* Whatever wins becomes the code path that
-downed-body dragging (M7) reuses.
+- **Carry** — held in front, animation, constant drag on swim speed (~−4 u/s).
+  Stamina cost is higher when carrying (sprint drain is 1.8×).
+- **Hand-off** — when another player is close (~3 m), a prompt appears. Press
+  to hand it off: both players briefly hold it, momentum transfers, they
+  become the carrier. Fast and physical. This is the main **cooperative verb**.
+- **Drop** — if you take damage from the fish or you sprint too hard, there's
+  a chance you lose grip. The Gouda tumbles and sinks. You have ~3 seconds to
+  catch it before it's lost. Miss it and it's gone — time or a long backtrack
+  to recover it.
+
+This reuses the carry code path for downed-body dragging (M7).
+
+*AC:* two players can hand off cleanly in open water; drop risk is real but
+not arbitrary (happens on damage/sprint, not random).
 
 **M1.2 · Gouda as an item** *(1 d)* — retire the decorative `goldCore` in
 `gouda.ts`; register an `items.ts` kind `gouda`, seeded at `getGoldPos()` so

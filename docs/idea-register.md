@@ -135,7 +135,7 @@ The decision record. `plan-mvp.md` is the sequenced plan that comes out of it;
 | ID | Idea | Verdict | Notes |
 |---|---|---|---|
 | G1 | Replicated item, host-arbitrated pickup | IN | Needs one new message: `pick` request → authoritative `item*` |
-| G2 | **How you actually transport it** — held / towed on a line / shoved as a physics body / harnessed | **?** | Open. Prototype 2–3 and pick. See the M1 spike |
+| G2 | **Carried in arms with hand-off and drop** — hold in front, slow swim, hand-off to teammates when close, drop on damage/sprint | LOCKED | Simple, readable, cooperative. Reuses carry code for downed-body drag (M7). Loseable on fumble. |
 | G3 | **Weight** — negative buoyancy, reduced speed cap. One tuning for 2 and 4 players | IN | |
 | G4 | **The light tradeoff** — carrier's flashlight forced off, but the Gouda lights a wide radius for everyone | IN | Carrier is the party's lamp *and* the party's beacon |
 | G5 | **Throwable / passable** to a teammate | IN | Depends on the G2 outcome |
@@ -232,7 +232,6 @@ The decision record. `plan-mvp.md` is the sequenced plan that comes out of it;
 
 | ID | Question |
 |---|---|
-| Q1 | **G2 — how is the Gouda actually transported?** The M1 spike answers this |
 | Q2 | Which biome gets which verb, and which cheese types build it? The biome pass answers this |
 | Q3 | What are the other threat types? (E3, post-MVP) |
 | Q4 | Does a late joiner spawn in the bell mid-run, or somewhere else? (D15 detail) |
