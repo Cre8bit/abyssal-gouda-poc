@@ -91,7 +91,13 @@ import {
 } from "./game/effects.ts";
 import { initOxygen, refillOxygen, isDead } from "./game/oxygen.ts";
 import { setBellCount, collideBathyscaphe } from "./world/bathyscaphe.ts";
-import { game, placeAtSpawn, resetGameState, type Vec3 } from "./state.ts";
+import {
+  game,
+  placeAtSpawn,
+  resetGameState,
+  type SphereDig,
+  type Vec3,
+} from "./state.ts";
 import type { PlayerStateOut } from "./net/protocol.ts";
 import {
   registerSystem,
@@ -160,12 +166,8 @@ interface TpEvent {
   y?: number;
   z: number;
 }
-interface DigEvent {
-  x: number;
-  y: number;
-  z: number;
-  r?: number;
-}
+// The carve shape is shared with state.ts — mid-build digs are queued there.
+type DigEvent = SphereDig;
 interface SeedEvent {
   seed: number;
   d?: number;
@@ -234,6 +236,11 @@ async function buildWorld(rebuild = false) {
   placeAtSpawn(getSpawnPoint());
   refillOxygen();
   game.worldReady = true;
+  // Replay carves that landed during the build — geometry only: the burst and
+  // the thump belong to a moment that has already passed (and to a position
+  // the diver was nowhere near, since we were still on the loading screen).
+  for (const d of game.pendingDigs) digAt(d.x, d.y, d.z, d.r ?? DIG_RADIUS);
+  game.pendingDigs.length = 0;
   loaderEl.classList.add("done");
 
   // Release the lantern-catfish (host/solo simulate; joiners get puppets
@@ -529,6 +536,12 @@ onEventReceived((peerId, data) => {
   } else if (data.kind === "dig") {
     // Teammate dug somewhere: apply the same carve locally.
     const d = data as unknown as DigEvent;
+    if (!game.worldReady) {
+      // Mid-carve: digAt() would only reach the chunks built so far and the
+      // rest would come out of the oven unbroken. Replay it after the build.
+      game.pendingDigs.push(d);
+      return;
+    }
     digAt(d.x, d.y, d.z, d.r ?? DIG_RADIUS);
     burstAt(d.x, d.y, d.z);
     // Audible only if they're digging nearby — muffled thumps through cheese.

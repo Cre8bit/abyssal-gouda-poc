@@ -1143,8 +1143,8 @@ function wrapAroundCamera(
 export function addPlayer(
   id: string,
   color: THREE.ColorRepresentation,
-): THREE.Group | RemotePlayer | undefined {
-  if (players.has(id)) return players.get(id);
+): void {
+  if (players.has(id)) return;
 
   const group = new THREE.Group();
   const pivot = new THREE.Group();
@@ -1268,8 +1268,6 @@ export function addPlayer(
     scene.add(headGlow);
     player.headGlow = headGlow;
   });
-
-  return group;
 }
 
 // --- Remote diver per-frame update: estimate velocity, run the procedural

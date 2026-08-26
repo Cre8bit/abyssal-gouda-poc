@@ -24,6 +24,26 @@ let statusCb: ((state: VoiceStatus) => void) | null = null;
 const remoteVoices = new Map<string, RemoteVoice>(); // peerId -> { source, panner, el, call }
 const pendingCalls = new Set<string>(); // peerIds we are currently dialing
 
+// PeerJS gives us no way to cancel a call that is mid-negotiation, and the
+// mic prompt is an await we cannot take back — so a peer that drops while we
+// are dialing still gets a "stream" event afterwards. Wiring that up would
+// build a panner and an <audio> element for someone who has already left,
+// with nothing left to tear them down. Instead every peer carries a dial
+// generation: hangUp() bumps it, and each async continuation checks the
+// generation it started under before touching any state. Only hangUp() ever
+// bumps; entries are never removed (that would un-stale work still in
+// flight), which is fine — it is one integer per peer id seen this session.
+const callGen = new Map<string, number>();
+
+function genOf(peerId: string): number {
+  return callGen.get(peerId) ?? 0;
+}
+
+// True if the peer was hung up (or re-dialed) since `gen` was captured.
+function isStale(peerId: string, gen: number): boolean {
+  return genOf(peerId) !== gen;
+}
+
 export function onVoiceStatus(fn: (state: VoiceStatus) => void) {
   statusCb = fn;
 }
@@ -48,14 +68,21 @@ async function ensureMic() {
 // Answer incoming voice calls (both host and client should install this).
 export function initVoice(peer: Peer) {
   peer.on("call", async (call) => {
+    const gen = genOf(call.peer);
     try {
       call.answer(await ensureMic());
-      attachCall(call);
     } catch {
       call.answer(); // still receive their audio even if our mic is denied
-      attachCall(call);
       report("mic-denied");
     }
+    // The mic prompt can outlive the caller.
+    if (isStale(call.peer, gen)) {
+      try {
+        call.close();
+      } catch {}
+      return;
+    }
+    attachCall(call, gen);
   });
 }
 
@@ -65,24 +92,43 @@ export function initVoice(peer: Peer) {
 export async function callPeer(peer: Peer, remoteId: string) {
   if (remoteVoices.has(remoteId) || pendingCalls.has(remoteId)) return;
   pendingCalls.add(remoteId);
+  const gen = genOf(remoteId);
   try {
     report("connecting");
-    const call = peer.call(remoteId, await ensureMic());
-    attachCall(call);
+    const mic = await ensureMic();
+    // Hung up while the mic prompt was open — never place the call. Leave
+    // pendingCalls alone: hangUp() already cleared our entry, and anything
+    // there now belongs to a newer dial for the same id.
+    if (isStale(remoteId, gen)) return;
+    attachCall(peer.call(remoteId, mic), gen);
   } catch {
-    pendingCalls.delete(remoteId);
-    report("mic-denied");
+    if (!isStale(remoteId, gen)) {
+      pendingCalls.delete(remoteId);
+      report("mic-denied");
+    }
   }
 }
 
-function attachCall(call: MediaConnection) {
+function attachCall(call: MediaConnection, gen: number) {
   call.on("stream", (stream) => {
+    // The peer left while this call was negotiating: drop it rather than
+    // wire up a voice chain that teardown() will never see.
+    if (isStale(call.peer, gen)) {
+      try {
+        call.close();
+      } catch {}
+      return;
+    }
     pendingCalls.delete(call.peer);
     setupSpatialAudio(call.peer, stream, call);
     report("on");
   });
-  call.on("close", () => teardown(call.peer));
+  call.on("close", () => {
+    if (!isStale(call.peer, gen)) teardown(call.peer);
+  });
   call.on("error", () => {
+    // A call we already hung up erroring out is expected, not a voice fault.
+    if (isStale(call.peer, gen)) return;
     pendingCalls.delete(call.peer);
     report("error");
   });
@@ -90,6 +136,7 @@ function attachCall(call: MediaConnection) {
 
 // Drop one peer's voice (mesh disconnect).
 export function hangUp(peerId: string) {
+  callGen.set(peerId, genOf(peerId) + 1); // invalidate in-flight dials/streams
   pendingCalls.delete(peerId);
   const voice = remoteVoices.get(peerId);
   if (voice?.call) {
