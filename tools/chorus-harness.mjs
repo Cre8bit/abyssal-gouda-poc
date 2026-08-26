@@ -8,13 +8,14 @@
 //   · four beacons in open water LOCK onto the bell, never onto its ghost
 //   · four beacons at one depth REFUSE to lock instead of guessing
 //   · a fifth beacon at a different depth breaks that tie
+//   · copying another diver's belt merges it, once, without losing your own
 //   · the fix map draws every stage without throwing
 //
 // Run with:  npm run chorus
 import {
   BEACON_RANGE, BELL_RADIUS, MIN_SEPARATION, MAX_BEACONS,
   STAGE, STAGE_NAME, placeBeacon, clearBeacons, solve, onShell, separationOK,
-  beaconCount, getBeacons,
+  beaconCount, myBeaconCount, adoptBeacons, getBeacons,
 } from "../src/triangulation.js";
 import { initFixMap, drawFixMap } from "../src/fixmap.js";
 
@@ -219,6 +220,47 @@ check("...and hand back a drawable shape", !!(line.ring || line.points || line.p
 
 clearBeacons();
 check("no beacons → NO FIX", solve().stage === STAGE.NONE);
+
+// --- Copying another diver's belt -----------------------------------------
+console.log("\n--- copying beacons off another diver ---");
+const at = (o) => ({ x: bell.x + o[0], y: bell.y + o[1], z: bell.z + o[2] });
+const asTheirs = (o, seq) => ({ ...at(o), r: Math.hypot(...o), owner: "them", seq });
+
+clearBeacons();
+plantAt(at([100, 0, 0]));
+// What the other diver hands over: their own two, planted elsewhere on the shell.
+const theirs = [asTheirs([0, 0, -100], 0), asTheirs([60, 50, 62], 1)];
+check("one beacon of mine → SHELL", solve().stage === STAGE.SHELL);
+const added = adoptBeacons(theirs);
+check("copying adds both of theirs", added === 2 && beaconCount() === 3);
+check("...and mine is still just one", myBeaconCount() === 1);
+check("three beacons between us → TWINS", solve().stage === STAGE.TWINS, `stage ${STAGE_NAME[solve().stage]}`);
+check("copying the same belt twice adds nothing", adoptBeacons(theirs) === 0 && beaconCount() === 3);
+check(
+  "a copied beacon blocks planting next to it",
+  !separationOK(at([0, 0, -100 + MIN_SEPARATION - 5])),
+);
+check(
+  "theirs are marked as not mine",
+  getBeacons().filter((b) => b.mine === false).length === 2,
+);
+
+// The belt limit counts what YOU plant, so a copied set never locks you out.
+clearBeacons();
+adoptBeacons(
+  Array.from({ length: 6 }, (_, i) => ({
+    x: i * 40, y: bell.y, z: 0, r: 100, owner: "them", seq: i,
+  })),
+);
+let planted = 0;
+for (let i = 0; i < MAX_BEACONS + 2; i++) {
+  if (placeBeacon({ x: -i * 60 - 200, y: bell.y, z: 0 }, 100)) planted++;
+}
+check(`a full copied set still leaves all ${MAX_BEACONS} of my own`, planted === MAX_BEACONS);
+check("held total is both belts", beaconCount() === MAX_BEACONS + 6);
+
+console.log(`\n${failures ? `${failures} FAILED` : "all checks passed"}`);
+process.exit(failures ? 1 : 0);
 
 // --- The fix map ----------------------------------------------------------
 // Drawing runs against a stub 2D context: no pixels to look at, but every stage

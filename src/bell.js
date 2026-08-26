@@ -4,8 +4,13 @@
 export const LEVEL_DROP = 100; // metres between levels
 export const DROP_DURATION = 2.2;
 export const ATTACH_RADIUS = 7;
-export const EJECT_MIN = 55;
-export const EJECT_MAX = 85;
+// Never inside the antenna's shell: a diver thrown out closer than BEACON_RANGE
+// would be standing inside the sphere they are trying to measure, with no way to
+// plant until they swam back out. At level 1 you land on the shell itself, so the
+// first beacon is there for the taking; deeper, you land beyond it and have to
+// close in to find it.
+export const EJECT_MIN = 100;
+export const EJECT_MAX = 130;
 const EJECT_GROWTH = 0.35; // each depth throws you proportionally further
 export const SETTLE_DELAY = 0.4;
 export const ALARM_PERIOD = 5; // seconds between the bell's red flash + ping

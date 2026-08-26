@@ -4,7 +4,9 @@
 const NODES = 14; // polyline resolution along the flow
 export const LENGTH = 50; // metres from mouth to tail
 export const RADIUS = 9; // how wide the corridor is
-const STRENGTH = 3.4; // metres per second of push at the core
+// Twice what it was, which puts the core above a diver's 4.5 m/s cruise: you can
+// still beat it, but only by sprinting, so being caught actually costs you.
+const STRENGTH = 6.8; // metres per second of push at the core
 
 const LIFE = 26; // seconds a current runs for
 const FADE = 4; // ramp in and out, so nothing snaps on

@@ -11,6 +11,7 @@
 // the map is always the way they are facing.
 
 const AQUA = "98, 255, 208"; // knowledge — the same colour the hologram uses
+const RED = "255, 77, 77"; // beacons — the same red they burn in the water
 const DIVER = "170, 215, 240";
 const GRID = "90, 140, 165";
 
@@ -193,13 +194,21 @@ function candidate(p, locked) {
   }
 }
 
+// A planted beacon. Filled is yours; an open ring is one you copied off another
+// diver, so the map always shows how much of a fix is your own legwork.
 function beacon(b) {
   const s = screen(b);
   stem(b);
   ctx.beginPath();
-  ctx.arc(s.x, s.y, 2, 0, Math.PI * 2);
-  ctx.fillStyle = `rgba(${AQUA}, 0.85)`;
-  ctx.fill();
+  ctx.arc(s.x, s.y, b.mine === false ? 2.6 : 2.2, 0, Math.PI * 2);
+  if (b.mine === false) {
+    ctx.strokeStyle = `rgba(${RED}, 0.95)`;
+    ctx.lineWidth = 1.2;
+    ctx.stroke();
+  } else {
+    ctx.fillStyle = `rgba(${RED}, 0.95)`;
+    ctx.fill();
+  }
 }
 
 // The diver. The camera turns with them, so their nose always points up.

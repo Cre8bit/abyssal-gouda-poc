@@ -15,24 +15,22 @@ import {
   setDepthLevel,
   fireFlare,
   setSwimSpeed,
-  spawnCreature,
-  placeCreature,
-  creaturePosition,
   flashBellAlarm,
   spawnAngler,
   despawnAngler,
   updateAngler,
   anglerState,
   placeAngler,
-  setResonance,
-  setResonanceBuoys,
-  clearResonance,
+  setBeaconMarkers,
+  clearBeaconMarkers,
 } from "./graphics.js";
 import {
   clearBeacons,
   getBeacons,
   beaconCount,
+  myBeaconCount,
   placeBeacon,
+  adoptBeacons,
   onShell,
   shellOffset,
   separationOK,
@@ -67,6 +65,7 @@ import {
   setLook,
   isSprinting,
 } from "./input.js";
+import { createRoamer } from "./creature.js";
 import { SnapshotBuffer } from "./interpolation.js";
 import {
   getBell,
@@ -113,7 +112,7 @@ import {
 } from "./voice.js";
 
 const MAX_SPEED = 4.5; // units per second
-const SPRINT_MULT = 2; // hold Shift to bolt for the bell
+const SPRINT_MULT = 2.6; // hold Shift to bolt for the bell
 const WATER_INERTIA = 4; // how quickly velocity reaches its target
 const NETWORK_RATE = 1 / 30; // send state 30x per second
 const CEILING_Y = 4; // you cannot swim back above the start line
@@ -145,7 +144,6 @@ const restartBtn = document.getElementById("restart-btn");
 const bellPrompt = document.getElementById("bell-prompt");
 const eventCenter = document.getElementById("event-center");
 const minimapCanvas = document.getElementById("minimap");
-const bellRadarCanvas = document.getElementById("bell-radar");
 const oxygenFill = document.getElementById("oxygen-fill");
 const oxygenText = document.getElementById("oxygen-text");
 const triStage = document.getElementById("tri-stage");
@@ -175,6 +173,9 @@ const currentNoise = new ImprovedNoise();
 const drift = { x: 0, y: 0, z: 0 }; // push from whatever current has hold of you
 let inCurrent = false;
 let creatureVoice = null;
+// The thing you hear and never see: a position for the moan to travel from.
+const roamer = createRoamer();
+let roamerClock = 0; // its own noise track needs a monotonic time of its own
 let oxygen = O2_SECONDS;
 
 const remoteBuffers = new Map(); // peerId -> SnapshotBuffer
@@ -330,6 +331,8 @@ window.addEventListener("keydown", (e) => {
     throwFlare();
   } else if (e.code === "KeyT") {
     plantBeacon();
+  } else if (e.code === "KeyC") {
+    copyBeacons();
   } else if (e.code === "KeyE") {
     if (!eaten) toggleAttach();
   } else if (e.code === "KeyR") {
@@ -371,7 +374,7 @@ function plantBeacon() {
     showEvent("The antenna stows while you ride the bell — release to plant.");
     return;
   }
-  if (beaconCount() >= MAX_BEACONS) {
+  if (myBeaconCount() >= MAX_BEACONS) {
     showEvent("✦ Beacon belt empty.");
     return;
   }
@@ -387,13 +390,55 @@ function plantBeacon() {
   }
   if (!separationOK(localPosition)) {
     showEvent(
-      `✦ Too near your beacon at ${Math.round(distToNearest(localPosition))} m — carry it ${MIN_SEPARATION} m along the shell.`,
+      `✦ Too near a beacon at ${Math.round(distToNearest(localPosition))} m — carry it ${MIN_SEPARATION} m along the shell.`,
     );
     return;
   }
-  placeBeacon(localPosition, range);
+  placeBeacon(localPosition, range, myId());
   playAntenna();
-  showEvent(`✦ Beacon ${beaconCount()} planted.`);
+  showEvent(`✦ Beacon ${myBeaconCount()} planted.`);
+}
+
+// --- The Chorus: copying another diver's beacons ---------------------------
+//
+// Two divers each hunting alone learn twice as slowly as two divers who trade.
+// Swim up to somebody, press C, and their beacons become yours — a shell they
+// swam to is true whoever swam to it. It only goes one way, so they have to
+// press it too, and it is a snapshot, so anything either of you plants
+// afterwards means meeting again. That is the whole point: the water is dark and
+// wide, and the cheapest way to a fix is another pair of hands.
+const SHARE_RANGE = 5; // metres — close enough that you swam to each other
+let shareOffered = false; // so the prompt fires on arrival, not every frame
+
+function nearestDiver() {
+  let best = null;
+  let bestDist = Infinity;
+  for (const [peerId, buffer] of remoteBuffers) {
+    if (remoteEaten.get(peerId)) continue;
+    const s = buffer.last?.() ?? buffer.sample();
+    if (!s) continue;
+    const d = Math.hypot(
+      s.x - localPosition.x,
+      s.y - localPosition.y,
+      s.z - localPosition.z,
+    );
+    if (d < bestDist) {
+      bestDist = d;
+      best = peerId;
+    }
+  }
+  return best && bestDist <= SHARE_RANGE ? { peerId: best, dist: bestDist } : null;
+}
+
+function copyBeacons() {
+  if (eaten) return;
+  const near = nearestDiver();
+  if (!near) {
+    showEvent("◈ Nobody alongside — swim within 5 m of a diver to copy.");
+    return;
+  }
+  sendEvent({ kind: "beacons-ask", to: near.peerId, from: myId() });
+  showEvent("◈ Reaching for their belt…");
 }
 
 function broadcastNow() {
@@ -449,7 +494,7 @@ function restart() {
   eatenTimer = 0;
   despawnAngler();
   clearBeacons();
-  clearResonance();
+  clearBeaconMarkers();
   triStageSeen = 0;
   onShellNow = false;
   for (const peerId of remoteAttached.keys()) remoteAttached.set(peerId, true);
@@ -598,6 +643,34 @@ onStateReceived((peerId, { x, y, z, yaw, pitch, light, att }) => {
 });
 
 onEventReceived((peerId, data) => {
+  // Beacon trades are addressed to one diver, but everyone is wired only to the
+  // host, so anything not meant for us gets passed along by whoever is hosting.
+  if (data.kind === "beacons-ask" || data.kind === "beacons-give") {
+    if (data.to !== myId()) {
+      if (isHost) sendEvent(data);
+      return;
+    }
+    if (data.kind === "beacons-ask") {
+      // Hand over everything we hold — a shell is true whoever swam to it.
+      sendEvent({
+        kind: "beacons-give",
+        to: data.from,
+        from: myId(),
+        list: getBeacons().map(({ x, y, z, r, owner, seq }) => ({ x, y, z, r, owner, seq })),
+      });
+      showEvent("◈ A diver copied your beacons.");
+    } else {
+      const added = adoptBeacons(data.list);
+      playAntenna();
+      showEvent(
+        added
+          ? `◈ ${added} beacon${added > 1 ? "s" : ""} copied — ${beaconCount()} in hand.`
+          : "◈ Nothing new on their belt.",
+      );
+    }
+    return;
+  }
+
   if (data.kind === "drop") {
     startDrop(data.level);
     playDescent(DROP_DURATION);
@@ -648,7 +721,7 @@ renderLoop((delta) => {
   const bell = getBell();
   if (updateBell(delta)) {
     settleTimer = SETTLE_DELAY;
-    spawnCreature(getBell().y); // one arrives with every landing
+    roamer.spawn({ x: 0, y: getBell().y, z: 0 }); // one arrives with every landing
     recoverEaten(); // and whoever it took last level surfaces with the crew
     // Deeper down the water is black enough for a single light to be the only
     // thing in the world — that is when the lure works.
@@ -690,13 +763,6 @@ renderLoop((delta) => {
     if (shot.flash && shotFrame === 20) flashBellAlarm();
     if (shot.flare && shotFrame === 6) throwFlare();
     // Frame 4: the camera is not moved to the shot pose until later in a frame.
-    if (shot.creature && shotFrame === 4) {
-      placeCreature(
-        localPosition,
-        Math.atan2(-Math.cos(shot.yaw), -Math.sin(shot.yaw)),
-        70,
-      );
-    }
     if (shot.angler && shotFrame === 4) {
       placeAngler(
         localPosition,
@@ -851,7 +917,11 @@ renderLoop((delta) => {
   setListenerPose(localPosition, yaw, pitch);
   setSonarListener(localPosition, yaw, pitch);
   if (creatureVoice) {
-    const c = creaturePosition();
+    if (!shot) {
+      roamerClock += delta;
+      roamer.update(delta, roamerClock, currentNoise);
+    }
+    const c = roamer.position;
     creatureVoice.setPosition(c.x, c.y, c.z);
   }
 
@@ -893,9 +963,16 @@ renderLoop((delta) => {
     }
   }
 
+  // A diver drawing alongside is the cheapest fix in the game, so say so once
+  // when they arrive rather than nagging every frame.
+  const alongside = !eaten && !shot ? nearestDiver() : null;
+  if (alongside && !shareOffered) {
+    showEvent("◈ Diver alongside — C to copy their beacons.", 3000);
+  }
+  shareOffered = !!alongside;
+
   const fix = solve();
-  setResonance(fix);
-  setResonanceBuoys(getBeacons());
+  setBeaconMarkers(getBeacons());
   if (fix.stage > triStageSeen) {
     playFix(fix.stage);
     showEvent(STAGE_TOAST[fix.stage], 3000);
@@ -906,7 +983,6 @@ renderLoop((delta) => {
   // 12. HUD.
   drawCompass(yaw);
   drawMinimap(yaw);
-  drawBellRadar(yaw, bellDist);
   drawFixMap({ fix, beacons: getBeacons(), player: localPosition, yaw });
 
   const o2 = oxygen / O2_SECONDS;
@@ -921,7 +997,7 @@ renderLoop((delta) => {
       ? `⚓ Hooked on — ${hooked}/${crew} aboard · E to release`
       : bellDist <= ATTACH_RADIUS
         ? `⚓ Press E to hook onto the bell — ${hooked}/${crew} aboard`
-        : `Bell ${Math.round(bellDist)} m away — ${hooked}/${crew} aboard`;
+        : `${hooked}/${crew} aboard — the bell is out there somewhere`;
 });
 
 // --- Compass strip (canvas, like a dive HUD) ---
@@ -1003,59 +1079,6 @@ function drawMinimap(yaw) {
   paintQuadrants(ctx, minimapCanvas, lit, "120, 220, 255");
 }
 
-// The same dial again, but for the bell. Deliberately a second instrument
-// rather than a marker on the first: you have to read them both.
-const bellRadarCtx = bellRadarCanvas.getContext("2d");
-
-function drawBellRadar(yaw, dist) {
-  const bell = getBell();
-  const lit = [0, 0, 0, 0];
-  quadrantAt(lit, 0, 0, yaw, Math.max(0.2, 1 - dist / 260));
-
-  // The spoof. The radar has never known what the bell IS — it lights the
-  // quadrant of the nearest thing pinging on the bell's frequency, and the
-  // lure pings on the bell's frequency. While the fish is still pretending
-  // and its light is closer than the hull, this instrument lies to you, in
-  // exactly the same amber, with the same confidence.
-  const angler = anglerState();
-  let beacon = { y: bell.y + 1.6 };
-  if (angler.isDecoy()) {
-    const lure = angler.lurePosition();
-    const lureDist = Math.hypot(
-      lure.x - localPosition.x,
-      lure.y - localPosition.y,
-      lure.z - localPosition.z,
-    );
-    if (lureDist < dist) {
-      lit[0] = lit[1] = lit[2] = lit[3] = 0;
-      quadrantAt(lit, lure.x, lure.z, yaw, Math.max(0.2, 1 - lureDist / 260));
-      beacon = lure;
-    }
-  }
-
-  paintQuadrants(bellRadarCtx, bellRadarCanvas, lit, "255, 196, 120");
-  // Vertical hint: the bell is often above or below, not just off to one side.
-  const rise = beacon.y - localPosition.y;
-  if (Math.abs(rise) > 4) {
-    const ctx = bellRadarCtx;
-    ctx.fillStyle = "rgba(255, 210, 150, 0.85)";
-    ctx.font = "10px monospace";
-    ctx.textAlign = "center";
-    ctx.fillText(rise > 0 ? "▲" : "▼", bellRadarCanvas.width / 2, 12);
-  }
-}
-
-// Light the quadrant a world point falls into, in view space.
-function quadrantAt(lit, x, z, yaw, strength) {
-  const dx = x - localPosition.x;
-  const dz = z - localPosition.z;
-  if (Math.hypot(dx, dz) <= 0.001) return;
-  const forward = -Math.atan2(dx, -dz) - yaw;
-  const a = ((forward % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
-  const q = Math.floor(((a + Math.PI / 4) % (Math.PI * 2)) / (Math.PI / 2));
-  lit[q] = Math.max(lit[q], strength);
-}
-
 function paintQuadrants(ctx, canvas, lit, rgb) {
   const w = canvas.width;
   const h = canvas.height;
@@ -1118,7 +1141,8 @@ function updateTriangulationHud(fix) {
   if (!triStage) return;
   triStage.textContent = STAGE_NAME[fix.stage];
   triStage.dataset.stage = String(fix.stage);
-  triCount.textContent = `${beaconCount()} ✦`;
+  const copied = beaconCount() - myBeaconCount();
+  triCount.textContent = copied ? `${myBeaconCount()}+${copied} ✦` : `${beaconCount()} ✦`;
 
   const q = Math.round((fix.quality ?? 0) * 100);
   triQualityFill.style.width = `${q}%`;
@@ -1127,7 +1151,7 @@ function updateTriangulationHud(fix) {
 
   // Exactly one gate can block the next beacon, so name that one and nothing
   // else — a diver reading three conditions at once reads none of them.
-  const ready = onShellNow && separationOK(localPosition) && beaconCount() < MAX_BEACONS;
+  const ready = onShellNow && separationOK(localPosition) && myBeaconCount() < MAX_BEACONS;
   triangulationPanel.dataset.ready = ready ? "1" : "0";
 
   let hint;
@@ -1135,12 +1159,12 @@ function updateTriangulationHud(fix) {
     hint = "Antenna dark — swallowed.";
   } else if (attached) {
     hint = "Release (E) to unstow the antenna.";
-  } else if (beaconCount() >= MAX_BEACONS) {
+  } else if (myBeaconCount() >= MAX_BEACONS) {
     hint = "Belt empty — follow what you have.";
   } else if (ready) {
-    hint = `T — plant beacon ${beaconCount() + 1}.`;
+    hint = `T — plant beacon ${myBeaconCount() + 1}.`;
   } else if (onShellNow) {
-    hint = `On the shell, too near beacon ${beaconCount()} — carry it ${MIN_SEPARATION} m along.`;
+    hint = `On the shell, too near a beacon — carry it ${MIN_SEPARATION} m along.`;
   } else if (fix.stage === 3 && fix.flat) {
     hint = "Every beacon at one depth — take the next one higher or lower.";
   } else if (shellOffset(distanceToBell(localPosition)) > 0) {

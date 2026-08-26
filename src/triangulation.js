@@ -31,12 +31,14 @@ export const BEACON_RANGE = 100;
 export const BELL_RADIUS = 10;
 
 // Two beacons on the same spot say the same thing twice. A new one has to stand
-// this far from EVERY beacon already planted — the rule that forces a lone
-// diver to swim the shell instead of standing still.
+// this far from EVERY beacon you hold — including one copied off another diver,
+// because a beacon planted next to theirs adds nothing either.
 export const MIN_SEPARATION = 50;
 
-// Four is the geometric answer. The spares exist for the flat layout below,
-// where four beacons genuinely cannot tell the bell from its mirror image.
+// How many YOU may plant. Copied beacons stack on top of this, so a pair who
+// meet up can hold more between them than either could carry alone. Four is the
+// geometric answer; the spares exist for the flat layout below, where four
+// genuinely cannot tell the bell from its mirror.
 export const MAX_BEACONS = 6;
 
 export const STAGE = {
@@ -55,11 +57,15 @@ export const STAGE_NAME = {
   4: "LOCK",
 };
 
-// { x, y, z, r } — where it stands and the range it heard.
+// { x, y, z, r, owner, seq, mine } — where it stands, the range it heard, and
+// whose it is. `owner`+`seq` identify it for the rest of its life, so copying
+// the same beacon twice cannot duplicate it.
 const beacons = [];
+let seq = 0;
 
 export function clearBeacons() {
   beacons.length = 0;
+  seq = 0;
 }
 
 export function getBeacons() {
@@ -68,6 +74,13 @@ export function getBeacons() {
 
 export function beaconCount() {
   return beacons.length;
+}
+
+// How many of these I planted myself — the number the belt limit applies to.
+export function myBeaconCount() {
+  let n = 0;
+  for (const b of beacons) if (b.mine) n++;
+  return n;
 }
 
 // --- The gates -------------------------------------------------------------
@@ -97,10 +110,24 @@ export function separationOK(pos) {
   return distToNearest(pos) >= MIN_SEPARATION;
 }
 
-export function placeBeacon(pos, range) {
-  if (beacons.length >= MAX_BEACONS) return false;
-  beacons.push({ x: pos.x, y: pos.y, z: pos.z, r: range });
+export function placeBeacon(pos, range, owner = "me") {
+  if (myBeaconCount() >= MAX_BEACONS) return false;
+  beacons.push({ x: pos.x, y: pos.y, z: pos.z, r: range, owner, seq: seq++, mine: true });
   return true;
+}
+
+// Take on another diver's beacons. Their facts are as good as yours — the shell
+// each one records is true whoever swam to it — so they simply join the list and
+// the solver sharpens. Anything already held is skipped, so pressing twice
+// costs nothing.
+export function adoptBeacons(list) {
+  let added = 0;
+  for (const b of list ?? []) {
+    if (beacons.some((h) => h.owner === b.owner && h.seq === b.seq)) continue;
+    beacons.push({ x: b.x, y: b.y, z: b.z, r: b.r, owner: b.owner, seq: b.seq, mine: false });
+    added++;
+  }
+  return added;
 }
 
 // --- The fuse -------------------------------------------------------------

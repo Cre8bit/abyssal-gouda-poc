@@ -16,7 +16,6 @@ import * as THREE from "three";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { buildForest, forestFor } from "./kelp.js";
 import { createFauna } from "./fauna.js";
-import { createCreature } from "./creature.js";
 import { createAngler } from "./angler.js";
 import { biolumeFor, biolumeDensity, FIELD_RADIUS, HEART_RADIUS } from "./biolume.js";
 import { getCurrents, strengthOf, RADIUS as CURRENT_RADIUS } from "./current.js";
@@ -37,6 +36,26 @@ const WATER_LOOKS = [
 ];
 const WATER_FADE = 0.8; // per-second lerp toward the current level's look
 const ALARM_FLASH = 1.1; // seconds for the red flash to bleed out
+
+// The Lanternmaw's esca, lifted straight from angler.js. The bell's lamp uses
+// these too: the imitation only works if there is nothing to tell apart.
+const LURE_LIGHT = 0xffc070; // the point light's colour
+const LURE_HALO = 0xffc978; // the bloom sprite around it
+const LURE_CORE = 0xffe6b4; // the hot centre you see the shape of
+// 150, not the 190 in the esca's constructor: angler.js overwrites distance every
+// frame with 150 + glow * 130, and glow is 0 for as long as it is still pretending
+// to be the bell. 150 is therefore the reach a diver is actually asked to judge.
+const LURE_RANGE = 150; // metres the light carries while the fish is lying
+const LURE_DECAY = 1.6;
+const LURE_BASE = 220; // dimmest it ever sits
+const LURE_SWELL = 380; // how much it breathes on top of that
+// The bell's crown lantern is a one-for-one copy of the esca, so the two are the
+// same light. The four rim bulbs are deliberately kept short-range: they light
+// the deck for whoever is aboard and contribute nothing at all at the distances
+// where the confusion matters, so the bell's far signature stays exactly one esca.
+const DECK_LIGHT = 20;
+const DECK_RANGE = 24;
+const DECK_DECAY = 1.9;
 
 // Plankton blooms: a visible veil that drowns out light, but never visibility.
 
@@ -71,18 +90,18 @@ let kelpLevel = -1;
 let bursts; // { points, states: [{origin, age, duration, delay}] }
 let fauna;
 let sparks; // { points, ages, head } — bioluminescence you stir up moving fast
-let creature;
 let angler;
 let bloom; // the bioluminescent biome: the one place particles are the point
 let bloomLevel = -1;
 const currentMotes = []; // one mote cloud per flow, so each is visible
 let swimSpeed = 0;
 let flare; // { group, light, core, halo, dir, travelled, alive }
-let resonance; // the triangulation hologram: shell / ring / twins / lock + buoys
+let resonance; // the planted beacon markers, one slot per beacon a diver holds
 let flashlight; // { group, spot, spill, beam, lens, halo, on }
 let bellGroup;
 let bellLight;
 let bellBeacon;
+let bellLantern; // { core, light } — the esca on the dome crown
 let bellAlarm; // { light, halo, mat, t, strength }
 let hemiLight;
 let gloomLight;
@@ -173,12 +192,11 @@ export function initGraphics(container) {
   createBubbles();
   createBursts();
   createFlare();
-  createResonance();
+  createBeaconMarkers();
   createSparks();
   createBloom();
   createCurrentMotes();
   fauna = createFauna(scene, noise, createHalo);
-  creature = createCreature(scene);
   angler = createAngler(scene);
 
   window.addEventListener("resize", onResize);
@@ -490,9 +508,13 @@ function createDivingBell() {
   base.castShadow = true;
   group.add(base);
 
+  // The bell's lamp is the Lanternmaw's lantern, to the digit: same hue, same
+  // total output, same falloff (see LURE_* below). That is the point — the fish
+  // imitates the bell, so a warm glow in the dark can be either, and the only
+  // instrument that can tell them apart is the antenna, which never lies.
   const bulbMat = new THREE.MeshStandardMaterial({
-    color: 0xcfe8ff,
-    emissive: 0xbfe0ff,
+    color: LURE_CORE,
+    emissive: LURE_LIGHT,
     emissiveIntensity: 3,
   });
   for (let i = 0; i < 4; i++) {
@@ -500,20 +522,44 @@ function createDivingBell() {
     const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.09, 8, 8), bulbMat);
     bulb.position.set(Math.cos(a) * 1.55, 3.1, Math.sin(a) * 1.55);
     group.add(bulb);
-    const light = new THREE.PointLight(0xbfe0ff, 14, 24, 1.9);
+    const light = new THREE.PointLight(LURE_LIGHT, DECK_LIGHT, DECK_RANGE, DECK_DECAY);
     light.position.copy(bulb.position);
     group.add(light);
-    const halo = createHalo(0.9, 0.22);
+    const halo = createHalo(0.9, 0.22, LURE_HALO);
     halo.position.copy(bulb.position);
     group.add(halo);
     if (i === 2) bellLight = { light, bulb: bulb, halo, mat: bulbMat };
   }
 
-  // Always-on marker: this is what guarantees the bell is never lost.
-  bellBeacon = createHalo(1.5, 0.85);
-  bellBeacon.material.fog = false; // haze must never hide the way home
-  bellBeacon.position.y = 3.6;
+  // The lantern on the crown. The Lanternmaw dangles one of these in front of
+  // its mouth; the bell wears one on its dome, and at any distance where the
+  // hull itself is dark the two are one amber point and nothing else. Same
+  // bulb, same bloom, same falloff — the confusion IS the feature.
+  const crown = 5.2; // just clear of the dome, which tops out at 5.0
+  // Small and hot: the bloom around it is what you actually see, exactly as on
+  // the fish. A big pale sphere here reads as a painted ball, not a light.
+  const lanternCore = new THREE.Mesh(
+    new THREE.SphereGeometry(0.22, 12, 10),
+    new THREE.MeshBasicMaterial({ color: LURE_CORE, fog: false }),
+  );
+  lanternCore.position.y = crown;
+  group.add(lanternCore);
+
+  const lanternLight = new THREE.PointLight(
+    LURE_LIGHT,
+    LURE_BASE,
+    LURE_RANGE,
+    LURE_DECAY,
+  );
+  lanternLight.position.y = crown;
+  group.add(lanternLight);
+
+  // Doubles as the always-on marker: haze must never hide the way home.
+  bellBeacon = createHalo(1.5, 0.85, LURE_HALO);
+  bellBeacon.material.fog = false;
+  bellBeacon.position.y = crown;
   group.add(bellBeacon);
+  bellLantern = { core: lanternCore, light: lanternLight };
 
   // Suspension cable running up out of sight — the only way home.
   const cable = new THREE.Mesh(
@@ -1126,28 +1172,8 @@ function createSparks() {
   sparks = { points, ages, head: 0, debt: 0 };
 }
 
-// `speed` is 0..1 of top pace; only real effort wakes the water up.
-// One creature per depth: called when the bell settles.
-export function spawnCreature(y) {
-  creature.spawn(_v1.set(0, y, 0));
-}
-
-// Screenshot hook: put it a fixed distance ahead, broadside on.
-export function placeCreature(pos, bearing, dist) {
-  creature.spawn(_v1.set(pos.x, pos.y, pos.z));
-  creature.group.position.set(
-    pos.x + Math.cos(bearing) * dist,
-    pos.y - 4,
-    pos.z + Math.sin(bearing) * dist,
-  );
-}
-
-export function creaturePosition() {
-  return creature.position;
-}
-
 // --- The Lanternmaw ------------------------------------------------------
-// Unlike the ambient creature, the angler needs to know where the divers are,
+// The angler needs to know where the divers are,
 // so main.js drives it from inside onFrame rather than it ticking on its own.
 
 export function spawnAngler(y) {
@@ -1171,6 +1197,7 @@ export function placeAngler(pos, bearing, dist, phase) {
   angler.place(pos, bearing, dist, phase);
 }
 
+// `speed` is 0..1 of top pace; only real effort wakes the water up.
 export function setSwimSpeed(speed) {
   swimSpeed = speed;
 }
@@ -1269,15 +1296,15 @@ function updateFlare(delta) {
 // different colour from every other light in the game (a cold resonant aqua):
 // the bell pings amber, the lure lies in amber, but *knowledge* glows aqua, so
 // the moment the crew's fix appears you know you are looking at maths, not bait.
-const RESO_COLOR = 0x62ffd0;
-const RESO_BUOYS = 8;
-const _rv = new THREE.Vector3();
-const _rq = new THREE.Quaternion();
-const _rz = new THREE.Vector3(0, 0, 1);
+// A beacon is a thing somebody swam to and left behind, not a deduction, so it
+// gets its own colour. Red also survives the deep-water blue shift better than
+// aqua does, which matters at the ranges these sit at.
+const BEACON_COLOR = 0xff4d4d;
+const RESO_BUOYS = 12; // two full belts, so a shared pair loses nothing
 
-function resoMat(opacity) {
+function beaconMat(opacity) {
   return new THREE.MeshBasicMaterial({
-    color: RESO_COLOR,
+    color: BEACON_COLOR,
     transparent: true,
     opacity,
     depthWrite: false,
@@ -1286,82 +1313,41 @@ function resoMat(opacity) {
   });
 }
 
-function createBeacon(columnHeight) {
-  const group = new THREE.Group();
-  // A shaft of light lancing up and down through the water — the single most
-  // legible "over here" a diver can be given in a place with no landmarks.
-  const column = new THREE.Mesh(
-    new THREE.CylinderGeometry(0.22, 0.22, columnHeight, 10, 1, true),
-    resoMat(0.22),
-  );
-  group.add(column);
-  const core = new THREE.Mesh(new THREE.SphereGeometry(0.9, 16, 12), resoMat(0.9));
-  group.add(core);
-  const halo = createHalo(6, 0.6, RESO_COLOR);
-  halo.material.fog = false;
-  halo.material.blending = THREE.AdditiveBlending;
-  group.add(halo);
-  const light = new THREE.PointLight(RESO_COLOR, 0, 60, 1.4);
-  group.add(light);
-  group.visible = false;
-  scene.add(group);
-  return { group, column, core, halo, light };
-}
-
-function createResonance() {
-  // SHELL — a whole sphere of "somewhere on here". Faint skin + a wire lattice
-  // so it reads as a surface, not a fog ball, from inside or out.
-  const shell = new THREE.Group();
-  const skin = new THREE.Mesh(new THREE.SphereGeometry(1, 40, 28), resoMat(0.045));
-  skin.material.side = THREE.DoubleSide;
-  const wire = new THREE.Mesh(
-    new THREE.SphereGeometry(1, 24, 16),
-    new THREE.MeshBasicMaterial({
-      color: RESO_COLOR,
-      wireframe: true,
-      transparent: true,
-      opacity: 0.12,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-      fog: false,
-    }),
-  );
-  shell.add(skin, wire);
-  shell.visible = false;
-  scene.add(shell);
-
-  // RING — where two shells kiss. A clean glowing hoop you swim the rim of.
-  const ring = new THREE.Mesh(
-    new THREE.TorusGeometry(1, 0.02, 8, 96),
-    resoMat(0.85),
-  );
-  ring.visible = false;
-  scene.add(ring);
-
-  // TWINS use both beacons at half strength; LOCK uses beacon[0] at full.
-  const beacons = [createBeacon(240), createBeacon(240)];
-
-  // Anchored reading buoys — one soft mote wherever a reading was taken, so the
-  // crew can see their own baseline and read "we're all bunched up" at a glance.
+// The planted beacons are the ONLY thing the hunt puts in the water. No sphere,
+// no hoop, no column of light standing over the answer: every shape the maths
+// produces lives on the fix map, where it can be read without blotting out the
+// abyss. What is out here is physical — somewhere a diver actually swam to.
+function createBeaconMarkers() {
+  // Planted beacons. Red, and the only red thing a diver plants: aqua is what
+  // the maths knows, red is where somebody physically stood to learn it. A
+  // beacon copied off another diver shows as an open wire shell instead of a
+  // solid mote, so you can always see whose legwork a fix rests on.
   const buoys = [];
   for (let i = 0; i < RESO_BUOYS; i++) {
     const g = new THREE.Group();
-    const core = new THREE.Mesh(new THREE.SphereGeometry(0.35, 10, 8), resoMat(0.8));
-    const halo = createHalo(2.4, 0.4, RESO_COLOR);
+    const core = new THREE.Mesh(new THREE.SphereGeometry(0.35, 10, 8), beaconMat(0.85));
+    const wire = new THREE.Mesh(
+      new THREE.SphereGeometry(0.62, 8, 6),
+      new THREE.MeshBasicMaterial({
+        color: BEACON_COLOR,
+        wireframe: true,
+        transparent: true,
+        opacity: 0.7,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+        fog: false,
+      }),
+    );
+    const halo = createHalo(2.4, 0.4, BEACON_COLOR);
     halo.material.fog = false;
     halo.material.blending = THREE.AdditiveBlending;
-    g.add(core, halo);
+    g.add(core, wire, halo);
     g.visible = false;
     scene.add(g);
-    buoys.push(g);
+    buoys.push({ group: g, core, wire, halo });
   }
 
   resonance = {
-    shell,
-    skin,
-    wire,
-    ring,
-    beacons,
     buoys,
     stage: 0,
     quality: 0,
@@ -1369,99 +1355,22 @@ function createResonance() {
   };
 }
 
-// Called every frame from the game loop with the solver's output. Positions
-// and reveals exactly the geometry for the current rung; the pulsing itself is
-// handled in updateResonance so it keeps breathing between solves.
-export function setResonance(sol) {
+// Drop the beacon markers at the given world positions. `mine` on an anchor
+// picks the solid mote; anything copied off another diver gets the wire shell.
+export function setBeaconMarkers(anchors) {
   if (!resonance) return;
-  const r = resonance;
-  r.stage = sol?.stage ?? 0;
-  r.quality = sol?.quality ?? 0;
-
-  r.shell.visible = false;
-  r.ring.visible = false;
-  for (const b of r.beacons) b.group.visible = false;
-
-  if (!sol || sol.stage === 0) return;
-
-  if (sol.stage === 1) {
-    r.shell.visible = true;
-    r.shell.position.set(sol.center.x, sol.center.y, sol.center.z);
-    r.shell.scale.setScalar(sol.radius);
-  } else if (sol.stage === 2) {
-    const c = sol.ring.center;
-    r.ring.visible = true;
-    r.ring.position.set(c.x, c.y, c.z);
-    _rv.set(sol.ring.normal.x, sol.ring.normal.y, sol.ring.normal.z).normalize();
-    _rq.setFromUnitVectors(_rz, _rv);
-    r.ring.quaternion.copy(_rq);
-    // Tube scales with the hoop so a vast, uncertain ring reads as a fat, soft
-    // band and a tight one as a crisp wire.
-    r.ring.scale.setScalar(sol.ring.radius);
-  } else if (sol.stage === 3) {
-    const pts = sol.points ?? (sol.point ? [sol.point] : []);
-    pts.slice(0, 2).forEach((p, i) => {
-      const b = r.beacons[i];
-      b.group.visible = true;
-      b.group.position.set(p.x, p.y, p.z);
-    });
-  } else if (sol.stage === 4) {
-    const b = r.beacons[0];
-    b.group.visible = true;
-    b.group.position.set(sol.point.x, sol.point.y, sol.point.z);
-  }
-}
-
-// Drop the anchored reading markers at the given world positions.
-export function setResonanceBuoys(anchors) {
-  if (!resonance) return;
-  resonance.buoys.forEach((g, i) => {
+  resonance.buoys.forEach((b, i) => {
     const a = anchors[i];
-    if (a) {
-      g.visible = true;
-      g.position.set(a.x, a.y, a.z);
-    } else {
-      g.visible = false;
-    }
+    b.group.visible = !!a;
+    if (!a) return;
+    b.group.position.set(a.x, a.y, a.z);
+    b.core.visible = a.mine !== false;
+    b.wire.visible = a.mine === false;
   });
 }
 
-export function clearResonance() {
-  if (!resonance) return;
-  setResonance(null);
-  setResonanceBuoys([]);
-}
-
-function updateResonance(delta) {
-  if (!resonance) return;
-  const r = resonance;
-  r.pulse += delta;
-  const breathe = 0.5 + 0.5 * Math.sin(r.pulse * 2.2);
-
-  if (r.shell.visible) {
-    r.shell.rotation.y += delta * 0.15;
-    r.shell.rotation.x += delta * 0.05;
-    r.skin.material.opacity = 0.03 + 0.03 * breathe;
-    r.wire.material.opacity = 0.09 + 0.06 * breathe;
-  }
-  if (r.ring.visible) {
-    r.ring.rotation.z += delta * 0.4; // spin about its own axis — a live halo
-    r.ring.material.opacity = 0.6 + 0.35 * breathe;
-  }
-  // The sharper the crew's geometry, the harder the beacons burn — a fuzzy fix
-  // gives you a nervous, guttering light; a clean one a steady spike.
-  const conf = 0.35 + 0.65 * r.quality;
-  for (const b of r.beacons) {
-    if (!b.group.visible) continue;
-    const lock = r.stage === 4;
-    const amp = (lock ? 1 : 0.55) * conf;
-    b.core.material.opacity = (0.6 + 0.4 * breathe) * amp;
-    b.column.material.opacity = (0.12 + 0.12 * breathe) * amp;
-    b.halo.material.opacity = (0.35 + 0.3 * breathe) * amp;
-    b.halo.scale.setScalar(4 + breathe * 2);
-    b.light.intensity = (lock ? 220 : 90) * (0.7 + 0.3 * breathe) * conf;
-    b.light.distance = 55;
-  }
+export function clearBeaconMarkers() {
+  setBeaconMarkers([]);
 }
 
 function createBubbles() {
@@ -1967,10 +1876,14 @@ function updateBellLight(delta) {
   if (!bellLight) return;
   const t = elapsed;
   const pulse = 0.82 + 0.18 * Math.sin(t * 0.35) + 0.06 * Math.sin(t * 0.13);
-  const target = 14 * pulse;
-  bellLight.light.intensity +=
-    (target - bellLight.light.intensity) * Math.min(delta * 2, 1);
-  const lit = bellLight.light.intensity / 14;
+  // The esca breathes between LURE_BASE and LURE_BASE + LURE_SWELL; the bell
+  // breathes over the same band on its own slower clock.
+  const top = LURE_BASE + LURE_SWELL;
+  const target = top * pulse;
+  bellLantern.light.intensity +=
+    (target - bellLantern.light.intensity) * Math.min(delta * 2, 1);
+  const lit = bellLantern.light.intensity / top;
+  bellLight.light.intensity = DECK_LIGHT * lit;
   bellLight.mat.emissiveIntensity = 3 * lit;
   bellLight.halo.material.opacity = 0.3 * lit;
 
@@ -1978,7 +1891,7 @@ function updateBellLight(delta) {
   // point, however far you drift — nothing is allowed to hide it.
   bellBeacon.material.opacity = 0.55 + 0.3 * lit;
   const range = camera.position.distanceTo(bellGroup.position);
-  bellBeacon.scale.setScalar(Math.max(1.5, range * 0.03));
+  bellBeacon.scale.setScalar(Math.max(8, range * 0.03));
 }
 
 function animateFlashlight() {
@@ -2080,11 +1993,9 @@ export function renderLoop(onFrame) {
     wrapAroundCamera(bubbles, BUBBLE_RADIUS, 0.85, delta, drift);
     updateBursts(delta);
     updateFlare(delta);
-    updateResonance(delta);
     delta_ = delta;
     updateSparks(delta);
     fauna.update(camera, elapsed, delta);
-    creature.update(delta, elapsed, noise);
 
     kelpTime.value = elapsed;
     animateFlashlight();

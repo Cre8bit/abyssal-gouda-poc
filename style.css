@@ -208,17 +208,10 @@ button:active {
   opacity: 0.8;
 }
 
-#bell-radar {
-  position: absolute;
-  top: 7.4rem;
-  right: 4rem;
-  opacity: 0.8;
-}
-
-/* The Chorus: the fix map, then its readout, stacked under the bell radar. */
+/* The Chorus: the fix map, then its readout, under the teammate dial. */
 #fix-map {
   position: absolute;
-  top: 14.3rem;
+  top: 7.4rem;
   right: 1.5rem;
   opacity: 0.92;
   border-radius: 5px;
@@ -226,7 +219,7 @@ button:active {
 
 #triangulation {
   position: absolute;
-  top: 24.6rem;
+  top: 17.7rem;
   right: 1.5rem;
   width: 9.6rem;
   padding: 0.5rem 0.6rem;

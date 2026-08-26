@@ -31,8 +31,6 @@ const VIEWS = {
   "bloom-edge": { level: 2, find: "bloom-edge", yaw: 0, pitch: 0 },
   "current-1": { level: 1, off: [40, 6, 40], yaw: 2.4, pitch: 0, current: true },
   "current-3": { level: 3, off: [40, 6, 40], yaw: 2.4, pitch: 0, current: true },
-  "creature-2": { level: 2, off: [40, 6, 40], yaw: 2.4, pitch: 0, creature: true },
-  "creature-3": { level: 3, off: [40, 6, 40], yaw: 2.4, pitch: 0, creature: true },
   "jelly-1": { level: 1, off: [50, 4, 50], yaw: 2.4, pitch: 0.1 },
   "jelly-2": { level: 2, off: [50, 4, 50], yaw: 2.4, pitch: 0.1 },
   "kelp-deep": { level: 3, find: "kelp", yaw: 0.9, pitch: 0 },
@@ -44,6 +42,10 @@ const VIEWS = {
   "up-2": { level: 2, off: [30, -12, 30], yaw: 2.4, pitch: 1.1 },
   "bell-below": { level: 1, off: [0, -18, 22], yaw: 0, pitch: 0.5 },
   "bell-side": { level: 2, off: [24, 2, 6], yaw: -1.35, pitch: -0.05 },
+  // Looking straight at the bell from where an ejected diver lands, to see how
+  // much the lamp gives away before a single beacon is planted.
+  "bell-spawn": { level: 2, off: [0, 0, 115], yaw: 0, pitch: 0 },
+  "bell-spawn-3": { level: 3, off: [0, 0, 115], yaw: 0, pitch: 0 },
   "flare-2": { level: 2, off: [30, 4, 30], yaw: 2.4, pitch: 0, flare: true },
   "flare-3": { level: 3, off: [30, 4, 30], yaw: 2.4, pitch: 0, flare: true },
   // The Lanternmaw, at the three distances that matter: the lie, the moment
@@ -150,7 +152,6 @@ export function getShot() {
     flare: view.flare === true,
     wake: view.wake === true,
     current: view.current === true,
-    creature: view.creature === true,
     hud: view.hud === true,
     beacons: view.beacons ?? null,
   };
