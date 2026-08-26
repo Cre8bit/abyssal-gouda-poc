@@ -78,6 +78,7 @@ let bloomLevel = -1;
 const currentMotes = []; // one mote cloud per flow, so each is visible
 let swimSpeed = 0;
 let flare; // { group, light, core, halo, dir, travelled, alive }
+let resonance; // the triangulation hologram: shell / ring / twins / lock + buoys
 let flashlight; // { group, spot, spill, beam, lens, halo, on }
 let bellGroup;
 let bellLight;
@@ -172,6 +173,7 @@ export function initGraphics(container) {
   createBubbles();
   createBursts();
   createFlare();
+  createResonance();
   createSparks();
   createBloom();
   createCurrentMotes();
@@ -1260,6 +1262,208 @@ function updateFlare(delta) {
   flare.core.scale.setScalar(0.8 + swell * 0.4);
 }
 
+// --- The Chorus: the triangulation hologram -------------------------------
+//
+// The solver hands us a shape — a shell, a ring, two twins, or a locked point —
+// and this is where that shape gets a body in the water. It is deliberately a
+// different colour from every other light in the game (a cold resonant aqua):
+// the bell pings amber, the lure lies in amber, but *knowledge* glows aqua, so
+// the moment the crew's fix appears you know you are looking at maths, not bait.
+const RESO_COLOR = 0x62ffd0;
+const RESO_BUOYS = 8;
+const _rv = new THREE.Vector3();
+const _rq = new THREE.Quaternion();
+const _rz = new THREE.Vector3(0, 0, 1);
+
+function resoMat(opacity) {
+  return new THREE.MeshBasicMaterial({
+    color: RESO_COLOR,
+    transparent: true,
+    opacity,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    fog: false,
+  });
+}
+
+function createBeacon(columnHeight) {
+  const group = new THREE.Group();
+  // A shaft of light lancing up and down through the water — the single most
+  // legible "over here" a diver can be given in a place with no landmarks.
+  const column = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.22, 0.22, columnHeight, 10, 1, true),
+    resoMat(0.22),
+  );
+  group.add(column);
+  const core = new THREE.Mesh(new THREE.SphereGeometry(0.9, 16, 12), resoMat(0.9));
+  group.add(core);
+  const halo = createHalo(6, 0.6, RESO_COLOR);
+  halo.material.fog = false;
+  halo.material.blending = THREE.AdditiveBlending;
+  group.add(halo);
+  const light = new THREE.PointLight(RESO_COLOR, 0, 60, 1.4);
+  group.add(light);
+  group.visible = false;
+  scene.add(group);
+  return { group, column, core, halo, light };
+}
+
+function createResonance() {
+  // SHELL — a whole sphere of "somewhere on here". Faint skin + a wire lattice
+  // so it reads as a surface, not a fog ball, from inside or out.
+  const shell = new THREE.Group();
+  const skin = new THREE.Mesh(new THREE.SphereGeometry(1, 40, 28), resoMat(0.045));
+  skin.material.side = THREE.DoubleSide;
+  const wire = new THREE.Mesh(
+    new THREE.SphereGeometry(1, 24, 16),
+    new THREE.MeshBasicMaterial({
+      color: RESO_COLOR,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.12,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+      fog: false,
+    }),
+  );
+  shell.add(skin, wire);
+  shell.visible = false;
+  scene.add(shell);
+
+  // RING — where two shells kiss. A clean glowing hoop you swim the rim of.
+  const ring = new THREE.Mesh(
+    new THREE.TorusGeometry(1, 0.02, 8, 96),
+    resoMat(0.85),
+  );
+  ring.visible = false;
+  scene.add(ring);
+
+  // TWINS use both beacons at half strength; LOCK uses beacon[0] at full.
+  const beacons = [createBeacon(240), createBeacon(240)];
+
+  // Anchored reading buoys — one soft mote wherever a reading was taken, so the
+  // crew can see their own baseline and read "we're all bunched up" at a glance.
+  const buoys = [];
+  for (let i = 0; i < RESO_BUOYS; i++) {
+    const g = new THREE.Group();
+    const core = new THREE.Mesh(new THREE.SphereGeometry(0.35, 10, 8), resoMat(0.8));
+    const halo = createHalo(2.4, 0.4, RESO_COLOR);
+    halo.material.fog = false;
+    halo.material.blending = THREE.AdditiveBlending;
+    g.add(core, halo);
+    g.visible = false;
+    scene.add(g);
+    buoys.push(g);
+  }
+
+  resonance = {
+    shell,
+    skin,
+    wire,
+    ring,
+    beacons,
+    buoys,
+    stage: 0,
+    quality: 0,
+    pulse: 0,
+  };
+}
+
+// Called every frame from the game loop with the solver's output. Positions
+// and reveals exactly the geometry for the current rung; the pulsing itself is
+// handled in updateResonance so it keeps breathing between solves.
+export function setResonance(sol) {
+  if (!resonance) return;
+  const r = resonance;
+  r.stage = sol?.stage ?? 0;
+  r.quality = sol?.quality ?? 0;
+
+  r.shell.visible = false;
+  r.ring.visible = false;
+  for (const b of r.beacons) b.group.visible = false;
+
+  if (!sol || sol.stage === 0) return;
+
+  if (sol.stage === 1) {
+    r.shell.visible = true;
+    r.shell.position.set(sol.center.x, sol.center.y, sol.center.z);
+    r.shell.scale.setScalar(sol.radius);
+  } else if (sol.stage === 2) {
+    const c = sol.ring.center;
+    r.ring.visible = true;
+    r.ring.position.set(c.x, c.y, c.z);
+    _rv.set(sol.ring.normal.x, sol.ring.normal.y, sol.ring.normal.z).normalize();
+    _rq.setFromUnitVectors(_rz, _rv);
+    r.ring.quaternion.copy(_rq);
+    // Tube scales with the hoop so a vast, uncertain ring reads as a fat, soft
+    // band and a tight one as a crisp wire.
+    r.ring.scale.setScalar(sol.ring.radius);
+  } else if (sol.stage === 3) {
+    const pts = sol.points ?? (sol.point ? [sol.point] : []);
+    pts.slice(0, 2).forEach((p, i) => {
+      const b = r.beacons[i];
+      b.group.visible = true;
+      b.group.position.set(p.x, p.y, p.z);
+    });
+  } else if (sol.stage === 4) {
+    const b = r.beacons[0];
+    b.group.visible = true;
+    b.group.position.set(sol.point.x, sol.point.y, sol.point.z);
+  }
+}
+
+// Drop the anchored reading markers at the given world positions.
+export function setResonanceBuoys(anchors) {
+  if (!resonance) return;
+  resonance.buoys.forEach((g, i) => {
+    const a = anchors[i];
+    if (a) {
+      g.visible = true;
+      g.position.set(a.x, a.y, a.z);
+    } else {
+      g.visible = false;
+    }
+  });
+}
+
+export function clearResonance() {
+  if (!resonance) return;
+  setResonance(null);
+  setResonanceBuoys([]);
+}
+
+function updateResonance(delta) {
+  if (!resonance) return;
+  const r = resonance;
+  r.pulse += delta;
+  const breathe = 0.5 + 0.5 * Math.sin(r.pulse * 2.2);
+
+  if (r.shell.visible) {
+    r.shell.rotation.y += delta * 0.15;
+    r.shell.rotation.x += delta * 0.05;
+    r.skin.material.opacity = 0.03 + 0.03 * breathe;
+    r.wire.material.opacity = 0.09 + 0.06 * breathe;
+  }
+  if (r.ring.visible) {
+    r.ring.rotation.z += delta * 0.4; // spin about its own axis — a live halo
+    r.ring.material.opacity = 0.6 + 0.35 * breathe;
+  }
+  // The sharper the crew's geometry, the harder the beacons burn — a fuzzy fix
+  // gives you a nervous, guttering light; a clean one a steady spike.
+  const conf = 0.35 + 0.65 * r.quality;
+  for (const b of r.beacons) {
+    if (!b.group.visible) continue;
+    const lock = r.stage === 4;
+    const amp = (lock ? 1 : 0.55) * conf;
+    b.core.material.opacity = (0.6 + 0.4 * breathe) * amp;
+    b.column.material.opacity = (0.12 + 0.12 * breathe) * amp;
+    b.halo.material.opacity = (0.35 + 0.3 * breathe) * amp;
+    b.halo.scale.setScalar(4 + breathe * 2);
+    b.light.intensity = (lock ? 220 : 90) * (0.7 + 0.3 * breathe) * conf;
+    b.light.distance = 55;
+  }
+}
+
 function createBubbles() {
   const positions = new Float32Array(BUBBLE_COUNT * 3);
   for (let i = 0; i < BUBBLE_COUNT; i++) {
@@ -1876,6 +2080,7 @@ export function renderLoop(onFrame) {
     wrapAroundCamera(bubbles, BUBBLE_RADIUS, 0.85, delta, drift);
     updateBursts(delta);
     updateFlare(delta);
+    updateResonance(delta);
     delta_ = delta;
     updateSparks(delta);
     fauna.update(camera, elapsed, delta);

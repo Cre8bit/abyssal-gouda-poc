@@ -485,6 +485,58 @@ export function playSwallow() {
   sub.stop(at + 2.7);
 }
 
+// The antenna taking a reading: a clean two-note upward chirp, bright and
+// synthetic — deliberately unlike the organic amber ping, so a reading always
+// sounds like an *instrument* answering, never like the sea.
+export function playAntenna() {
+  if (!ctx) return;
+  const at = ctx.currentTime;
+  for (const [delay, freq] of [
+    [0, 620],
+    [0.09, 930],
+  ]) {
+    const osc = ctx.createOscillator();
+    osc.type = "triangle";
+    osc.frequency.setValueAtTime(freq, at + delay);
+    osc.frequency.exponentialRampToValueAtTime(freq * 1.5, at + delay + 0.12);
+    osc.connect(envelope(at + delay, 0.22, 0.006, 0.16)).connect(master);
+    osc.start(at + delay);
+    osc.stop(at + delay + 0.2);
+  }
+}
+
+// Climbing a rung — SHELL → RING → TWINS → LOCK. A chord whose voices and
+// brightness grow with the stage, so the crew *hears* the fix sharpen: one
+// note for a shell, a full shining triad the instant it locks.
+export function playFix(stage) {
+  if (!ctx || stage < 1) return;
+  const at = ctx.currentTime;
+  // A just-intoned stack; more of it rings out the deeper into the fix you get.
+  const chord = [392, 523, 659, 784]; // G4 C5 E5 G5
+  const voices = Math.min(stage + 1, chord.length);
+  const bright = 0.5 + stage * 0.12;
+  for (let i = 0; i < voices; i++) {
+    const osc = ctx.createOscillator();
+    osc.type = stage >= 4 ? "sawtooth" : "triangle";
+    osc.frequency.value = chord[i];
+    const shape = ctx.createBiquadFilter();
+    shape.type = "lowpass";
+    shape.frequency.value = 900 + 1400 * bright;
+    osc.connect(shape).connect(envelope(at + i * 0.04, 0.16, 0.01, 0.9 + stage * 0.12)).connect(master);
+    osc.start(at + i * 0.04);
+    osc.stop(at + 1.6);
+  }
+  // A soft sub arrives only on the full lock — the ground under the certainty.
+  if (stage >= 4) {
+    const sub = ctx.createOscillator();
+    sub.type = "sine";
+    sub.frequency.setValueAtTime(98, at);
+    sub.connect(envelope(at, 0.3, 0.02, 1.4)).connect(master);
+    sub.start(at);
+    sub.stop(at + 1.6);
+  }
+}
+
 // Attack/decay gain node — every voice here shares the same shape.
 function envelope(at, amp, attack, release) {
   const gain = ctx.createGain();

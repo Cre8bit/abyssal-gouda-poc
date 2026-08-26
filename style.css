@@ -215,6 +215,80 @@ button:active {
   opacity: 0.8;
 }
 
+/* The Chorus: triangulation readout, tucked under the bell radar. */
+#triangulation {
+  position: absolute;
+  top: 14.3rem;
+  right: 1.5rem;
+  width: 9.6rem;
+  padding: 0.5rem 0.6rem;
+  background: rgba(0, 22, 32, 0.5);
+  border: 1px solid rgba(98, 255, 208, 0.22);
+  border-radius: 5px;
+  font-size: 0.7rem;
+  letter-spacing: 0.06em;
+}
+
+#tri-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  color: rgba(98, 255, 208, 0.7);
+  font-size: 0.62rem;
+  letter-spacing: 0.14em;
+}
+
+#tri-count {
+  color: rgba(210, 235, 250, 0.75);
+}
+
+#tri-stage {
+  margin: 0.3rem 0 0.35rem;
+  font-size: 1rem;
+  font-weight: bold;
+  letter-spacing: 0.12em;
+  color: rgba(160, 200, 220, 0.85);
+  text-shadow: 0 0 8px rgba(0, 20, 40, 0.9);
+}
+
+/* The rung glows brighter as the crew's knowledge sharpens. */
+#tri-stage[data-stage="1"] {
+  color: #9fc7dc;
+}
+#tri-stage[data-stage="2"] {
+  color: #7fe6d4;
+}
+#tri-stage[data-stage="3"] {
+  color: #ffe08a;
+}
+#tri-stage[data-stage="4"] {
+  color: #62ffd0;
+  text-shadow: 0 0 12px rgba(98, 255, 208, 0.7);
+}
+
+#tri-quality {
+  height: 4px;
+  background: rgba(140, 190, 215, 0.16);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+#tri-quality-fill {
+  height: 100%;
+  width: 0%;
+  background: #62ffd0;
+  transition:
+    width 0.25s linear,
+    background 0.25s linear;
+}
+
+#tri-hint {
+  margin-top: 0.4rem;
+  font-size: 0.66rem;
+  color: rgba(200, 225, 240, 0.7);
+  line-height: 1.3;
+}
+
 #oxygen {
   position: absolute;
   bottom: 3.2rem;

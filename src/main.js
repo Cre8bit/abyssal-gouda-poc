@@ -24,7 +24,22 @@ import {
   updateAngler,
   anglerState,
   placeAngler,
+  setResonance,
+  setResonanceBuoys,
+  clearResonance,
 } from "./graphics.js";
+import {
+  measureRange,
+  addReading,
+  clearReadings,
+  baselineOK,
+  getReadings,
+  readingCount,
+  solve,
+  nextSeq,
+  STAGE_NAME,
+  READING_COOLDOWN,
+} from "./triangulation.js";
 import {
   hostGame,
   joinGame,
@@ -80,6 +95,8 @@ import {
   playLurePing,
   playMawRoar,
   playSwallow,
+  playAntenna,
+  playFix,
 } from "./sonar.js";
 import {
   initVoice,
@@ -126,6 +143,10 @@ const minimapCanvas = document.getElementById("minimap");
 const bellRadarCanvas = document.getElementById("bell-radar");
 const oxygenFill = document.getElementById("oxygen-fill");
 const oxygenText = document.getElementById("oxygen-text");
+const triStage = document.getElementById("tri-stage");
+const triQualityFill = document.getElementById("tri-quality-fill");
+const triCount = document.getElementById("tri-count");
+const triHint = document.getElementById("tri-hint");
 
 const localPosition = { x: 0, y: 2, z: 8 };
 const velocity = { x: 0, y: 0, z: 0 };
@@ -140,6 +161,8 @@ let settleTimer = -1; // counts down between the bell's stop and the ejection
 let alarmTimer = ALARM_PERIOD;
 let creakTimer = 12;
 let flareCooldown = 0; // the flare is the one thing that buys you a look
+let readingCooldown = 0; // the antenna needs a beat to recharge between reads
+let triStageSeen = 0; // last fix rung, to chime only when the crew climbs one
 const currentNoise = new ImprovedNoise();
 const drift = { x: 0, y: 0, z: 0 }; // push from whatever current has hold of you
 let inCurrent = false;
@@ -289,6 +312,8 @@ window.addEventListener("keydown", (e) => {
     toggleMute();
   } else if (e.code === "KeyG") {
     throwFlare();
+  } else if (e.code === "KeyT") {
+    takeReading();
   } else if (e.code === "KeyE") {
     if (!eaten) toggleAttach();
   } else if (e.code === "KeyR") {
@@ -314,6 +339,47 @@ function throwFlare() {
   });
   flareCooldown = FLARE_RELOAD;
   showEvent("✷ Flare away.");
+}
+
+// --- The Chorus: the antenna reading ---------------------------------------
+//
+// One press, one sphere. The antenna hears how FAR the bell is, never which
+// way — so a single reading is a whole sphere of maybe, and the only way to a
+// point is more spheres, taken from places far enough apart to disagree. A
+// lone diver swims the baseline; a crew fans out and gets there four times as
+// fast. Either way it is a choice against the oxygen clock, never a chore.
+function takeReading() {
+  if (eaten) return;
+  if (attached) {
+    showEvent("Antenna stows while you ride the bell — release to sound.");
+    return;
+  }
+  if (readingCooldown > 0) {
+    showEvent(`Antenna recharging — ${readingCooldown.toFixed(1)}s`);
+    return;
+  }
+  if (!baselineOK(myId(), localPosition)) {
+    showEvent("≈ Too close to your last reading — swim wide for a new angle.");
+    return;
+  }
+  const bell = getBell();
+  const r = measureRange(localPosition, { x: 0, y: bell.y, z: 0 }, bell.level);
+  const reading = {
+    id: myId(),
+    x: localPosition.x,
+    y: localPosition.y,
+    z: localPosition.z,
+    r,
+    seq: nextSeq(),
+  };
+  addReading(reading);
+  readingCooldown = READING_COOLDOWN;
+  playAntenna();
+  // A client's reading only reaches the host; the host fans it out to everyone
+  // (and back to the author, where the seq dedupe drops it) so all windows
+  // fuse the identical set of spheres.
+  sendEvent({ kind: "reading", ...reading });
+  showEvent(`◎ Reading taken — ${Math.round(r)} m to the bell. Share it.`);
 }
 
 function broadcastNow() {
@@ -368,6 +434,10 @@ function restart() {
   eaten = false;
   eatenTimer = 0;
   despawnAngler();
+  clearReadings();
+  clearResonance();
+  triStageSeen = 0;
+  readingCooldown = 0;
   for (const peerId of remoteAttached.keys()) remoteAttached.set(peerId, true);
   for (const peerId of remoteEaten.keys()) remoteEaten.set(peerId, false);
   for (const buffer of remoteBuffers.values()) buffer.reset();
@@ -517,7 +587,12 @@ onEventReceived((peerId, data) => {
   if (data.kind === "drop") {
     startDrop(data.level);
     playDescent(DROP_DURATION);
+    clearReadings(); // the bell has moved — every old sphere is a lie now
     showEvent(`▼ The bell drops to level ${data.level}…`);
+  } else if (data.kind === "reading") {
+    // A peer sounded their antenna. Fuse it, and if we're the host, relay it
+    // on to the rest of the crew (the author gets it back but dedupes it).
+    if (addReading(data) && isHost) sendEvent(data);
   } else if (data.kind === "sync") {
     snapToLevel(data.level);
     attached = true;
@@ -594,6 +669,7 @@ renderLoop((delta) => {
     const level = bell.level + 1;
     startDrop(level);
     playDescent(DROP_DURATION);
+    clearReadings(); // the bell has moved — every old sphere is a lie now
     sendEvent({ kind: "drop", level });
     showEvent(`▼ The bell drops to level ${level}…`);
   }
@@ -755,6 +831,7 @@ renderLoop((delta) => {
   if (!shot) updateCurrent(delta, localPosition, currentNoise);
   if (shot?.current) updateCurrent(0, localPosition, currentNoise);
   if (flareCooldown > 0) flareCooldown = Math.max(0, flareCooldown - delta);
+  if (readingCooldown > 0) readingCooldown = Math.max(0, readingCooldown - delta);
   creakTimer -= shot ? 0 : delta;
   if (creakTimer <= 0) {
     creakTimer = 9 + Math.random() * 22;
@@ -784,6 +861,18 @@ renderLoop((delta) => {
       setVoicePosition(peerId, s.x, s.y, s.z);
     }
   }
+
+  // 11.5 The Chorus: fuse every anchored reading into the crew's current fix,
+  //      give it a body in the water, and chime whenever a new rung is reached.
+  const fix = solve();
+  setResonance(fix);
+  setResonanceBuoys(getReadings());
+  if (fix.stage > triStageSeen) {
+    playFix(fix.stage);
+    showEvent(STAGE_TOAST[fix.stage], 3000);
+  }
+  triStageSeen = fix.stage;
+  updateTriangulationHud(fix);
 
   // 12. HUD.
   drawCompass(yaw);
@@ -982,6 +1071,43 @@ function showEvent(text, duration = 2200) {
     toast.classList.add("leaving");
     setTimeout(() => toast.remove(), 400);
   }, duration);
+}
+
+// What each rung of the fix feels like, called out the moment the crew reaches
+// it — the granularity of the knowledge, narrated.
+const STAGE_TOAST = {
+  1: "◎ SHELL — the bell is somewhere on this sphere.",
+  2: "◎ RING — two soundings agree: swim the glowing hoop.",
+  3: "◎ TWINS — two candidates now. One of them is a ghost.",
+  4: "◉ LOCK — the bell has an address. Follow the beam.",
+};
+
+function updateTriangulationHud(fix) {
+  if (!triStage) return;
+  triStage.textContent = STAGE_NAME[fix.stage];
+  triStage.dataset.stage = String(fix.stage);
+  triCount.textContent = `${readingCount()} ✦`;
+
+  const q = Math.round((fix.quality ?? 0) * 100);
+  triQualityFill.style.width = `${q}%`;
+  triQualityFill.style.background =
+    q > 66 ? "#62ffd0" : q > 33 ? "#ffe08a" : "#ff8a6a";
+
+  let hint;
+  if (eaten) {
+    hint = "Antenna dark — swallowed.";
+  } else if (attached) {
+    hint = "Release (E) to sound the antenna.";
+  } else if (readingCooldown > 0) {
+    hint = `Recharging… ${readingCooldown.toFixed(1)}s`;
+  } else if (!baselineOK(myId(), localPosition)) {
+    hint = "Swim wide for a new angle, then T.";
+  } else if (fix.stage >= 4) {
+    hint = "Locked — T to sharpen, or follow the beam.";
+  } else {
+    hint = "T — take a reading.";
+  }
+  triHint.textContent = hint;
 }
 
 function clamp(v, min, max) {
