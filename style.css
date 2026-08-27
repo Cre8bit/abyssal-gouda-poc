@@ -233,17 +233,22 @@ button:active {
   text-shadow: 0 0 8px rgba(0, 20, 40, 0.9);
 }
 
-/* Distance to the gouda gold, under the compass strip. */
-#gold-indicator {
+/* The haul line, under the compass strip: what [E] does right now. It sits
+   TOP-centre and not down by the crosshair for one reason — a carried Gouda
+   fills the bottom third of the frame with its own glow, and nothing written
+   there is legible while you are holding it. Empty (and invisible) unless the
+   wheel is within reach or in your arms: a prompt, never a tracker (D4). */
+#carry-prompt {
   position: absolute;
   top: 3.4rem;
   left: 50%;
   transform: translateX(-50%);
-  font-size: 0.8rem;
-  letter-spacing: 0.14em;
+  font-size: 0.85rem;
+  letter-spacing: 0.12em;
   color: #ffc23d;
   text-shadow: 0 0 10px rgba(255, 194, 61, 0.5);
-  opacity: 0.9;
+  opacity: 0.92;
+  white-space: nowrap;
 }
 
 #voice-indicator {
@@ -420,6 +425,53 @@ button:active {
   letter-spacing: 0.5em;
   text-indent: 0.5em;
   color: rgba(160, 200, 220, 0.7);
+}
+
+/* --- Run won (M1.3 placeholder) --- */
+#win-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 45;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  background: radial-gradient(
+    ellipse at center,
+    rgba(50, 32, 4, 0.82) 20%,
+    rgba(4, 3, 0, 0.97) 100%
+  );
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 1s ease;
+}
+
+#win-overlay.visible {
+  opacity: 1;
+}
+
+.win-title {
+  font-family: monospace;
+  font-size: 1.5rem;
+  letter-spacing: 0.34em;
+  text-indent: 0.34em;
+  color: #ffd88a;
+  text-shadow: 0 0 22px rgba(255, 194, 61, 0.55);
+}
+
+.win-sub {
+  font-family: monospace;
+  font-size: 0.9rem;
+  letter-spacing: 0.16em;
+  color: rgba(255, 226, 170, 0.8);
+}
+
+.win-hint {
+  font-family: monospace;
+  font-size: 0.72rem;
+  letter-spacing: 0.2em;
+  color: rgba(255, 226, 170, 0.4);
 }
 
 .hidden {

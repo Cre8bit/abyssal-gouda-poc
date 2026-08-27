@@ -29,6 +29,10 @@ const BITE_SHOVE = 9; // impulse away from the snapping jaws (u/s)
 
 export interface CatfishSystemDeps {
   showEvent(text: string, durationMs?: number): void;
+  // A hit landed on the local diver. Damage has one consequence so far —
+  // you may lose your grip on the Golden Gouda (M1.1) — and the fish has no
+  // business knowing that, so it just reports the hit.
+  onDamage?(): void;
 }
 
 export interface CatfishSystem extends GameSystem {
@@ -39,6 +43,7 @@ export interface CatfishSystem extends GameSystem {
 
 export function createCatfishSystem({
   showEvent,
+  onDamage,
 }: CatfishSystemDeps): CatfishSystem {
   let netTimer = 0;
 
@@ -55,6 +60,7 @@ export function createCatfishSystem({
     v.z += (dz / d) * BITE_SHOVE;
     playBite();
     showEvent("🐟 A lantern-catfish snaps at you! Swim!");
+    onDamage?.();
   };
 
   return {

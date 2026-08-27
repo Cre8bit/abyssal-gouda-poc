@@ -18,6 +18,7 @@ import {
   rebuildWorld,
   emitBreath,
   burstAt,
+  setFlashlight,
 } from "./render/graphics.ts";
 import {
   initAbyssAudio,
@@ -31,6 +32,7 @@ import {
   resolveCollision,
   findOpenSpot,
   getSpawnPoint,
+  getGoldPos,
   digAt,
   raycastSolid,
   WORLD_R,
@@ -43,6 +45,7 @@ import {
   isConnected,
   getPeer,
   getHostId,
+  getMyId,
   getPeerIds,
   getWorstRtt,
   getSignalingMode,
@@ -88,6 +91,7 @@ import {
   getPeerStatus,
   clearPeerStatus,
   statusIcons,
+  hasLocalStatus,
 } from "./game/effects.ts";
 import { initOxygen, refillOxygen, isDead } from "./game/oxygen.ts";
 import { setBellCount, collideBathyscaphe } from "./world/bathyscaphe.ts";
@@ -110,7 +114,14 @@ import { createEffectsSystem } from "./systems/effectsSystem.ts";
 import { createOxygenSystem } from "./systems/oxygenSystem.ts";
 import { createCatfishSystem } from "./systems/catfishSystem.ts";
 import { createItemsSystem } from "./systems/itemsSystem.ts";
-import { sendItemSnapshotTo } from "./game/items.ts";
+import { createCargoSystem } from "./systems/cargoSystem.ts";
+import { getMountedGouda } from "./entities/goldenGouda.ts";
+import { carrySpeedCap, CARGO } from "./game/cargo.ts";
+import {
+  sendItemSnapshotTo,
+  requestItemSnapshotFrom,
+  getItem,
+} from "./game/items.ts";
 
 const MAX_SPEED = 10.0; // units per second — brisk fins
 const SPRINT_MULT = 1.9; // hold Shift: burst of speed (descend is on C)
@@ -158,6 +169,9 @@ const o2Bar = el("o2-bar");
 const pingText = el("ping");
 const peerStatusText = el("peer-status");
 const deathOverlay = el("death-overlay");
+const winOverlay = el("win-overlay");
+const winSub = el("win-sub");
+const carryPrompt = el("carry-prompt");
 
 // Network events arrive as loose GameEvent records — each handled kind
 // trusts its payload shape exactly as the JS did (same-version peers).
@@ -190,7 +204,29 @@ initMouseLook(canvas);
 // the loop runs them in ONE slot — after input smoothing, before physics.
 registerSystem(createEffectsSystem()); // 10 — expire timed statuses
 registerSystem(createOxygenSystem({ o2Fill, o2Bar })); // 20 — drain + HUD
-const catfishSys = registerSystem(createCatfishSystem({ showEvent })); // 30
+const cargoSys = registerSystem(
+  createCargoSystem({
+    showEvent,
+    // G4: the carrier's own torch is off for as long as they hold the wheel.
+    setTorch: (on) => {
+      game.flashlightOn = setFlashlight(on);
+      broadcastNow();
+    },
+    setPrompt: (text) => (carryPrompt.textContent = text ?? ""),
+    onWin: showWin,
+  }),
+); // 35 — the haul
+const catfishSys = registerSystem(
+  createCatfishSystem({
+    showEvent,
+    // A bite can knock the Golden Gouda out of your arms (M1.1).
+    onDamage: () => {
+      if (Math.random() < CARGO.BITE_FUMBLE_CHANCE) {
+        cargoSys.fumble("🧀 The jaws hit you — the Gouda is loose!");
+      }
+    },
+  }),
+); // 30
 registerSystem(createItemsSystem()); // 40 — dynamic map objects
 
 // Procedural abyss soundscape — must boot inside a user gesture, so hook
@@ -246,6 +282,14 @@ async function buildWorld(rebuild = false) {
   // Release the lantern-catfish (host/solo simulate; joiners get puppets
   // rebuilt from the authority's first fish-state broadcast).
   catfishSys.spawn(game.difficulty);
+  // Seed the Golden Gouda into its cavern. Same seed → same hiding place on
+  // every client, so placing it costs nothing on the wire (M1.2).
+  cargoSys.spawn();
+  // …but a REBUILD wiped the registry, so anything that has already moved
+  // (the wheel is in someone's arms, a light stick was dropped) has to come
+  // back from the host.
+  const hostId = getHostId();
+  if (hostId) requestItemSnapshotFrom(hostId);
 }
 // Headless screenshot mode (?shot=<name>, see shots.js + tools/runner.mjs):
 // once the world is up, skip the menu and pin the player to the vantage point.
@@ -262,6 +306,8 @@ hostBtn.addEventListener("click", async () => {
     game.hostedId = id;
     game.fishAuthority = true;
     game.fishAuthorityId = id;
+    // A wheel picked up before the mesh existed is filed under "local".
+    cargoSys.rebindLocalId();
     const peer = getPeer();
     if (peer) initVoice(peer); // non-null right after hostGame() resolves
     showStatus("Invite a diver:");
@@ -315,6 +361,7 @@ async function join(hostId: string, mode: SignalingMode | null = null) {
     // calls are placed per-peer by onPeerConnected.
     game.fishAuthority = false;
     game.fishAuthorityId = remoteId;
+    cargoSys.rebindLocalId();
     menu.classList.add("hidden");
     hud.classList.remove("hidden");
   } catch (err) {
@@ -357,6 +404,10 @@ scatterBtn.addEventListener("click", scatter);
 // Action keys (physical positions — layout-agnostic).
 window.addEventListener("keydown", (e) => {
   if (e.code === "KeyF") {
+    if (hasLocalStatus(STATUS.CARRYING)) {
+      showEvent("🔦 Not while you're holding it — the Gouda is your light.");
+      return;
+    }
     game.flashlightOn = toggleFlashlight();
     playClick();
     showEvent(
@@ -371,7 +422,10 @@ window.addEventListener("keydown", (e) => {
   } else if (e.code === "KeyT" && isConnected()) {
     scatter();
   } else if (e.code === "KeyE") {
-    tryDig();
+    // One contextual verb: the Gouda first (lift it, or hand it over), the
+    // pickaxe otherwise. They can never both apply — you cannot dig with
+    // both arms full, which is exactly why the wheel gets first refusal.
+    if (!cargoSys.use()) tryDig();
   }
 });
 
@@ -381,6 +435,10 @@ window.addEventListener("keydown", (e) => {
 let lastDigAt = 0;
 function tryDig() {
   if (!game.worldReady || isDead()) return;
+  if (hasLocalStatus(STATUS.CARRYING)) {
+    showEvent("⛏ Both arms are full — you can't swing with the Gouda.");
+    return;
+  }
   const now = performance.now();
   if (now - lastDigAt < DIG_COOLDOWN_MS) return;
 
@@ -622,10 +680,17 @@ renderLoop((delta) => {
   _right.x = Math.cos(swimYaw);
   _right.z = -Math.sin(swimYaw);
 
-  const speedCap = MAX_SPEED * (isSprinting() ? SPRINT_MULT : 1);
+  // Hauling the Golden Gouda: a lower cap and a constant pull downward
+  // (G3). The sink is applied to the TARGET velocity, so swimming up still
+  // works — you just have to keep doing it, and the moment you stop kicking
+  // the abyss starts taking it back down (D3: home is up).
+  const carrying = hasLocalStatus(STATUS.CARRYING);
+  const baseCap = carrying ? carrySpeedCap(MAX_SPEED) : MAX_SPEED;
+  const speedCap = baseCap * (isSprinting() ? SPRINT_MULT : 1);
   _target.x = (_fwd.x * move.z + _right.x * move.x) * speedCap;
   _target.y = (_fwd.y * move.z + move.y) * speedCap;
   _target.z = (_fwd.z * move.z + _right.z * move.x) * speedCap;
+  if (carrying) _target.y -= CARGO.SINK_RATE;
 
   // Water inertia.
   const k = 1 - Math.exp(-WATER_INERTIA * delta);
@@ -681,6 +746,8 @@ renderLoop((delta) => {
   // 4b. First-person body: trails the lazy swim orientation while the head
   // (camera) looks around freely — arms come into view when you look down.
   updateLocalPlayer(pos, yaw, pitch, swimYaw, swimPitch, vel);
+  // 4c. …and whatever is in those arms rides the body it is strapped to.
+  cargoSys.followCarrier();
 
   // 5. Spatial audio listener follows the camera; the procedural abyss
   // soundscape follows depth, speed, and effort.
@@ -720,8 +787,9 @@ renderLoop((delta) => {
     }
   }
 
-  // 8. HUD. (No gold tracker: the gold is hidden — search, listen for the
-  // glow leaking out of tunnel mouths.)
+  // 8. HUD. (The gold is hidden by design — search, listen for the glow
+  // leaking out of tunnel mouths. SHOW_GOUDA_BEARING temporarily overrides
+  // that for playtesting; see drawGoudaBearing.)
   drawCompass(yaw);
   depthText.textContent = `▼ ${Math.max(0, Math.round(ABYSS_DEPTH - pos.y))} m`;
 
@@ -754,8 +822,9 @@ initOxygen({
   onDeath: () => {
     deathOverlay.classList.add("visible");
     showEvent("💀 Blackout… the abyss takes you.", DEATH_RESPAWN_MS);
-    // TODO(phase 1): drop the Golden Gouda (and any carried items) here.
-    setLocalStatus(STATUS.CARRYING, false);
+    // Limp hands: whatever you were carrying is left in the water where you
+    // blacked out, not carried home for you.
+    cargoSys.fumble("🧀 Your grip fails — the Gouda slips away.");
     clearTimeout(respawnTimer);
     respawnTimer = setTimeout(() => {
       const s = game.spawnPoint;
@@ -781,6 +850,13 @@ if (import.meta.env.DEV) {
     getLocalPos: () => ({ ...game.localPosition }),
     teleport: teleportLocal,
     setLook,
+    // The haul (M1), driveable from the console or a headless harness:
+    // __abyssal.goldPos() → teleport next to it → cargo.use() to lift it.
+    cargo: cargoSys,
+    goldPos: getGoldPos,
+    gouda: () => getItem("gouda"),
+    goudaVisual: getMountedGouda, // live light/emissive tuning from the console
+    getLocalStatus,
   };
 }
 
@@ -831,8 +907,84 @@ function drawCompass(yaw: number) {
   // Center marker.
   ctx.fillRect(w / 2 - 1, h - 12, 2, 12);
 
-  // (No gold bearing — the gold is hidden somewhere in the wheels; the
-  // compass only keeps you oriented.)
+  if (SHOW_GOUDA_BEARING) drawGoudaBearing(ctx, w, heading);
+}
+
+// --- TEMPORARY playtest aid: bearing to the Golden Gouda -------------------
+// This deliberately breaks register D4 (the wheel is hidden and never
+// tracked — you find it by searching and by the glow leaking out of tunnel
+// mouths). It exists so a solo tester can reach the cargo without digging the
+// whole labyrinth first. Flip the flag to false (or delete this block and the
+// call above, plus the extra 14px of canvas height in index.html) to get the
+// real HUD back.
+const SHOW_GOUDA_BEARING = true;
+
+function drawGoudaBearing(
+  ctx: CanvasRenderingContext2D,
+  w: number,
+  heading: number,
+) {
+  // The item is the live wheel (it moves once someone lifts it); the seed
+  // position is the fallback for the frame before it is spawned.
+  const target = getItem("gouda") ?? getGoldPos();
+  if (!target) return;
+
+  const p = game.localPosition;
+  const dx = target.x - p.x;
+  const dy = target.y - p.y;
+  const dz = target.z - p.z;
+  const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+  // Forward is (-sin yaw, -cos yaw) and heading is -yaw, so a heading h looks
+  // along (sin h, -cos h) — invert that to get the wheel's absolute bearing.
+  const bearing = ((Math.atan2(dx, -dz) * 180) / Math.PI + 360) % 360;
+  // Signed shortest offset from where we are looking, in (-180, 180].
+  const deg = ((((bearing - heading + 540) % 360) + 360) % 360) - 180;
+  const off = deg < -60 || deg > 60; // outside the strip's 120° window
+  // Clamped to the window, then inset so a pinned chevron stays on-canvas.
+  const x = Math.max(
+    8,
+    Math.min(w - 8, w / 2 + Math.max(-60, Math.min(60, deg)) * (w / 120)),
+  );
+
+  ctx.fillStyle = "rgba(255, 208, 96, 0.95)";
+  ctx.beginPath();
+  if (off) {
+    // Off the strip: a chevron pinned to the edge, pointing the short way.
+    const s = deg > 0 ? 1 : -1; // apex leans the way you have to turn
+    ctx.moveTo(x - s * 6, 14);
+    ctx.lineTo(x - s * 6, 22);
+    ctx.lineTo(x + s * 3, 18);
+  } else {
+    ctx.moveTo(x - 6, 14);
+    ctx.lineTo(x + 6, 14);
+    ctx.lineTo(x, 22);
+  }
+  ctx.closePath();
+  ctx.fill();
+
+  // Distance, kept clear of the canvas edges so it never clips.
+  ctx.font = "11px monospace";
+  ctx.textAlign = "center";
+  ctx.fillText(
+    `\u{1F9C0} ${Math.round(dist)} m ${dy > 2 ? "\u25B2" : dy < -2 ? "\u25BC" : "\u2022"}`,
+    Math.max(46, Math.min(w - 46, x)),
+    11,
+  );
+}
+
+// --- Run won (M1.3, placeholder) -------------------------------------------
+// The Gouda crossed the bell's hatch radius. M5.4 turns this into a real run
+// summary (time, essence, who died, who dropped it); for now it just has to
+// be unmistakable that the run ENDED, and that you won it.
+function showWin(carrier: string) {
+  const mine = carrier === getMyId() || getPeerIds().indexOf(carrier) === -1;
+  winSub.textContent = mine
+    ? "you hauled it home"
+    : `${carrier.slice(0, 4)} hauled it home`;
+  winOverlay.classList.add("visible");
+  carryPrompt.textContent = "";
+  playWhoosh();
 }
 
 function showStatus(text: string) {

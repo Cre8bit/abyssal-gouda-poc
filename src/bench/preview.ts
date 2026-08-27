@@ -13,6 +13,8 @@
 // Every model/creature that enters the game MUST get an entry in MODELS
 // below, in the same PR that adds it. An entry is:
 //   { id, label, url, cam: { dist, height, gridY }, build(gltf) }
+// `url` is optional: a model built entirely in code (the Golden Gouda) has
+// no GLB to fetch, and build() is handed null instead of a gltf.
 // build() returns an instance the bench drives:
 //   group           — added to the scene while this model is active
 //   update(dt, t)   — dt is already rate-scaled (0 while paused)
@@ -33,8 +35,15 @@ import {
   updateDiverRig,
   FP_VIEW,
 } from "../entities/diverRig.ts";
-import { toonify } from "../render/toon.ts";
+import { prepareCatfishTemplate } from "../entities/catfish.ts";
+import { toonMaterial } from "../render/toon.ts";
 import { createBellVisual } from "../world/bathyscaphe.ts";
+import {
+  createGoudaVisual,
+  prepareGoudaTemplate,
+  GOUDA_RADIUS,
+} from "../entities/goldenGouda.ts";
+import { CARGO } from "../game/cargo.ts";
 
 // The instance contract documented above, as a real type: what build() must
 // return for the bench to drive it.
@@ -61,9 +70,9 @@ export interface BenchUiApi {
 export interface BenchModelDef {
   id: string;
   label: string;
-  url: string;
+  url?: string; // omitted for models generated in code
   cam: BenchCamSpec;
-  build(gltf: GLTF): BenchInstance;
+  build(gltf: GLTF | null): BenchInstance;
 }
 
 export interface BenchCamSpec {
@@ -86,6 +95,10 @@ const LANTERN_BASE: Record<string, number> = {
 };
 const TORCH_OFFSET = new THREE.Vector3(0, 0.35, -0.14);
 const TORCH_INTENSITY = 190;
+
+// Bone-local axes for overlays parented to a bone (the gouda's bit arrows).
+const BONE_UP = new THREE.Vector3(0, 1, 0);
+const ORIGIN = new THREE.Vector3();
 
 // --- Scene -----------------------------------------------------------------
 const scene = new THREE.Scene();
@@ -203,10 +216,7 @@ function loadGltf(url: string) {
 // One prepared diver template shared by the third-person and FP entries.
 let diverTemplate: ReturnType<typeof prepareDiverTemplate> | null = null;
 function diverTemplateFrom(gltf: GLTF) {
-  if (!diverTemplate) {
-    toonify(gltf.scene); // same cel pass as graphics.js
-    diverTemplate = prepareDiverTemplate(gltf);
-  }
+  diverTemplate ??= prepareDiverTemplate(gltf); // cel pass runs inside prep
   return diverTemplate;
 }
 
@@ -476,12 +486,7 @@ function buildGloves(gltf: GLTF): BenchInstance {
 // Baked clips (swim / bite / flicker) exactly as catfish.js plays them, plus
 // the lantern light logic so each mood can be judged with its clip.
 function buildCatfish(gltf: GLTF): BenchInstance {
-  const root = gltf.scene;
-  root.traverse((o) => {
-    if ((o as THREE.Mesh).isMesh || (o as THREE.SkinnedMesh).isSkinnedMesh)
-      o.frustumCulled = false;
-  });
-  toonify(root, { ink: 0.8 }); // heavy ink — it's the monster
+  const root = prepareCatfishTemplate(gltf).scene; // same cel pass as in game
   root.scale.setScalar(CATFISH_SCALE);
 
   const group = new THREE.Group();
@@ -698,6 +703,112 @@ function buildBell(gltf: GLTF): BenchInstance {
   };
 }
 
+// --- Model: the Golden Gouda ---------------------------------------------------
+// This is the ONLY place you can actually look at the wheel without playing a
+// whole run to its cavern. Two things to judge here.
+//
+// The lights: the near lamp has to read as a room light rather than a sun, and
+// the long glow has to still be faintly visible at tunnel-mouth distance (the
+// only hint the map gives).
+//
+// The levitation: golden_gouda.glb ships a real skin — 7 bones weighted one
+// per floating cheese bit, plus Blender's `neutral_bone` holding the wheel
+// itself (see the rig notes in entities/goldenGouda.ts). The bits ARE bones
+// here, so this is where you check the rig survived its last export:
+// prepareGoudaTemplate() measures it and the bit count below is how many bit
+// bones actually own geometry, so a re-export that drops or renames a bone
+// shows up here first. "lift" scrubs the travel live — the bits have to
+// breathe out of their own sockets and back in, and never so far that they
+// read as debris that fell off.
+//
+// The grid doubles as a ruler: PLAYER_RADIUS is 0.6 and a rat diver is about
+// 1.3 u tall, so the wheel should look like an armful, not a boulder.
+function buildGouda(gltf: GLTF | null): BenchInstance {
+  const gouda = createGoudaVisual(gltf ? prepareGoudaTemplate(gltf) : null);
+  let held = false;
+
+  // A stand-in diver at the hold offset: the point of "held" mode is whether
+  // the wheel sits in front of a body without the bits clipping through it.
+  const stand = new THREE.Mesh(
+    new THREE.CapsuleGeometry(0.6, 0.7, 6, 12),
+    toonMaterial({ color: 0x2b4756, transparent: true, opacity: 0.5 }),
+  );
+  stand.position.set(0, CARGO.HOLD_DOWN, CARGO.HOLD_FORWARD);
+  stand.visible = false;
+  gouda.group.add(stand);
+
+  // The rig, drawn: one arrow per bit bone, parented TO the bone and pointing
+  // along its own +Y — the axis that bit rides out on. Parented rather than
+  // placed, so each arrow inherits the bone's real animated transform: the
+  // arrows spin with the wheel, breathe out with their bit, and pick up the
+  // wobble, which is the whole thing you want to look at. Lengths are quoted
+  // in world u and divided into bone units (bones live in model space).
+  let bonesOn = false;
+  const markers: THREE.ArrowHelper[] = [];
+  const s = gouda.scale;
+  for (const bit of gouda.bits) {
+    const arrow = new THREE.ArrowHelper(
+      BONE_UP,
+      ORIGIN,
+      0.45 / s,
+      0x5ce8ff,
+      0.12 / s,
+      0.07 / s,
+    );
+    arrow.visible = false;
+    bit.bone.add(arrow);
+    markers.push(arrow);
+  }
+
+  return {
+    group: gouda.group,
+    update(_dt: number, t: number) {
+      gouda.update(t, held);
+    },
+    ui(panel: HTMLElement, api: BenchUiApi) {
+      const parts = section(panel, "Haul");
+      button(parts, "held", (b) => {
+        held = !held;
+        stand.visible = held;
+        b.classList.toggle("on", held);
+      });
+
+      const lev = section(panel, "Levitation");
+      api.sliderRow(lev, "lift", 0, 0.3, 0.005, gouda.lift, (v) => {
+        gouda.lift = v;
+      });
+      button(lev, "bones", (b) => {
+        bonesOn = !bonesOn;
+        for (const arrow of markers) arrow.visible = bonesOn;
+        b.classList.toggle("on", bonesOn);
+      });
+
+      const note = document.createElement("div");
+      note.className = "hint";
+      note.textContent =
+        `wheel radius ${GOUDA_RADIUS} u — a rat diver is ~1.3 u tall. "held" ` +
+        "pins the spin, pulls the levitation travel in so the bits cannot " +
+        "push through a chest, and shows a stand-in diver at the carry " +
+        "offset. Carrying it forces the carrier's own torch off: this IS the " +
+        'party\'s light. "bones" draws each bit bone along its own +Y — the ' +
+        "axis that bit rides out on — parented to the bone, so the arrows " +
+        "move with the rig";
+      panel.appendChild(note);
+    },
+    action() {
+      held = !held;
+      stand.visible = held;
+    },
+    lines: () => [
+      ["lamp", gouda.lamp.intensity.toFixed(0)],
+      ["glow", gouda.glow.intensity.toFixed(0)],
+      ["held", held ? "yes" : "no"],
+      ["bits", `${gouda.bits.length} / 7 bit bones`],
+      ["lift", `${gouda.lift.toFixed(3)} u`],
+    ],
+  };
+}
+
 // --- Registry ----------------------------------------------------------------
 // ⚠ Standing rule: every new game model gets an entry here (see AGENTS.md).
 const MODELS: BenchModelDef[] = [
@@ -729,6 +840,13 @@ const MODELS: BenchModelDef[] = [
     cam: { dist: 14, height: 4.5, gridY: 0 },
     build: buildBell,
   },
+  {
+    id: "gouda",
+    label: "golden gouda",
+    url: `${BASE}models/golden_gouda.glb`,
+    cam: { dist: 4.5, height: 0, gridY: -1.6 },
+    build: buildGouda,
+  },
 ];
 
 // --- Bench state ---------------------------------------------------------------
@@ -758,14 +876,18 @@ async function activate(def: BenchModelDef) {
 
   if (!instances.has(def.id)) {
     try {
-      console.log(`bench: loading ${def.url}`);
-      const gltf = await loadGltf(def.url);
+      // Code-built models (no url) skip the fetch entirely.
+      let gltf: GLTF | null = null;
+      if (def.url) {
+        console.log(`bench: loading ${def.url}`);
+        gltf = await loadGltf(def.url);
+      }
       console.log(`bench: building ${def.id}`);
       instances.set(def.id, def.build(gltf));
       console.log(`bench: built ${def.id}`);
     } catch (err) {
-      console.error(`failed to load ${def.url}`, err);
-      $("loading").textContent = `failed to load ${def.url}`;
+      console.error(`failed to build ${def.id}`, err);
+      $("loading").textContent = `failed to build ${def.id}`;
       return;
     }
   }
@@ -799,9 +921,13 @@ async function activate(def: BenchModelDef) {
 
 function applyWire() {
   ACTIVE?.group.traverse((o) => {
-    const m = o as THREE.Mesh & { material: THREE.MeshStandardMaterial };
-    if (m.isMesh || (o as THREE.SkinnedMesh).isSkinnedMesh)
-      m.material.wireframe = wire;
+    const m = o as THREE.Mesh;
+    if (!m.isMesh && !(o as THREE.SkinnedMesh).isSkinnedMesh) return;
+    // One mesh can carry several materials (the golden gouda's wheel draws its
+    // cel-shaded body and its unlit bits as two geometry groups), so walk the
+    // array — assigning through it would set a dead property on the Array.
+    for (const mat of Array.isArray(m.material) ? m.material : [m.material])
+      (mat as THREE.MeshStandardMaterial).wireframe = wire;
   });
 }
 

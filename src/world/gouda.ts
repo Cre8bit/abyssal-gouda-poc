@@ -26,7 +26,7 @@
 //   the galleries (95–130)   cathedral wheels: huge chambers, wide tunnels
 //   the bulwark   (~78)      SEALED WALL #2 — tighter, meaner
 //   the hollows   (38–58)    cramped approach wheels
-//   the heart     (0)        colossal hunk, gold core in its grand cavern
+//   the heart     (0)        colossal hunk, a grand cavern — and a DECOY
 //
 // Dead-end chambers sealed by deliberately thin walls are marked with a
 // crack-glow (getBlastPoints()) — dig or (future) blast through them.
@@ -36,14 +36,16 @@
 import * as THREE from "three";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { MarchingCubes } from "three/examples/jsm/objects/MarchingCubes.js";
-import { getToonGradient } from "../render/toon.ts";
+import { toonMaterial } from "../render/toon.ts";
 import type { Vec3 } from "../state.ts";
 
 export const WORLD_R = 420; // outer edge of the drift
 export const BOUNDARY_R = 470; // visible map boundary veil
 export const HEART_POS = { x: 0, y: 0, z: 0 }; // map center — a DECOY.
-// The gold hides in a random cavern inside one of the mid-radius wheels
-// (see GOLD_BAND) and is NOT shown on the compass. Search, listen, dig.
+// The Golden Gouda hides in a random cavern inside one of the mid-radius
+// wheels (see GOLD_BAND) and is NOT shown on the compass. Search, listen for
+// its glow leaking out of tunnel mouths, dig. getGoldPos() is only the SEED
+// position — once the run starts the wheel is an item and it moves.
 const GOLD_BAND = [60, 175];
 
 const HEART_S = 56;
@@ -181,22 +183,6 @@ interface Debris {
   mesh: THREE.Mesh;
 }
 
-interface GoldShard {
-  mesh: THREE.Mesh;
-  radius: number;
-  speed: number;
-  phase: number;
-  tilt: number;
-}
-
-interface GoldCore {
-  group: THREE.Group;
-  core: THREE.Mesh<THREE.IcosahedronGeometry, THREE.MeshToonMaterial>;
-  light: THREE.PointLight;
-  deepGlow: THREE.PointLight;
-  shards: GoldShard[];
-}
-
 // --- Generation parameters (set per game) --------------------------------------
 
 let worldSeed = 1337;
@@ -207,8 +193,7 @@ const debris: Debris[] = []; // { center, r, mesh }
 const blastPoints: Vec3[] = [];
 let worldGroup: THREE.Group | null = null;
 let extrasGroup: THREE.Group | null = null;
-let goldCore: GoldCore | null = null;
-let goldPos: Vec3 | null = null; // world position of the hidden gold
+let goldPos: Vec3 | null = null; // where the Gouda is seeded (M1.2)
 let markerMaterial: THREE.SpriteMaterial | null = null;
 let spawnPoint: THREE.Vector3 | null = null;
 let lastCull = -1;
@@ -875,22 +860,21 @@ function createGoudaMaterial({
   vein: [number, number, number];
   veinStrength: number;
 }): THREE.MeshToonMaterial {
-  // Cel-shaded cheese: MeshToonMaterial quantizes the lighting into hard
-  // bands (shared gradient map, see toon.js); the custom paste/rind/vein
-  // injection below rides on top unchanged. `rough` is kept for tuning
-  // history but toon shading has no roughness.
+  // Cel-shaded cheese: the shared toon ramp quantizes the lighting into hard
+  // bands and toonMaterial() adds the same ink rim every model wears (see
+  // render/toon.ts); the paste/rind/vein injection below is this material's
+  // own layer under it. `rough` is kept for tuning history but toon shading
+  // has no roughness.
   void rough;
-  const material = new THREE.MeshToonMaterial({
-    color: 0xffffff, // overridden per-fragment by the paste/rind mix
-    gradientMap: getToonGradient(),
-  });
 
   const pasteVec = vec3str(paste);
   const rindVec = vec3str(rind);
   const veinVec = `vec3(${vein[0].toFixed(3)}, ${vein[1].toFixed(3)}, ${vein[2].toFixed(3)})`;
   const vs = veinStrength.toFixed(3);
 
-  material.onBeforeCompile = (shader) => {
+  const injectCheese = (
+    shader: THREE.WebGLProgramParametersWithUniforms,
+  ): void => {
     shader.uniforms.uGoudaTime = uGoudaTime;
 
     shader.vertexShader =
@@ -914,11 +898,6 @@ function createGoudaMaterial({
           float mottle = 0.92 + 0.08 * sin(vGoudaWorld.x * 0.9 + vGoudaWorld.y * 1.3)
                                      * sin(vGoudaWorld.z * 1.1 - vGoudaWorld.y * 0.7);
           diffuseColor.rgb = mix(${pasteVec}, ${rindVec}, vCrust) * mottle;
-          // Ink rim: darken grazing angles toward black — the toon outline.
-          vec3 inkV = normalize(cameraPosition - vGoudaWorld);
-          vec3 inkN = normalize(vGoudaNormal + vec3(1e-5));
-          float ink = smoothstep(0.30, 0.10, abs(dot(inkN, inkV)));
-          diffuseColor.rgb *= mix(1.0, 0.30, ink);
         }`,
         )
         .replace(
@@ -958,13 +937,17 @@ function createGoudaMaterial({
         }`,
         );
   };
-  // Zones share the same injection SOURCE but different baked constants —
-  // force a distinct program per zone so three's shader cache can't merge
-  // them into one look.
-  material.customProgramCacheKey = () =>
-    `gouda${pasteVec}${rindVec}${veinVec}${vs}`;
 
-  return material;
+  // Zones share the same injection SOURCE but different baked constants, so
+  // the cache key carries them — otherwise three's shader cache merges every
+  // zone into one look.
+  return toonMaterial(
+    { color: 0xffffff }, // overridden per-fragment by the paste/rind mix
+    {
+      shader: injectCheese,
+      key: `gouda${pasteVec}${rindVec}${veinVec}${vs}`,
+    },
+  );
 }
 
 function createZoneMaterials(): Record<ZoneName, THREE.MeshToonMaterial> {
@@ -1056,55 +1039,7 @@ function createZoneMaterials(): Record<ZoneName, THREE.MeshToonMaterial> {
   };
 }
 
-// --- Gold core, boundary, blast markers ------------------------------------------------------
-
-function createGoldCore(
-  parent: THREE.Group,
-  rng: Rng,
-  pos: Vec3,
-  scale = 1,
-): void {
-  const group = new THREE.Group();
-  group.position.set(pos.x, pos.y, pos.z);
-  group.scale.setScalar(scale);
-
-  const goldMat = new THREE.MeshToonMaterial({
-    color: 0xffc23d,
-    emissive: 0xffb020,
-    emissiveIntensity: 2.4,
-    gradientMap: getToonGradient(),
-  });
-
-  const core = new THREE.Mesh(new THREE.IcosahedronGeometry(4.5, 1), goldMat);
-  core.castShadow = true;
-  group.add(core);
-
-  const shardGeo = new THREE.IcosahedronGeometry(0.7, 0);
-  const shards: GoldShard[] = [];
-  for (let i = 0; i < 12; i++) {
-    const shard = new THREE.Mesh(shardGeo, goldMat);
-    const st = {
-      mesh: shard,
-      radius: 6.5 + rng() * 4,
-      speed: 0.15 + rng() * 0.3,
-      phase: rng() * Math.PI * 2,
-      tilt: rng() * Math.PI,
-    };
-    shard.scale.setScalar(0.5 + rng() * 1.2);
-    shards.push(st);
-    group.add(shard);
-  }
-
-  // Cavern light + a soft glow that leaks through nearby tunnels — the only
-  // hint of where the gold hides (it is NOT on the compass).
-  const light = new THREE.PointLight(0xffb742, 900, 90, 1.8);
-  group.add(light);
-  const deepGlow = new THREE.PointLight(0xff9c33, 24, 160, 1.3);
-  group.add(deepGlow);
-
-  parent.add(group);
-  goldCore = { group, core, light, deepGlow, shards };
-}
+// --- Boundary veil, blast markers ------------------------------------------------------------
 
 function createBoundarySphere(parent: THREE.Group): void {
   const material = new THREE.ShaderMaterial({
@@ -1198,23 +1133,6 @@ export function updateGouda(
   visibility = 90,
 ): void {
   uGoudaTime.value = elapsed;
-
-  if (goldCore) {
-    const pulse = 0.75 + 0.25 * Math.sin(elapsed * 0.8);
-    goldCore.light.intensity = 900 * pulse;
-    goldCore.deepGlow.intensity = 24 * (0.85 + 0.15 * Math.sin(elapsed * 0.31));
-    goldCore.core.material.emissiveIntensity = 1.8 + 1.2 * pulse;
-    goldCore.core.rotation.y = elapsed * 0.1;
-    goldCore.core.rotation.x = elapsed * 0.04;
-    for (const s of goldCore.shards) {
-      const a = elapsed * s.speed + s.phase;
-      s.mesh.position.set(
-        Math.cos(a) * s.radius,
-        Math.sin(a * 0.7 + s.tilt) * s.radius * 0.5,
-        Math.sin(a) * s.radius,
-      );
-    }
-  }
 
   if (markerMaterial) {
     markerMaterial.opacity = 0.35 + 0.22 * Math.sin(elapsed * 2.6);
@@ -1618,9 +1536,10 @@ export async function buildGoudaWorld(
     y: host.center.y + eye.y * host.s,
     z: host.center.z + eye.z * host.s,
   };
-  const goldScale = Math.min(1, Math.max(0.4, (eye.r * host.s) / 16));
-
-  createGoldCore(extrasGroup, rng, goldPos, goldScale);
+  // Nothing is BUILT here any more: the wheel itself is an item seeded at
+  // this position (game/items.ts kind "gouda", systems/cargoSystem.ts), so
+  // it can be picked up, handed over, fumbled down a shaft, and carried home.
+  // The world only decides where it hides.
   createBoundarySphere(extrasGroup);
   createBlastMarkers(extrasGroup);
   scene.add(extrasGroup);
@@ -1659,7 +1578,6 @@ export function disposeWorld(scene: THREE.Scene): void {
   }
   worldGroup = null;
   extrasGroup = null;
-  goldCore = null;
   goldPos = null;
   markerMaterial = null;
   chunks.length = 0;
@@ -1668,7 +1586,8 @@ export function disposeWorld(scene: THREE.Scene): void {
   spawnPoint = null;
 }
 
-// Where the gold actually hides (for win-condition logic — NOT for the HUD).
+// Where the Gouda is seeded — read once at world build by cargoSystem, which
+// spawns the item there. NEVER for the HUD (D4: no gold marker, ever).
 export function getGoldPos(): Vec3 | null {
   return goldPos;
 }

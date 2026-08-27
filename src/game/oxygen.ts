@@ -1,15 +1,18 @@
 // oxygen.ts — the survival clock (T0.3).
 //
 // A full tank lasts ~10 minutes of calm swimming — matching the 10-20 min
-// target run. Sprinting and distress statuses (trapped, gassed) burn it
-// faster; the recharge zone at the spawn point (the bathyscaphe berth)
-// refills it. Hitting zero = blackout → main.ts respawns the diver.
+// target run. Sprinting, hauling the Gouda, and distress statuses (trapped,
+// gassed) burn it faster; the recharge zone at the spawn point (the
+// bathyscaphe berth) refills it. Hitting zero = blackout → main.ts respawns
+// the diver.
 
 import { STATUS, type StatusMask } from "./effects.ts";
 
 export const O2_MAX = 100;
 const BASE_DRAIN = O2_MAX / 600; // 10 min of calm swimming
 const SPRINT_MULT = 1.8;
+const CARRY_MULT = 1.15; // the wheel is heavy even when you take it slow
+const CARRY_SPRINT_MULT = 1.8; // …and sprinting with it costs 1.8× again
 const TRAPPED_MULT = 2.0; // panic breathing, pinned to the floor
 const GASSED_MULT = 1.5; // coughing in fermentation gas
 const REFILL_RATE = O2_MAX / 5; // full tank in 5 s at the bathyscaphe
@@ -77,6 +80,13 @@ export function updateOxygen(
 
   let drain = BASE_DRAIN;
   if (sprinting) drain *= SPRINT_MULT;
+  // Hauling the Golden Gouda (M1.1): a steady tax for carrying it at all,
+  // and a punishing one for sprinting with it — the same choice that risks
+  // your grip also eats the clock.
+  if (status & STATUS.CARRYING) {
+    drain *= CARRY_MULT;
+    if (sprinting) drain *= CARRY_SPRINT_MULT;
+  }
   if (status & STATUS.TRAPPED) drain *= TRAPPED_MULT;
   if (status & STATUS.GASSED) drain *= GASSED_MULT;
 

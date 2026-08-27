@@ -24,7 +24,10 @@
 
     <!-- Dive HUD -->
     <div id="hud" class="hidden">
-      <canvas id="compass" width="420" height="34"></canvas>
+      <!-- height is 34 for the strip itself + 14 of headroom for the
+           TEMPORARY Golden Gouda bearing marker (see main.ts,
+           SHOW_GOUDA_BEARING) -->
+      <canvas id="compass" width="420" height="48"></canvas>
       <div id="depth">▼ 0 m</div>
       <div id="o2-bar" title="Oxygen">
         <span class="o2-label">O₂</span>
@@ -33,6 +36,9 @@
       <div id="voice-indicator">VOICE · off</div>
       <div id="ping"></div>
       <div id="peer-status"></div>
+      <!-- Contextual haul line: what [E] does right now (M1). Never a
+           tracker — the Gouda is hidden and stays hidden (register D4). -->
+      <div id="carry-prompt"></div>
       <div id="event-center"></div>
       <button id="scatter-btn" class="hidden">⤨ Scatter (T)</button>
       <button id="mini-copy-link-btn" class="hidden" title="Copy invite link">
@@ -45,6 +51,13 @@
       <div class="death-text">— BLACKOUT —</div>
     </div>
 
+    <!-- Run won: the Gouda made it into the bell (M1.3, placeholder) -->
+    <div id="win-overlay">
+      <div class="win-title">THE GOLDEN GOUDA IS ABOARD</div>
+      <div id="win-sub" class="win-sub"></div>
+      <div class="win-hint">reload to dive again</div>
+    </div>
+
     <!-- UI overlay -->
     <div id="ui-overlay">
       <div id="menu" class="panel">
@@ -54,8 +67,9 @@
         <button id="join-btn">Join Game</button>
         <p class="hint">
           Click the scene to look around · ZQSD/WASD to swim<br />Space / Shift
-          to rise & sink · E dig · F flashlight · T scatter · V mute<br />Esc to
-          release the mouse · the gold hides deep inside one of the wheels
+          to rise & sink · E dig / lift / hand off · F flashlight · T scatter ·
+          V mute<br />Esc to release the mouse · find the Golden Gouda, haul it
+          back to the bell
         </p>
       </div>
 

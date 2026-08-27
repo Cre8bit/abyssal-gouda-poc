@@ -11,11 +11,13 @@ with big through-holes), **the scree** (dense belt of small cut blocks),
 **the warrens** (speleology: long tangled narrow tunnels), **the crust**
 (sealed wall #1 — many giant fused hunks with radial through-routes), **the
 galleries** (cathedral wheels, huge chambers), **the bulwark** (sealed wall
-#2), **the hollows** (cramped wheels), and **the heart** (gold core in its
-grand cavern). Fog thickens layer by layer; each biome has its own
-bioluminescent vein colour. A run to the gold targets 10–20 minutes.
+#2), **the hollows** (cramped wheels), and **the heart** (a grand cavern,
+and a decoy). Fog thickens layer by layer; each biome has its own
+bioluminescent vein colour. A run to the Gouda targets 10–20 minutes.
 
-**The world is destructible**: press **E** to dig. Each chunk keeps its
+**The world is destructible**: press **E** to dig (**E** is contextual — it
+lifts or hands over the Golden Gouda when that is in reach, and swings the
+pickaxe otherwise). Each chunk keeps its
 voxel field cached — a dig edits the carved voxels and re-runs marching
 cubes on that single chunk (~20 ms), collision follows exactly, and dig
 events sync to teammates over the P2P channel. Thin marked blast walls in
@@ -27,8 +29,19 @@ a pulsing crack-glow (`getBlastPoints()`) for the future explosives/digging
 feature. Maps are seeded per game — the host's seed rides the invite link and
 the P2P handshake (joiners rebuild automatically), and `?seed=N&d=1..3` in
 the URL reproduces any map at any difficulty (narrower tunnels, thicker
-bulwark, more dead ends). The compass carries a gold marker and distance
-readout pointing at the prize.
+bulwark, more dead ends). The compass **never** carries a gold marker: the
+Gouda is fully hidden, and you find it by its glow leaking out of tunnel
+mouths.
+
+**The haul.** The Golden Gouda is a real object, not scenery — a wheel
+seeded in a random mid-depth cavern that you pick up, carry in your arms,
+and have to get home. Carrying it slows you down, drags you toward the
+abyss, stows your pickaxe, and forces your own torch off: the wheel becomes
+the party's light and the party's beacon. Sprinting with it, or taking a
+catfish hit, can knock it out of your grip — you get about three seconds to
+catch it before it tumbles away down a shaft. Press **E** next to a
+teammate to hand it over. Get it inside the bell's hatch and the run is
+won.
 
 The world is a procedural 3D labyrinth of massive gouda chunks (`src/gouda.js`).
 Each chunk is an analytic SDF — a noise-crusted ellipsoid minus a connected graph
@@ -90,7 +103,7 @@ remaining peers deterministically elect a replacement (lowest peer id).
 
 1. Player 1 clicks **Host Game**, then **Copy invite link** (or shares the ID).
 2. Players 2-N open the invite link (auto-join), or click **Join Game** and enter the ID.
-3. Swim with **ZQSD/WASD** (layout-agnostic), look with the mouse, **Space/C** to rise/sink, **Shift** sprint (burns O₂), **E** dig, **F** flashlight, **T** scatter, **V** mute voice. Watch the O₂ bar — refill at the spawn.
+3. Swim with **ZQSD/WASD** (layout-agnostic), look with the mouse, **Space/C** to rise/sink, **Shift** sprint (burns O₂), **E** dig / lift the Gouda / hand it off, **F** flashlight, **T** scatter, **V** mute voice. Watch the O₂ bar — refill at the spawn. Find the Golden Gouda and haul it back to the bell.
 
 ## Testing locally (two windows)
 

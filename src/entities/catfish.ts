@@ -112,22 +112,27 @@ let pendingPuppets = 0; // puppet count requested before the template loaded
 // previous spawnCatfish() is still loading can't double the school.
 let spawnGen = 0;
 
+// One-time prep on the freshly loaded GLTF, shared by every clone — and by
+// the bench, which imports this rather than repeating the cel pass. Like the
+// diver's prepareDiverTemplate(), the toon conversion lives WITH the model,
+// so no mount site can forget it. Idempotent: toonify() skips materials it
+// has already converted, and the bench re-preps the same GLTF on every
+// switch back to the fish.
+export function prepareCatfishTemplate(gltf: GLTF): GLTF {
+  gltf.scene.traverse((o) => {
+    if ((o as THREE.Mesh).isMesh || (o as THREE.SkinnedMesh).isSkinnedMesh) {
+      o.castShadow = true;
+      o.frustumCulled = false; // skinned bounds don't follow the bones
+    }
+  });
+  toonify(gltf.scene, { ink: 0.8 }); // heavy ink — it's the monster
+  return gltf;
+}
+
 function loadTemplate() {
   templatePromise ??= new GLTFLoader()
     .loadAsync(MODEL_URL)
-    .then((gltf) => {
-      gltf.scene.traverse((o) => {
-        if (
-          (o as THREE.Mesh).isMesh ||
-          (o as THREE.SkinnedMesh).isSkinnedMesh
-        ) {
-          o.castShadow = true;
-          o.frustumCulled = false; // skinned bounds don't follow the bones
-        }
-      });
-      toonify(gltf.scene, { ink: 0.8 }); // heavy ink — it's the monster
-      return gltf;
-    })
+    .then(prepareCatfishTemplate)
     .catch((err) => {
       console.warn("catfish model failed to load", err);
       return null;

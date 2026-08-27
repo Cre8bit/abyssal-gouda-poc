@@ -17,7 +17,7 @@
 // preview.js drives the same code on the bench (standing rule — AGENTS.md).
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
-import { toonify } from "../render/toon.ts";
+import { toonify, toonMaterial } from "../render/toon.ts";
 import type { Vec3 } from "../state.ts";
 
 const MODEL_URL = `${import.meta.env.BASE_URL}models/tinBell.glb`;
@@ -99,7 +99,7 @@ export function createBellVisual(bellScene: THREE.Object3D): BellVisual {
   // Mooring cable, straight up and out of sight.
   const cable = new THREE.Mesh(
     new THREE.CylinderGeometry(0.09, 0.09, CABLE_LEN, 6),
-    new THREE.MeshToonMaterial({ color: 0x2a2f33 }),
+    toonMaterial({ color: 0x2a2f33 }), // same ramp + ink as the bell itself
   );
   cable.position.y = BELL_SCALE + CABLE_LEN / 2;
   group.add(cable);

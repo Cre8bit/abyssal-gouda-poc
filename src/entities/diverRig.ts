@@ -34,6 +34,7 @@
 import * as THREE from "three";
 import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
 import type { GLTF } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { toonify } from "../render/toon.ts";
 
 export const DIVER_SCALE = 1.4; // template ~0.95 tall → ~1.33 world units
 // The FIRST-PERSON body renders smaller than reality: at true scale the
@@ -209,6 +210,10 @@ export interface DiverRig {
 // rest quaternions and template-space axes mapped into bone-local frames.
 export function prepareDiverTemplate(gltf: GLTF): DiverTemplate {
   const scene = gltf.scene;
+  // The cel pass belongs to the model, not to whoever mounts it: the diver
+  // has three mount sites (local FP body, remote clones, the bench) and one
+  // prep, so doing it here is the only version that cannot be forgotten.
+  toonify(scene);
   scene.traverse((obj) => {
     if ((obj as THREE.Mesh).isMesh) {
       obj.castShadow = true;

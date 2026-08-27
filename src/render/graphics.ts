@@ -31,7 +31,8 @@ import {
   FP_VIEW,
 } from "../entities/diverRig.ts";
 import { initCatfishSystem } from "../entities/catfish.ts";
-import { toonify } from "./toon.ts";
+import { setGoudaScene } from "../entities/goldenGouda.ts";
+import { toonMaterial } from "./toon.ts";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
@@ -198,10 +199,7 @@ let diverTemplatePromise: Promise<DiverTemplate | null> | null = null;
 function loadDiverTemplate(): Promise<DiverTemplate | null> {
   diverTemplatePromise ??= new GLTFLoader()
     .loadAsync(DIVER_MODEL_URL)
-    .then((gltf) => {
-      toonify(gltf.scene); // cel-shaded diver, same maps
-      return prepareDiverTemplate(gltf);
-    })
+    .then((gltf) => prepareDiverTemplate(gltf)) // cel pass runs inside prep
     .catch((err) => {
       // Degrade loudly, not silently: remote divers keep their placeholder
       // capsule, the local FP gloves just never appear.
@@ -351,6 +349,7 @@ export function initGraphics(container: HTMLElement): HTMLCanvasElement {
   createFlashlight();
   createLocalBody();
   initCatfishSystem(scene);
+  setGoudaScene(scene); // the Golden Gouda mounts itself here when it spawns
   createSnow();
   createBubbles();
   createBursts();
@@ -733,10 +732,17 @@ export function addShotLight(intensity: number = 1.5): void {
 }
 
 export function toggleFlashlight(): boolean {
-  flashlight.on = !flashlight.on;
-  flashlight.spot.visible = flashlight.on;
-  flashlight.spill.visible = flashlight.on;
-  flashlight.fill.visible = flashlight.on;
+  return setFlashlight(!flashlight.on);
+}
+
+// Drive the torch directly. Used by the haul (G4): while you carry the
+// Golden Gouda your own lamp is off and the wheel is the party's light — so
+// the state has to be forced, not toggled from wherever it happened to be.
+export function setFlashlight(on: boolean): boolean {
+  flashlight.on = on;
+  flashlight.spot.visible = on;
+  flashlight.spill.visible = on;
+  flashlight.fill.visible = on;
   return flashlight.on;
 }
 
@@ -1140,10 +1146,7 @@ function wrapAroundCamera(
 
 // --- Remote divers -------------------------------------------------------
 
-export function addPlayer(
-  id: string,
-  color: THREE.ColorRepresentation,
-): void {
+export function addPlayer(id: string, color: THREE.ColorRepresentation): void {
   if (players.has(id)) return;
 
   const group = new THREE.Group();
@@ -1154,22 +1157,17 @@ export function addPlayer(
   const placeholder = new THREE.Group();
   const body = new THREE.Mesh(
     new THREE.CapsuleGeometry(0.32, 0.65, 8, 16),
-    new THREE.MeshStandardMaterial({ color: 0x161e23, roughness: 0.6 }),
+    toonMaterial({ color: 0x161e23 }),
   );
   body.rotation.x = Math.PI / 2;
   body.castShadow = true;
   placeholder.add(body);
   const visor = new THREE.Mesh(
     new THREE.SphereGeometry(0.13, 12, 12),
-    new THREE.MeshStandardMaterial({
-      color,
-      emissive: color,
-      emissiveIntensity: 2.5,
-    }),
+    toonMaterial({ color, emissive: color, emissiveIntensity: 2.5 }),
   );
   visor.position.set(0, 0.15, -0.5);
   placeholder.add(visor);
-  toonify(placeholder); // match the cel-shaded world
   pivot.add(placeholder);
 
   // Headlamp rig — initially mounted on the pivot; reparented into the

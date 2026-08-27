@@ -41,6 +41,10 @@ export interface ItemKindDef {
   onSpawn?(item: ItemInstance): void;
   // Per-frame behavior (burn down a timer, check isSupported, animate).
   onUpdate?(item: ItemInstance, ctx: FrameContext): void;
+  // An authoritative correction landed for an item we already had: position
+  // and/or payload just changed under us (see applyOne). The Golden Gouda
+  // changing hands is exactly this.
+  onSync?(item: ItemInstance): void;
   // Unmount + dispose whatever onSpawn created.
   onRemove?(item: ItemInstance): void;
 }
@@ -160,6 +164,19 @@ function serialize(item: ItemInstance): SerializedItem {
 function applyOne(raw: unknown): void {
   const it = raw as SerializedItem | null;
   if (!it || typeof it.id !== "string" || typeof it.kind !== "string") return;
+  const existing = items.get(it.id);
+  if (existing) {
+    // NOT a duplicate to ignore: a row we already hold is an AUTHORITATIVE
+    // CORRECTION. The Gouda is seeded identically on every client (so it
+    // costs zero network) and then MOVES — re-spawning it would tear the
+    // visual down and rebuild it mid-carry, so refresh it in place instead.
+    existing.x = it.x;
+    existing.y = it.y;
+    existing.z = it.z;
+    existing.data = it.data ?? {};
+    kinds.get(existing.kind)?.onSync?.(existing);
+    return;
+  }
   spawnItem(it.kind, { x: it.x, y: it.y, z: it.z }, it.data ?? {}, {
     id: it.id,
     broadcast: false,
@@ -178,6 +195,23 @@ export function applyItemEvent(
   } else if (kind === "item*") {
     if (Array.isArray(data.list)) for (const raw of data.list) applyOne(raw);
   }
+}
+
+// Push ONE item's current truth to every peer. This is the authoritative
+// answer half of the contested-pickup protocol (docs/plan-mvp.md M1.2): the
+// host mutates the item, then calls this, and every client — including the
+// diver whose grab lost the race — converges on the same holder.
+export function syncItem(id: string): void {
+  const item = items.get(id);
+  if (item) sendEvent({ kind: "item*", list: [serialize(item)] });
+}
+
+// Ask a peer (in practice: the host) to re-send everything. A joiner that
+// adopts the host's seed REBUILDS its world, and the rebuild clears the item
+// registry — including any snapshot that arrived while it was carving. So
+// once the new world is up, it asks again.
+export function requestItemSnapshotFrom(peerId: string): void {
+  sendEventTo(peerId, { kind: "items?" });
 }
 
 // Bring a late joiner up to speed with every live dynamic item (the host
