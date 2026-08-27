@@ -3,6 +3,10 @@
 
 let ctx = null;
 let master = null;
+let muffle = null; // lowpass on everything: the water thickens with depth
+
+const MUFFLE_OPEN = 16000; // near the surface, sound still travels
+const MUFFLE_DEEP = 2400; // in the black, only the low end reaches you
 let drone = null;
 let ambience = null;
 let ambienceFilter = null;
@@ -18,7 +22,16 @@ export function initSonar() {
   ctx = new (window.AudioContext || window.webkitAudioContext)();
   master = ctx.createGain();
   master.gain.value = 0.5;
-  master.connect(ctx.destination);
+  // Water swallows the high end, and more of it the deeper you go. Everything
+  // the game makes goes through here, so the whole soundscape closes up as you
+  // descend — which is most of what stops the dark reading as empty space.
+  // Teammates' voices are deliberately NOT in this chain (voice.js has its own
+  // context): muffling the people you need to coordinate with is just cruel.
+  muffle = ctx.createBiquadFilter();
+  muffle.type = "lowpass";
+  muffle.frequency.value = MUFFLE_OPEN;
+  muffle.Q.value = 0.4;
+  master.connect(muffle).connect(ctx.destination);
   noiseBuffer = makeNoiseBuffer();
   startDrone();
   startAmbience();
@@ -106,6 +119,9 @@ export function setDroneDepth(dread) {
   droneDepth = dread;
   drone.gain.setTargetAtTime(0.02 + dread * 0.09, ctx.currentTime, 2);
   ambience.gain.setTargetAtTime(0.055 + dread * 0.03, ctx.currentTime, 2);
+  // Curved, not linear: the first hundred metres take most of the brightness.
+  const open = MUFFLE_OPEN * Math.pow(MUFFLE_DEEP / MUFFLE_OPEN, dread);
+  muffle.frequency.setTargetAtTime(open, ctx.currentTime, 2.5);
 }
 
 // Water past the hull of the helmet. You are inside a sealed metal sphere, so
@@ -168,6 +184,12 @@ function startBreath() {
 
   gain.gain.value = 0.018;
   breath = { gain, filter, cycle };
+}
+
+// Breaths per second, as the audio is actually running it — so anything that
+// wants to happen ON a breath can read it instead of keeping its own clock.
+export function breathRate() {
+  return breath ? breath.cycle.frequency.value : 0.22;
 }
 
 // Breathing quickens with effort and with depth.

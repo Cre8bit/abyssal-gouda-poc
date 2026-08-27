@@ -9,8 +9,8 @@ export const ATTACH_RADIUS = 7;
 // plant until they swam back out. At level 1 you land on the shell itself, so the
 // first beacon is there for the taking; deeper, you land beyond it and have to
 // close in to find it.
-export const EJECT_MIN = 100;
-export const EJECT_MAX = 130;
+export const EJECT_MIN = 150;
+export const EJECT_MAX = 190;
 const EJECT_GROWTH = 0.35; // each depth throws you proportionally further
 export const SETTLE_DELAY = 0.4;
 export const ALARM_PERIOD = 5; // seconds between the bell's red flash + ping

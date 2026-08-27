@@ -81,9 +81,11 @@ function setupSpatialAudio(peerId, stream) {
   const panner = audioCtx.createPanner();
   panner.panningModel = "HRTF";
   panner.distanceModel = "inverse";
-  panner.refDistance = 2; // full volume within ~2 units
-  panner.maxDistance = 80;
-  panner.rolloffFactor = 1.7; // fades fast — you must get CLOSE
+  // Half again as far as it used to carry: close enough to still mean "swim to
+  // me", far enough that two divers working the same shell can actually talk.
+  panner.refDistance = 3; // full volume within ~3 units
+  panner.maxDistance = 120;
+  panner.rolloffFactor = 1.13; // 1.7 / 1.5 — the fall-off itself is gentler too
 
   source.connect(panner);
   panner.connect(audioCtx.destination);

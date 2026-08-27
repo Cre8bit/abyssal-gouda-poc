@@ -24,7 +24,7 @@
 
 // The antenna's one and only range: the bell must be this far off before a
 // beacon will take.
-export const BEACON_RANGE = 100;
+export const BEACON_RANGE = 150;
 
 // Half-thickness of the band that counts as "on the shell" — the bell's own
 // body. Placement forgiveness only; never used as a radius.
@@ -33,7 +33,7 @@ export const BELL_RADIUS = 10;
 // Two beacons on the same spot say the same thing twice. A new one has to stand
 // this far from EVERY beacon you hold — including one copied off another diver,
 // because a beacon planted next to theirs adds nothing either.
-export const MIN_SEPARATION = 50;
+export const MIN_SEPARATION = 75;
 
 // How many YOU may plant. Copied beacons stack on top of this, so a pair who
 // meet up can hold more between them than either could carry alone. Four is the
@@ -110,10 +110,14 @@ export function separationOK(pos) {
   return distToNearest(pos) >= MIN_SEPARATION;
 }
 
+// Returns the planted beacon, so the caller can tell the rest of the crew where
+// it is. Note what it does NOT have to share: `r`, the range the antenna heard.
+// That is the whole secret, and it only ever moves on an explicit exchange.
 export function placeBeacon(pos, range, owner = "me") {
-  if (myBeaconCount() >= MAX_BEACONS) return false;
-  beacons.push({ x: pos.x, y: pos.y, z: pos.z, r: range, owner, seq: seq++, mine: true });
-  return true;
+  if (myBeaconCount() >= MAX_BEACONS) return null;
+  const b = { x: pos.x, y: pos.y, z: pos.z, r: range, owner, seq: seq++, mine: true };
+  beacons.push(b);
+  return b;
 }
 
 // Take on another diver's beacons. Their facts are as good as yours — the shell

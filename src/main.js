@@ -23,6 +23,8 @@ import {
   placeAngler,
   setBeaconMarkers,
   clearBeaconMarkers,
+  puffBubbles,
+  poseBubbles,
 } from "./graphics.js";
 import {
   clearBeacons,
@@ -93,6 +95,7 @@ import {
   setDroneDepth,
   setSwimPace,
   setBreathRate,
+  breathRate,
   createCreatureVoice,
   setSonarListener,
   playLurePing,
@@ -112,7 +115,7 @@ import {
 } from "./voice.js";
 
 const MAX_SPEED = 4.5; // units per second
-const SPRINT_MULT = 2.6; // hold Shift to bolt for the bell
+const SPRINT_MULT = 3; // hold Shift to bolt for the bell
 const WATER_INERTIA = 4; // how quickly velocity reaches its target
 const NETWORK_RATE = 1 / 30; // send state 30x per second
 const CEILING_Y = 4; // you cannot swim back above the start line
@@ -176,7 +179,13 @@ let creatureVoice = null;
 // The thing you hear and never see: a position for the moan to travel from.
 const roamer = createRoamer();
 let roamerClock = 0; // its own noise track needs a monotonic time of its own
+let breathClock = 0; // so the bubbles leave the helmet on the breath, not near it
 let oxygen = O2_SECONDS;
+
+// Beacons other divers have planted, as lights in the water and nothing more.
+// Keyed "owner:seq". These deliberately carry no range, so they cannot sharpen
+// your fix by accident — for that you have to swim over and ask (C).
+const shownBeacons = new Map();
 
 const remoteBuffers = new Map(); // peerId -> SnapshotBuffer
 const remoteAttached = new Map(); // peerId -> bool
@@ -363,7 +372,7 @@ function throwFlare() {
 // --- The Chorus: planting a beacon -----------------------------------------
 //
 // The antenna will not tell you how far the bell is or which way it lies. It
-// chimes, and only when the bell is exactly on your own 100 m shell. Plant a
+// chimes, and only when the bell is exactly on your own shell. Plant a
 // beacon on that chime and you have pinned one fact; plant four of them far
 // enough apart and the facts cross at one point. So the work is swimming — out
 // to the shell, then along it — against the oxygen clock, and every beacon is a
@@ -394,9 +403,19 @@ function plantBeacon() {
     );
     return;
   }
-  placeBeacon(localPosition, range, myId());
+  const planted = placeBeacon(localPosition, range, myId());
   playAntenna();
   showEvent(`✦ Beacon ${myBeaconCount()} planted.`);
+  // Everyone gets to SEE it. What they do not get is the range it recorded, so
+  // it changes nothing on their map until they come and copy the belt.
+  sendEvent({
+    kind: "beacon-mark",
+    owner: planted.owner,
+    seq: planted.seq,
+    x: planted.x,
+    y: planted.y,
+    z: planted.z,
+  });
 }
 
 // --- The Chorus: copying another diver's beacons ---------------------------
@@ -494,6 +513,7 @@ function restart() {
   eatenTimer = 0;
   despawnAngler();
   clearBeacons();
+  shownBeacons.clear();
   clearBeaconMarkers();
   triStageSeen = 0;
   onShellNow = false;
@@ -671,10 +691,23 @@ onEventReceived((peerId, data) => {
     return;
   }
 
+  if (data.kind === "beacon-mark") {
+    if (isHost) sendEvent(data); // star topology: clients only hear the host
+    if (data.owner !== myId()) {
+      const key = `${data.owner}:${data.seq}`;
+      if (!shownBeacons.has(key)) {
+        shownBeacons.set(key, { x: data.x, y: data.y, z: data.z });
+        showEvent("✦ A diver planted a beacon — swim over (C) to take it.");
+      }
+    }
+    return;
+  }
+
   if (data.kind === "drop") {
     startDrop(data.level);
     playDescent(DROP_DURATION);
     clearBeacons(); // the bell has moved — every planted beacon is a lie now
+    shownBeacons.clear();
     showEvent(`▼ The bell drops to level ${data.level}…`);
   } else if (data.kind === "sync") {
     snapToLevel(data.level);
@@ -753,6 +786,7 @@ renderLoop((delta) => {
     startDrop(level);
     playDescent(DROP_DURATION);
     clearBeacons(); // the bell has moved — every planted beacon is a lie now
+    shownBeacons.clear();
     sendEvent({ kind: "drop", level });
     showEvent(`▼ The bell drops to level ${level}…`);
   }
@@ -762,6 +796,9 @@ renderLoop((delta) => {
     shotFrame++;
     if (shot.flash && shotFrame === 20) flashBellAlarm();
     if (shot.flare && shotFrame === 6) throwFlare();
+    // Fast-forwarded rather than waited for: a headless capture only runs a
+    // dozen frames, so a hook on a late frame would never fire at all.
+    if (shot.bubbles && shotFrame === 4) poseBubbles(0.3);
     // Frame 4: the camera is not moved to the shot pose until later in a frame.
     if (shot.angler && shotFrame === 4) {
       placeAngler(
@@ -907,6 +944,14 @@ renderLoop((delta) => {
   if (!shot) updateCurrent(delta, localPosition, currentNoise);
   if (shot?.current) updateCurrent(0, localPosition, currentNoise);
   if (flareCooldown > 0) flareCooldown = Math.max(0, flareCooldown - delta);
+  // Your own exhaust, on the beat the breath audio is actually running at.
+  if (!shot && !eaten) {
+    breathClock += delta;
+    if (breathClock >= 1 / Math.max(breathRate(), 0.05)) {
+      breathClock = 0;
+      puffBubbles();
+    }
+  }
   creakTimer -= shot ? 0 : delta;
   if (creakTimer <= 0) {
     creakTimer = 9 + Math.random() * 22;
@@ -972,7 +1017,15 @@ renderLoop((delta) => {
   shareOffered = !!alongside;
 
   const fix = solve();
-  setBeaconMarkers(getBeacons());
+  // Anything already on my belt is drawn from the belt; the rest are lights I
+  // have been shown and not taken. Same water, three different meanings.
+  const held = getBeacons();
+  const heldKeys = new Set(held.map((b) => `${b.owner}:${b.seq}`));
+  const unshared = [];
+  for (const [key, at] of shownBeacons) {
+    if (!heldKeys.has(key)) unshared.push({ ...at, mine: false, unshared: true });
+  }
+  setBeaconMarkers([...held, ...unshared]);
   if (fix.stage > triStageSeen) {
     playFix(fix.stage);
     showEvent(STAGE_TOAST[fix.stage], 3000);

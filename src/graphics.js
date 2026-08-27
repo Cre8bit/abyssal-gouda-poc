@@ -47,6 +47,12 @@ const LURE_CORE = 0xffe6b4; // the hot centre you see the shape of
 // to be the bell. 150 is therefore the reach a diver is actually asked to judge.
 const LURE_RANGE = 150; // metres the light carries while the fish is lying
 const LURE_DECAY = 1.6;
+// How far a lantern can be picked out, by depth level. Nothing is guaranteed
+// visible any more: deep water eats light, so what you could spot at 100 m near
+// the surface is gone by 56 m in the black. The bell and the fish share this,
+// because they share the lamp — if you can see one at all, it could be either.
+const SIGHT_RANGE = [100, 75, 56];
+
 const LURE_BASE = 220; // dimmest it ever sits
 const LURE_SWELL = 380; // how much it breathes on top of that
 // The bell's crown lantern is a one-for-one copy of the esca, so the two are the
@@ -88,6 +94,7 @@ let kelpForest;
 const kelpTime = { value: 0 };
 let kelpLevel = -1;
 let bursts; // { points, states: [{origin, age, duration, delay}] }
+let exhale; // { points, age, seeds } — your own breath leaving the helmet
 let fauna;
 let sparks; // { points, ages, head } — bioluminescence you stir up moving fast
 let angler;
@@ -107,6 +114,7 @@ let hemiLight;
 let gloomLight;
 let volumetric; // the local flashlight's beam materials, for the failing-lamp flicker
 let dread = 0; // 0 near the surface, 1 in the dark — drives every horror effect
+let sightLevel = 0; // depth level, for how far a lantern carries
 let elapsed = 0;
 let fixedStep = false; // screenshot mode: a deterministic clock
 let stepFrame = 0;
@@ -191,6 +199,7 @@ export function initGraphics(container) {
   createKelpForest();
   createBubbles();
   createBursts();
+  createExhale();
   createFlare();
   createBeaconMarkers();
   createSparks();
@@ -540,7 +549,7 @@ function createDivingBell() {
   // the fish. A big pale sphere here reads as a painted ball, not a light.
   const lanternCore = new THREE.Mesh(
     new THREE.SphereGeometry(0.22, 12, 10),
-    new THREE.MeshBasicMaterial({ color: LURE_CORE, fog: false }),
+    new THREE.MeshBasicMaterial({ color: LURE_CORE, fog: false, transparent: true }),
   );
   lanternCore.position.y = crown;
   group.add(lanternCore);
@@ -554,7 +563,6 @@ function createDivingBell() {
   lanternLight.position.y = crown;
   group.add(lanternLight);
 
-  // Doubles as the always-on marker: haze must never hide the way home.
   bellBeacon = createHalo(1.5, 0.85, LURE_HALO);
   bellBeacon.material.fog = false;
   bellBeacon.position.y = crown;
@@ -666,8 +674,21 @@ function rebuildKelp(level) {
 }
 
 export function setDepthLevel(level) {
+  sightLevel = Math.max(0, level);
   if (level !== kelpLevel && level >= 0) rebuildKelp(level);
   updateFields(level);
+}
+
+export function sightRange() {
+  return SIGHT_RANGE[Math.min(sightLevel, SIGHT_RANGE.length - 1)];
+}
+
+// 1 up close, 0 past the level's sight range, with a soft edge so a lantern
+// swims up out of the dark instead of popping into being.
+function lanternFade(dist) {
+  const reach = sightRange();
+  const t = (dist - reach * 0.72) / (reach * 0.28);
+  return 1 - Math.max(0, Math.min(1, t));
 }
 
 function updateAlarm(delta) {
@@ -811,7 +832,7 @@ function createSnow() {
     positions[i * 3] = (Math.random() - 0.5) * 2 * SNOW_RADIUS;
     positions[i * 3 + 1] = (Math.random() - 0.5) * 2 * SNOW_RADIUS;
     positions[i * 3 + 2] = (Math.random() - 0.5) * 2 * SNOW_RADIUS;
-    scales[i] = 0.75 + Math.pow(Math.random(), 2.4) * 1.7;
+    scales[i] = 0.4 + Math.pow(Math.random(), 2.8) * 0.9;
     offsets[i] = Math.random() * 100;
   }
 
@@ -831,6 +852,9 @@ function createSnow() {
         value: [new THREE.Vector3(0, 0, -1), new THREE.Vector3(0, 0, -1)],
       },
       uLightOn: { value: [1.0, 0.0] },
+      uAmbient: { value: 1.0 }, // how much light the water itself still carries
+      uLampPos: { value: new THREE.Vector3() }, // nearest warm lantern
+      uLampOn: { value: 0.0 },
     },
     vertexShader: /* glsl */ `
       uniform float uTime;
@@ -838,10 +862,13 @@ function createSnow() {
       uniform vec3 uLightPos[2];
       uniform vec3 uLightDir[2];
       uniform float uLightOn[2];
+      uniform vec3 uLampPos;
+      uniform float uLampOn;
       attribute float aScale;
       attribute float aOffset;
       varying float vAlpha;
       varying float vLit;
+      varying float vWarm;
 
       float beamFactor(vec3 wp, vec3 lp, vec3 ld, float on) {
         vec3 toP = wp - lp;
@@ -860,24 +887,42 @@ function createSnow() {
 
         vLit = beamFactor(p, uLightPos[0], uLightDir[0], uLightOn[0])
              + beamFactor(p, uLightPos[1], uLightDir[1], uLightOn[1]);
+        // A lantern throws in every direction, not a cone, and the water around
+        // it fills with warm light you can see hanging in it. Without this the
+        // bell and the fish glow in a vacuum.
+        vWarm = uLampOn * exp(-distance(p, uLampPos) * 0.055);
 
         vec4 mv = modelViewMatrix * vec4(p, 1.0);
         // Clamped: a mote right at the lens must not balloon into a disc.
-        gl_PointSize = min(aScale * uPixelRatio * (34.0 / -mv.z), 6.0);
-        vAlpha = smoothstep(42.0, 1.0, -mv.z);
+        gl_PointSize = min(aScale * uPixelRatio * (26.0 / -mv.z), 3.2);
+        // A mote some light has found carries; one floating in the dark dies
+        // within a few metres. Without this the water reads as a starfield,
+        // because unlit specks were being drawn out to 42 m in every direction.
+        float reach = mix(9.0, 30.0, min(vLit + vWarm, 1.0));
+        vAlpha = smoothstep(reach, 0.6, -mv.z);
         gl_Position = projectionMatrix * mv;
       }
     `,
     fragmentShader: /* glsl */ `
+      uniform float uAmbient;
       varying float vAlpha;
       varying float vLit;
+      varying float vWarm;
       void main() {
         float d = distance(gl_PointCoord, vec2(0.5));
-        float lit = min(vLit, 1.2);
-        // Barely visible in the dark; blazing motes inside a beam.
-        float a = smoothstep(0.5, 0.14, d) * vAlpha * (0.70 + lit * 0.9);
-        vec3 col = mix(vec3(0.74, 0.83, 0.90), vec3(0.97, 0.99, 1.0), lit);
-        gl_FragColor = vec4(col * (1.0 + lit * 2.0), a);
+        float cold = min(vLit, 1.2);
+        float warm = min(vWarm, 1.2);
+        float total = min(cold + warm, 1.2);
+        // Silt has no light of its own. It is only ever as bright as whatever
+        // found it, plus a whisper of whatever light the water itself still
+        // carries — which is nothing at all down at level 3.
+        float a = smoothstep(0.5, 0.14, d) * vAlpha * (uAmbient * 0.09 + total * 0.85);
+        // Takes the colour of its source: cold off a torch, amber off a lantern.
+        vec3 col = mix(vec3(0.58, 0.66, 0.72), vec3(0.86, 0.71, 0.49), warm / max(total, 0.001));
+        // Never brighter than 0.7. The old version multiplied up past 1.0, which
+        // pushed every fleck over the bloom pass's threshold and gave it a halo
+        // — a glowing point on black is a star, and that is what people saw.
+        gl_FragColor = vec4(col * (0.30 + total * 0.42), a);
       }
     `,
   });
@@ -887,7 +932,11 @@ function createSnow() {
   scene.add(snow);
 }
 
-const BLOOM_MOTES = 5200; // fewer than before, spread over a far larger region
+// The bloom is nothing but its particles — no sprite standing in for them at
+// range. That means density is the only tool: enough motes, spread through the
+// whole volume and each one faint, so what you see building up at a distance is
+// real overlapping plankton rather than a painted glow.
+const BLOOM_MOTES = 30000;
 const CURRENT_MOTES = 900; // per flow
 
 // Shared look for free-floating bioluminescence: a small hot core in a soft
@@ -903,6 +952,7 @@ function moteMaterial(uniforms, extraVert, extraFrag) {
       uniform float uPixelRatio;
       uniform float uSize;
       uniform float uDim;
+      uniform float uFar; // how far off this field can still be made out
       attribute float aSeed;
       varying float vAmt;
       ${extraVert.declarations}
@@ -910,7 +960,7 @@ function moteMaterial(uniforms, extraVert, extraFrag) {
         ${extraVert.body}
         vec4 mv = modelViewMatrix * vec4(p, 1.0);
         gl_PointSize = min((0.5 + aSeed * 0.9) * uPixelRatio * (uSize / -mv.z), 4.0);
-        vAmt = amt * uDim * smoothstep(140.0, 1.5, -mv.z);
+        vAmt = amt * uDim * smoothstep(uFar, 1.5, -mv.z);
         gl_Position = projectionMatrix * mv;
       }
     `,
@@ -940,7 +990,7 @@ function createBloom() {
     dirs[i * 3] = x / len;
     dirs[i * 3 + 1] = y / len;
     dirs[i * 3 + 2] = z / len;
-    rads[i] = Math.pow(Math.random(), 5.0); // crowd the heart hard
+    rads[i] = Math.pow(Math.random(), 1.9); // denser inward, but the reach is filled
     seeds[i] = Math.random();
   }
   const geometry = new THREE.BufferGeometry();
@@ -952,8 +1002,9 @@ function createBloom() {
     {
       uTime: { value: 0 },
       uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
-      uSize: { value: 30 },
-      uDim: { value: 0.42 }, // deliberately faint: presence, not fireworks
+      uSize: { value: 19 }, // small: a mote you can resolve is a star, not a cloud
+      uDim: { value: 0.26 }, // faint on its own; only the overlap reads as light
+      uFar: { value: 380 }, // visible well before you reach it, as real motes
       uRadius: { value: FIELD_RADIUS },
       uHeart: { value: HEART_RADIUS / FIELD_RADIUS },
       uAniso: { value: new THREE.Vector3(1, 1, 1) },
@@ -983,7 +1034,11 @@ function createBloom() {
         }`,
       body: `
         vec3 dir = position;
-        float reach = 1.0 - uWarp * (1.0 - vn3(dir * 1.7 + uSeed));
+        // Two octaves: the first carves the big lobes, the second frays their
+        // edges, so no silhouette of this thing reads as an ellipsoid.
+        float lobes = vn3(dir * 1.7 + uSeed);
+        float fray = vn3(dir * 5.3 + uSeed * 1.7);
+        float reach = 1.0 - uWarp * (1.0 - lobes * 0.78 - fray * 0.22);
         float amt = 0.0;
         vec3 p = dir * aRad * uRadius * uAniso;
         if (aRad <= reach) {
@@ -1038,6 +1093,7 @@ function makeMoteCloud() {
       uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
       uSize: { value: 34 },
       uDim: { value: 0.85 },
+      uFar: { value: 130 }, // a current stays something you notice late
       uPower: { value: 0 },
     },
     {
@@ -1069,6 +1125,7 @@ function updateFields(level) {
     bloomLevel = level;
   }
   bloom.material.uniforms.uTime.value = elapsed;
+
 
   const flows = getCurrents();
   for (let f = 0; f < flows.length; f++) streamFlow(flows[f], currentMotes[f]);
@@ -1185,7 +1242,11 @@ export function despawnAngler() {
 }
 
 export function updateAngler(delta, ctx) {
-  angler.update(delta, elapsed, noise, ctx);
+  // The fish's lantern obeys the same sight range as the bell's — measured to the
+  // lure, not the animal, since the lure is the only part that is ever lit.
+  const lure = angler.lurePosition();
+  const seen = lanternFade(camera.position.distanceTo(_v1.set(lure.x, lure.y, lure.z)));
+  angler.update(delta, elapsed, noise, { ...ctx, seen });
 }
 
 export function anglerState() {
@@ -1300,7 +1361,7 @@ function updateFlare(delta) {
 // gets its own colour. Red also survives the deep-water blue shift better than
 // aqua does, which matters at the ranges these sit at.
 const BEACON_COLOR = 0xff4d4d;
-const RESO_BUOYS = 12; // two full belts, so a shared pair loses nothing
+const RESO_BUOYS = 24; // both belts plus every beacon the crew has shown you
 
 function beaconMat(opacity) {
   return new THREE.MeshBasicMaterial({
@@ -1355,8 +1416,11 @@ function createBeaconMarkers() {
   };
 }
 
-// Drop the beacon markers at the given world positions. `mine` on an anchor
-// picks the solid mote; anything copied off another diver gets the wire shell.
+// Drop the beacon markers at the given world positions. Three readings, because
+// a diver needs to know at a glance whose work a light is: a solid mote is one
+// you planted, a bright wire shell is one you copied onto your own belt, and a
+// faint wire shell is one somebody showed you but you have not taken yet — you
+// can swim to it, but it is doing nothing for your fix until you go and ask.
 export function setBeaconMarkers(anchors) {
   if (!resonance) return;
   resonance.buoys.forEach((b, i) => {
@@ -1364,8 +1428,10 @@ export function setBeaconMarkers(anchors) {
     b.group.visible = !!a;
     if (!a) return;
     b.group.position.set(a.x, a.y, a.z);
-    b.core.visible = a.mine !== false;
-    b.wire.visible = a.mine === false;
+    b.core.visible = a.mine === true;
+    b.wire.visible = a.mine !== true;
+    b.wire.material.opacity = a.unshared ? 0.28 : 0.7;
+    b.halo.material.opacity = a.unshared ? 0.16 : 0.4;
   });
 }
 
@@ -1397,6 +1463,118 @@ function createBubbles() {
 }
 
 // Occasional bubble bursts: a vent exhales, a cluster races for the surface.
+// Your own breath, leaving the helmet. Its own emitter rather than a sixth
+// ambient burst: those are tuned for 5-18 m away and are faded out entirely
+// closer than 3 m, which is exactly where this has to live.
+const EXHALE_COUNT = 26;
+const EXHALE_LIFE = 1.9;
+
+function createExhale() {
+  const positions = new Float32Array(EXHALE_COUNT * 3);
+  const seeds = new Float32Array(EXHALE_COUNT);
+  for (let i = 0; i < EXHALE_COUNT; i++) seeds[i] = Math.random();
+
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 1));
+
+  const material = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+    uniforms: {
+      uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) },
+      uAlpha: { value: 0 },
+    },
+    vertexShader: /* glsl */ `
+      uniform float uPixelRatio;
+      uniform float uAlpha;
+      attribute float aSeed;
+      varying float vAlpha;
+      varying float vSeed;
+      void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        // Clamped hard: a bubble 40 cm off the faceplate would otherwise fill
+        // half the screen.
+        gl_PointSize = min((1.2 + aSeed * 1.8) * uPixelRatio * (10.0 / -mv.z), 26.0);
+        vAlpha = uAlpha;
+        vSeed = aSeed;
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      varying float vAlpha;
+      varying float vSeed;
+      void main() {
+        float d = distance(gl_PointCoord, vec2(0.5));
+        // A bubble is a shell of light, not a dot: bright rim, hollow middle.
+        float ring = smoothstep(0.5, 0.34, d) - smoothstep(0.30, 0.04, d) * 0.7;
+        gl_FragColor = vec4(0.80, 0.92, 1.0, ring * vAlpha * 0.85);
+      }
+    `,
+  });
+
+  const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+  points.visible = false;
+  scene.add(points);
+  exhale = { points, age: EXHALE_LIFE + 1, seeds };
+}
+
+// Called once per breath. Bubbles are born just off the faceplate and then left
+// behind in world space, so turning your head does not drag them with you.
+export function puffBubbles() {
+  if (!exhale || exhale.age < EXHALE_LIFE * 0.55) return;
+  camera.getWorldDirection(_v1);
+  const positions = exhale.points.geometry.attributes.position;
+  for (let i = 0; i < EXHALE_COUNT; i++) {
+    const s = exhale.seeds[i];
+    // Second offset derived from the first rather than drawn fresh: Math.random()
+    // here would make two runs of the same screenshot differ.
+    const t = (s * 7.13) % 1;
+    // Staggered start heights so the puff leaves as a stream, not a clump.
+    positions.setXYZ(
+      i,
+      camera.position.x + _v1.x * 0.55 + (s - 0.5) * 0.26,
+      camera.position.y - 0.34 - t * 0.18,
+      camera.position.z + _v1.z * 0.55 + (t - 0.5) * 0.26,
+    );
+  }
+  positions.needsUpdate = true;
+  exhale.age = 0;
+  exhale.points.visible = true;
+}
+
+// Screenshot hook: puff, then fast-forward to a chosen moment of the rise. A
+// headless capture only gets a dozen frames of sim, so without this it would
+// always catch the bubbles at the instant of birth, still inside the helmet.
+export function poseBubbles(age) {
+  puffBubbles();
+  if (!exhale) return;
+  exhale.age = 0;
+  updateExhale(age);
+}
+
+function updateExhale(delta) {
+  if (!exhale || exhale.age > EXHALE_LIFE) return;
+  exhale.age += delta;
+  const p = Math.min(exhale.age / EXHALE_LIFE, 1);
+  // Same rule the silt obeys: a bubble has no light of its own. With the torch
+  // off in deep water it is barely a smear, not a string of lanterns.
+  const litBy = flashlight?.on ? 1 : 0.18;
+  exhale.points.material.uniforms.uAlpha.value = Math.sin(Math.PI * p) * litBy;
+  const positions = exhale.points.geometry.attributes.position;
+  for (let i = 0; i < EXHALE_COUNT; i++) {
+    const s = exhale.seeds[i];
+    // Bigger bubbles climb faster, and they all wander as they go.
+    positions.setY(i, positions.getY(i) + (0.9 + s * 1.5) * delta);
+    positions.setX(i, positions.getX(i) + Math.sin(elapsed * 2.2 + s * 9) * 0.11 * delta);
+    positions.setZ(i, positions.getZ(i) + Math.cos(elapsed * 1.9 + s * 7) * 0.11 * delta);
+  }
+  positions.needsUpdate = true;
+  if (p >= 1) exhale.points.visible = false;
+}
+
 function createBursts() {
   const total = BURSTS * BURST_PARTICLES;
   const positions = new Float32Array(total * 3);
@@ -1860,7 +2038,19 @@ export function setPlayerLight(id, on) {
 }
 
 export function updateCamera(playerPos, yaw, pitch, speed = 0) {
-  camera.position.set(playerPos.x, playerPos.y, playerPos.z);
+  // Surge. The ocean is never still, so nothing floating in it is either. Two
+  // incommensurate periods per axis so it never reads as a loop.
+  //
+  // This moves the CAMERA and nothing else. Put it on the diver's real position
+  // instead and every range in the game breathes with it — the shell chime would
+  // flicker on and off while you hung still, and beacons would record a distance
+  // that depended on where in the swell you happened to press the key.
+  const t = elapsed;
+  camera.position.set(
+    playerPos.x + Math.sin(t * 0.21) * 0.30 + Math.sin(t * 0.53) * 0.09,
+    playerPos.y + Math.sin(t * 0.17 + 1.3) * 0.22 + Math.sin(t * 0.44) * 0.06,
+    playerPos.z + Math.cos(t * 0.19 + 0.7) * 0.30 + Math.cos(t * 0.47) * 0.08,
+  );
   camera.rotation.y = yaw;
   camera.rotation.x = pitch;
   // Breathing roll — a body hanging in water is never perfectly level.
@@ -1887,11 +2077,14 @@ function updateBellLight(delta) {
   bellLight.mat.emissiveIntensity = 3 * lit;
   bellLight.halo.material.opacity = 0.3 * lit;
 
-  // The beacon grows with range so the bell never shrinks below a visible
-  // point, however far you drift — nothing is allowed to hide it.
-  bellBeacon.material.opacity = 0.55 + 0.3 * lit;
+  // No guarantee of visibility any more. Past the level's sight range the
+  // lantern is simply gone, and the only way to find the bell is the beacons.
   const range = camera.position.distanceTo(bellGroup.position);
-  bellBeacon.scale.setScalar(Math.max(8, range * 0.03));
+  const seen = lanternFade(range);
+  bellBeacon.material.opacity = (0.55 + 0.3 * lit) * seen;
+  bellBeacon.scale.setScalar(8);
+  bellLantern.core.material.opacity = seen;
+  bellLantern.core.visible = seen > 0.01;
 }
 
 function animateFlashlight() {
@@ -1919,9 +2112,34 @@ function animateFlashlight() {
   volumetric.haze.material.uniforms.uIntensity.value = stutter;
 }
 
-// Feed the snow shader the two beam poses (local + first remote).
+// Feed the snow shader the two beam poses (local + first remote), the water's own
+// light level, and the nearest warm lantern — which is either the bell or the
+// thing imitating it, and the silt is not told which.
 function updateSnowLightUniforms() {
   const u = snow.material.uniforms;
+
+  // Normalised against the surface look, so silt hangs visible in lit water at
+  // level 1 and is invisible unless a beam finds it down in the black.
+  u.uAmbient.value = Math.min(waterCurrent.ambient / WATER_LOOKS[0].ambient, 1);
+
+  const bellAt = bellLantern
+    ? _v3.set(bellGroup.position.x, bellGroup.position.y + 5.2, bellGroup.position.z)
+    : null;
+  const lure = angler.lurePosition();
+  const lureLit = angler.isDecoy() || angler.isHunting?.() ? 1 : 0;
+  const bellD = bellAt ? camera.position.distanceTo(bellAt) : Infinity;
+  const lureD = lureLit
+    ? camera.position.distanceTo(_v2.set(lure.x, lure.y, lure.z))
+    : Infinity;
+  if (Math.min(bellD, lureD) === Infinity) {
+    u.uLampOn.value = 0;
+  } else if (lureD < bellD) {
+    u.uLampPos.value.set(lure.x, lure.y, lure.z);
+    u.uLampOn.value = lanternFade(lureD);
+  } else {
+    u.uLampPos.value.copy(bellAt);
+    u.uLampOn.value = lanternFade(bellD);
+  }
 
   flashlight.spot.getWorldPosition(u.uLightPos.value[0]);
   flashlight.spot.target.getWorldPosition(_v1);
@@ -1992,6 +2210,7 @@ export function renderLoop(onFrame) {
     wrapAroundCamera(snow, SNOW_RADIUS, -0.22, delta, drift, 7);
     wrapAroundCamera(bubbles, BUBBLE_RADIUS, 0.85, delta, drift);
     updateBursts(delta);
+    updateExhale(delta);
     updateFlare(delta);
     delta_ = delta;
     updateSparks(delta);

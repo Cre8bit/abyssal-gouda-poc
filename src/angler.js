@@ -331,6 +331,7 @@ export function createAngler(scene) {
 
   function update(delta, elapsed, noise, ctx = {}) {
     if (state.phase === "dormant") return;
+    state.seen = ctx.seen ?? 1; // how much of the lantern this depth lets through
     // A client doesn't run the hunt: a mob that decides on its own whether it
     // ate you would reach different verdicts in different windows. The host
     // simulates, everyone else is handed the pose and plays it back.
@@ -635,11 +636,16 @@ export function createAngler(scene) {
     // While lurking the lure is a slow beacon; once it has chosen you it burns
     // steady and hot, and floods the face from a foot in front of the teeth.
     const lit = 0.28 + state.pulse * 0.72;
+    // `seen` is the depth's sight range, handed in by graphics.js. Past it the
+    // lantern is gone — the same rule the bell's lamp obeys, so neither of them
+    // can be picked out of the dark from further than the other.
+    const seen = state.seen ?? 1;
     const scale = 7 + lit * 6 + state.glow * 5;
     escaHalo.scale.setScalar(scale);
-    escaHalo.material.opacity = 0.55 + lit * 0.45;
+    escaHalo.material.opacity = (0.55 + lit * 0.45) * seen;
     escaHalo.material.color.setHSL(0.09 - state.glow * 0.03, 0.85 - state.glow * 0.4, 0.55 + lit * 0.25);
     escaCore.scale.setScalar(0.6 + lit * 0.7);
+    escaCore.visible = seen > 0.01;
     escaLight.intensity = 220 + lit * 380 + state.glow * 900;
     escaLight.distance = 150 + state.glow * 130;
 

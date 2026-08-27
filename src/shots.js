@@ -10,7 +10,7 @@ import { biolumeFor, FIELD_RADIUS } from "./biolume.js";
 //
 // Shared vantage for the fix-map shots: the diver hovers on their own shell,
 // clear of every beacon below, looking out into open water.
-const FIX_VIEW = { level: 1, off: [70, 0, 70], yaw: 2.4, pitch: 0, hud: true };
+const FIX_VIEW = { level: 1, off: [106, 0, 106], yaw: 2.4, pitch: 0, hud: true };
 
 const VIEWS = {
   "bell-close": { level: 1, off: [0, 3, 14], yaw: 0, pitch: -0.06 },
@@ -29,6 +29,7 @@ const VIEWS = {
   "wake-2": { level: 2, off: [40, 8, 40], yaw: 2.4, pitch: -0.5, wake: true },
   "bloom-heart": { level: 1, find: "bloom", yaw: 0.7, pitch: 0 },
   "bloom-edge": { level: 2, find: "bloom-edge", yaw: 0, pitch: 0 },
+  "bloom-far": { level: 2, find: "bloom-far", yaw: 0, pitch: -0.06 },
   "current-1": { level: 1, off: [40, 6, 40], yaw: 2.4, pitch: 0, current: true },
   "current-3": { level: 3, off: [40, 6, 40], yaw: 2.4, pitch: 0, current: true },
   "jelly-1": { level: 1, off: [50, 4, 50], yaw: 2.4, pitch: 0.1 },
@@ -42,6 +43,9 @@ const VIEWS = {
   "up-2": { level: 2, off: [30, -12, 30], yaw: 2.4, pitch: 1.1 },
   "bell-below": { level: 1, off: [0, -18, 22], yaw: 0, pitch: 0.5 },
   "bell-side": { level: 2, off: [24, 2, 6], yaw: -1.35, pitch: -0.05 },
+  // Your own exhaust leaving the helmet, caught mid-rise.
+  "exhale": { level: 1, off: [0, 3, 16], yaw: 0, pitch: -0.2, bubbles: true },
+  "exhale-3": { level: 3, off: [0, 3, 16], yaw: 0, pitch: -0.2, bubbles: true },
   // Looking straight at the bell from where an ejected diver lands, to see how
   // much the lamp gives away before a single beacon is planted.
   "bell-spawn": { level: 2, off: [0, 0, 115], yaw: 0, pitch: 0 },
@@ -67,20 +71,20 @@ const VIEWS = {
     angler: "lunge", anglerDist: 26,
   },
   // The Chorus, one rung per shot. `beacons` are offsets from the bell, each a
-  // legal plant (about 100 m out, more than 50 m apart); the diver stands on
+  // legal plant (out on the shell, clear of each other); the diver stands on
   // their own shell so the panel shows the ready state. HUD on, since the fix
   // map IS the subject.
-  "fix-shell": { ...FIX_VIEW, beacons: [[100, 0, 0]] },
-  "fix-ring": { ...FIX_VIEW, beacons: [[100, 0, 0], [0, 0, 100]] },
-  "fix-twins": { ...FIX_VIEW, beacons: [[100, 0, 0], [0, 0, 100], [0, 100, 0]] },
+  "fix-shell": { ...FIX_VIEW, beacons: [[150, 0, 0]] },
+  "fix-ring": { ...FIX_VIEW, beacons: [[150, 0, 0], [0, 0, 150]] },
+  "fix-twins": { ...FIX_VIEW, beacons: [[150, 0, 0], [0, 0, 150], [0, 150, 0]] },
   "fix-lock": {
     ...FIX_VIEW,
-    beacons: [[100, 0, 0], [0, 0, 100], [0, 100, 0], [-58, -58, -58]],
+    beacons: [[150, 0, 0], [0, 0, 150], [0, 150, 0], [-87, -87, -87]],
   },
   // Four beacons all at one depth: the layout that cannot resolve the mirror.
   "fix-flat": {
     ...FIX_VIEW,
-    beacons: [[92, 40, 0], [0, 40, 92], [-92, 40, 0], [0, 40, -92]],
+    beacons: [[138, 60, 0], [0, 60, 138], [-138, 60, 0], [0, 60, -138]],
   },
 };
 
@@ -113,7 +117,13 @@ function inBloom(level) {
 // Outside, far enough back that the whole cloud reads as one shape.
 function atBloomEdge(level) {
   const f = biolumeFor(level);
-  return { x: f.x, y: f.y + 6, z: f.z + FIELD_RADIUS + 34 };
+  return { x: f.x, y: f.y + 6, z: f.z + FIELD_RADIUS * 0.8 };
+}
+
+// Well outside it: the honest test of whether particles alone carry at range.
+function atBloomFar(level) {
+  const f = biolumeFor(level);
+  return { x: f.x, y: f.y + 20, z: f.z + FIELD_RADIUS * 1.5 };
 }
 
 // The requested view, or null during normal play.
@@ -133,6 +143,7 @@ export function getShot() {
   else if (view.find === "kelp-rim") base = atForestRim(view.level);
   else if (view.find === "bloom") base = inBloom(view.level);
   else if (view.find === "bloom-edge") base = atBloomEdge(view.level);
+  else if (view.find === "bloom-far") base = atBloomFar(view.level);
   const spot = base ?? {
     x: view.off[0],
     y: -view.level * LEVEL_DROP + view.off[1],
@@ -153,6 +164,7 @@ export function getShot() {
     wake: view.wake === true,
     current: view.current === true,
     hud: view.hud === true,
+    bubbles: view.bubbles === true,
     beacons: view.beacons ?? null,
   };
 }

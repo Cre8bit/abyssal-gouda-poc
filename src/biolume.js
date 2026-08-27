@@ -3,11 +3,16 @@
 // the same bloom in the same place with nothing sent over the network.
 import { LEVEL_DROP } from "./bell.js";
 
-export const HEART_RADIUS = 26; // the dense core
-export const FIELD_RADIUS = 170; // full reach — a region, not an object
+// A wide dense core with a shorter halo. Get this ratio wrong and the bloom
+// scatters into separate points, which is exactly what reads as a starfield —
+// a cloud needs many faint motes overlapping, not few bright ones spread thin.
+export const HEART_RADIUS = 80;
+export const FIELD_RADIUS = 220; // full reach — a region you swim into, not an object
 
-const NEAR_MIN = 90;
-const NEAR_MAX = 190;
+// Out past the antenna's shell, so the bloom is somewhere you go rather than
+// something draped over the bell.
+const NEAR_MIN = 200;
+const NEAR_MAX = 340;
 const BAND_HALF = 40;
 
 function hash(a, b) {
@@ -41,7 +46,9 @@ export function biolumeFor(level) {
     ax,
     ay,
     az,
-    warp: 0.3 + r(8) * 0.3,
+    // Warped hard: at this strength the boundary grows lobes and inlets instead
+    // of reading as a smoothly squashed ball.
+    warp: 0.45 + r(8) * 0.35,
     seed: Math.floor(r(9) * 1e6),
   };
   return cached;
