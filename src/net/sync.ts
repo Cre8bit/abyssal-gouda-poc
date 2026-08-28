@@ -108,7 +108,7 @@ export function sendEvent(data: GameEvent): void {
   for (const rec of peers.values()) rawSend(rec, payload);
 }
 
-// Reliable gameplay event to ONE peer (e.g. per-player scatter targets).
+// Reliable gameplay event to ONE peer (e.g. the world seed on join).
 export function sendEventTo(peerId: string, data: GameEvent): void {
   const rec = peers.get(peerId);
   if (rec) rawSend(rec, { type: "event", ...data });

@@ -33,7 +33,8 @@ import {
   prepareDiverTemplate,
   createDiverRig,
   updateDiverRig,
-  FP_VIEW,
+  fpBodyPitch,
+  configureFpBody,
 } from "../entities/diverRig.ts";
 import { prepareCatfishTemplate } from "../entities/catfish.ts";
 import { toonMaterial } from "../render/toon.ts";
@@ -43,7 +44,15 @@ import {
   prepareGoudaTemplate,
   GOUDA_RADIUS,
 } from "../entities/goldenGouda.ts";
-import { CARGO } from "../game/cargo.ts";
+import { CARGO, holdPose } from "../game/cargo.ts";
+import { applyFpBodyParams } from "./shots.ts";
+
+declare global {
+  interface Window {
+    /** Live FP arm-pose tuning hook — see buildGloves(). */
+    fpBody?: typeof configureFpBody;
+  }
+}
 
 // The instance contract documented above, as a real type: what build() must
 // return for the bench to drive it.
@@ -271,10 +280,20 @@ function buildDiver(gltf: GLTF): BenchInstance {
     angle: 0,
     yaw: 0,
     bodyPitchSm: 0,
+    carrying: false, // both arms around the Golden Gouda
   };
   const vel = new THREE.Vector3();
   const focus = new THREE.Vector3();
   const _v = new THREE.Vector3();
+  const _hold = { x: 0, y: 0, z: 0 };
+  // Stand-in for the cargo, at exactly the offset game/cargo.ts hands it —
+  // the point of "carrying" is whether the arms land ON the load.
+  const cargo = new THREE.Mesh(
+    new THREE.SphereGeometry(GOUDA_RADIUS, 16, 12),
+    toonMaterial({ color: 0xffc23d, transparent: true, opacity: 0.55 }),
+  );
+  cargo.visible = false;
+  group.add(cargo);
   const R = 7; // swim circle radius
 
   let modeBtns: Record<string, HTMLButtonElement> = {};
@@ -331,7 +350,13 @@ function buildDiver(gltf: GLTF): BenchInstance {
         lookYaw,
         lookPitch,
         vel,
+        carrying: st.carrying,
       });
+      // The cargo rides where game/cargo.ts puts it, so the third-person
+      // carry pose can be judged against the real load rather than by eye.
+      cargo.visible = st.carrying;
+      holdPose(ORIGIN, st.yaw, lookPitch, _hold);
+      cargo.position.set(_hold.x, _hold.y, _hold.z).add(swim.position);
 
       // Torch beam leaves the helmet along the exact look direction.
       _v.copy(TORCH_OFFSET).applyQuaternion(rig.lookQuat);
@@ -356,6 +381,10 @@ function buildDiver(gltf: GLTF): BenchInstance {
         torch.visible = !torch.visible;
         b.classList.toggle("on", torch.visible);
       }).classList.add("on");
+      button(modes, "carrying", (b) => {
+        st.carrying = !st.carrying;
+        b.classList.toggle("on", st.carrying);
+      });
 
       // Touching a slider is a request to stop and look → manual mode.
       const hold = section(panel, "Hold (manual)").parentElement!;
@@ -392,8 +421,12 @@ function buildDiver(gltf: GLTF): BenchInstance {
     lines: () => [
       ["mode", st.mode],
       ["speed", `${vel.length().toFixed(1)} m/s`],
+      ["carrying", st.carrying ? "yes" : "no"],
     ],
-    bars: () => [["kick effort", rig.speedSm]],
+    bars: () => [
+      ["kick effort", rig.speedSm],
+      ["carry blend", rig.carrySm],
+    ],
   };
 }
 
@@ -401,8 +434,29 @@ function buildDiver(gltf: GLTF): BenchInstance {
 // The local player's own body: only the gloves + forearms survive prep
 // (diverRig.js buildFpGeometry). Use "eye cam" to judge their placement at
 // the real in-game FOV.
+const AXIS_X = new THREE.Vector3(1, 0, 0);
+const FOV_TAN = Math.tan((72 / 2) * (Math.PI / 180)); // camera vertical FOV
+const ASPECT = 16 / 9; // …the shape the game is actually played at
+
+// Is a point in camera space out of shot? (See the "cut vs frame" readout.)
+function cutVerdict(p: THREE.Vector3): string {
+  if (p.z > 0.02) return "✓ behind the lens";
+  const half = Math.abs(p.z) * FOV_TAN;
+  if (p.y < -half) return "✓ below the frame";
+  if (Math.abs(p.x) > half * ASPECT) return "✓ off the side";
+  return "✗ IN FRAME";
+}
+
 function buildGloves(gltf: GLTF): BenchInstance {
   const template = diverTemplateFrom(gltf);
+  // Same URL knobs as the shot harness (bench/shots.ts): ?m=gloves&uy=…&cfz=…
+  // previews a candidate arm pose here, where the joint readout below can say
+  // in numbers what the screenshot only shows in pixels.
+  applyFpBodyParams(new URLSearchParams(location.search));
+  // …and the same knobs live from the console (or a headless driver), so a
+  // pose can be SOLVED against the readout instead of reloaded one guess at a
+  // time: fpBody({ uy: 0.4, fy: 1.1 }). Bench page only.
+  window.fpBody = configureFpBody;
 
   const group = new THREE.Group();
   const pivot = new THREE.Group();
@@ -411,18 +465,71 @@ function buildGloves(gltf: GLTF): BenchInstance {
   // Same material treatment as the game's local body (createLocalBody):
   // double-sided sleeves, suit darkened below world albedo.
   rig.root.traverse((o) => {
-    if ((o as THREE.Mesh).isMesh) {
-      const m = o as THREE.Mesh & { material: THREE.MeshStandardMaterial };
-      m.material = m.material.clone();
-      m.material.side = THREE.DoubleSide;
-      m.material.color?.multiplyScalar(0.58);
-    }
+    if (!(o as THREE.Mesh).isMesh) return;
+    const mesh = o as THREE.Mesh;
+    // The arms carry two materials (suit + the shoulder cut's lining), so
+    // map over whatever is there rather than assuming a single material.
+    const dress = (m: THREE.Material) => {
+      const c = m.clone() as THREE.Material & { color?: THREE.Color };
+      c.side = THREE.DoubleSide;
+      c.color?.multiplyScalar(0.58);
+      return c;
+    };
+    mesh.material = Array.isArray(mesh.material)
+      ? mesh.material.map(dress)
+      : dress(mesh.material);
   });
   pivot.add(rig.root);
 
-  const st = { pitch: 0, speed: 0, eyeCam: false };
+  const st = { pitch: 0, speed: 0, eyeCam: false, carrying: false };
   const vel = new THREE.Vector3();
   const focus = new THREE.Vector3(0, -0.3, -0.6);
+  // The cargo, at the FIRST-PERSON framing offset (game/cargo.ts FP_HOLD_*,
+  // which is where the carrier's own camera draws it). It hangs off the
+  // same pivot as the body because while carrying the FP anchor tracks the
+  // look exactly (fpBodyPitch) — which is the only reason the grip can hold.
+  const cargo = new THREE.Mesh(
+    new THREE.SphereGeometry(GOUDA_RADIUS, 16, 12),
+    toonMaterial({ color: 0xffc23d }),
+  );
+  cargo.position.set(0, -CARGO.FP_HOLD_DOWN, -CARGO.FP_HOLD_FORWARD);
+  cargo.visible = false;
+  pivot.add(cargo);
+
+  // The three joints whose position in CAMERA space is the whole argument
+  // (see the readout below): the shoulder carries the FP geometry's only cut,
+  // the wrist is what the player is meant to see at the bottom of the frame.
+  const shoulder = rig.bones.get("R_Upperarm");
+  const elbow = rig.bones.get("R_Forearm");
+  const wrist = rig.bones.get("R_Hand");
+  // Bench `group` sits at the origin unrotated, so world space IS the eye's
+  // parent space; undoing the look pitch gives camera space. (Each caller
+  // gets its own vector — the readout holds two of them at once.)
+  const camSpace = (o: THREE.Object3D | undefined, out: THREE.Vector3) => {
+    if (!o) return null;
+    o.getWorldPosition(out);
+    return out.applyAxisAngle(AXIS_X, -st.pitch);
+  };
+  const _shoulderPos = new THREE.Vector3();
+  const _elbowPos = new THREE.Vector3();
+  const _wristPos = new THREE.Vector3();
+  // Which way the FINGERS point. The rig has no finger bones (the paw is one
+  // bone with the digits modelled in), so take the rest pose's forearm→paw
+  // direction into the wrist's own frame once, and it can be read back at any
+  // pose. A pair of hands that are in the right PLACE with the wrong AIM is
+  // the whole difference between holding a wheel of cheese and surrendering
+  // to it, and it is not something a joint position can tell you.
+  const _pawAxis = new THREE.Vector3(0, 0, -1);
+  const _q = new THREE.Quaternion();
+  if (elbow && wrist) {
+    rig.root.updateMatrixWorld(true);
+    _pawAxis
+      .copy(wrist.getWorldPosition(_wristPos))
+      .sub(elbow.getWorldPosition(_elbowPos))
+      .normalize()
+      .applyQuaternion(wrist.getWorldQuaternion(_q).invert());
+  }
+  const _pawDir = new THREE.Vector3();
 
   const inst: BenchInstance = {
     group,
@@ -431,7 +538,7 @@ function buildGloves(gltf: GLTF): BenchInstance {
     update(dt: number) {
       // Screen-anchored FPS-style: the invisible body pitches with the
       // camera via FP_VIEW — identical math to updateLocalBody.
-      const bodyPitch = FP_VIEW.base + st.pitch * FP_VIEW.follow;
+      const bodyPitch = fpBodyPitch(st.pitch);
       pivot.rotation.x = bodyPitch;
       vel.set(0, 0, -st.speed);
       updateDiverRig(rig, dt, {
@@ -440,7 +547,9 @@ function buildGloves(gltf: GLTF): BenchInstance {
         lookYaw: 0,
         lookPitch: st.pitch,
         vel,
+        carrying: st.carrying,
       });
+      cargo.visible = st.carrying;
       // In eye cam the follow-lerp must chase the look target, not the rig.
       if (st.eyeCam) focus.set(0, Math.tan(-st.pitch) * 4, -4);
       else focus.set(0, -0.3, -0.6);
@@ -462,6 +571,10 @@ function buildGloves(gltf: GLTF): BenchInstance {
           frameCamera(ACTIVE_DEF.cam);
         }
       });
+      button(cams, "carrying", (b) => {
+        st.carrying = !st.carrying;
+        b.classList.toggle("on", st.carrying);
+      });
       const hold = section(panel, "Pose").parentElement!;
       sliderRow(hold, "look pitch", -1.2, 1.2, 0.01, 0, (v) => {
         st.pitch = v;
@@ -471,13 +584,65 @@ function buildGloves(gltf: GLTF): BenchInstance {
       const note = document.createElement("div");
       note.className = "hint";
       note.textContent =
-        "placement is tuned via configureFpBody() URL params in the shot harness (shots.js)";
+        "placement is tuned via configureFpBody() URL params in the shot " +
+        'harness (bench/shots.ts). "carrying" shows the Golden Gouda where ' +
+        "game/cargo.ts rides it, plus the carry pose the arms blend into — " +
+        "the arms have to land ON the wheel at every look pitch";
       panel.appendChild(note);
     },
-    lines: () => [
-      ["body pitch", (FP_VIEW.base + st.pitch * FP_VIEW.follow).toFixed(2)],
+    lines: () => {
+      const sh = camSpace(shoulder, _shoulderPos);
+      const shZ = sh ? sh.z : 0;
+      const el = camSpace(elbow, _elbowPos);
+      const aim = wrist
+        ? _pawDir
+            .copy(_pawAxis)
+            .applyQuaternion(wrist.getWorldQuaternion(_q))
+            .applyAxisAngle(AXIS_X, -st.pitch)
+        : null;
+      const wr = camSpace(wrist, _wristPos);
+      // Half-height of the frame at the wrist's depth, for a 72° vertical
+      // FOV: |y| past this and the paw is off the bottom of the screen.
+      const edge = wr ? Math.abs(wr.z) * Math.tan((72 / 2) * (Math.PI / 180)) : 0;
+      return [
+        // POSITIVE = behind the lens, which is the only safe place for it:
+        // the shoulder carries the FP geometry's cut and the body is rigidly
+        // camera-locked, so this number is the same at every look angle.
+        [
+          "shoulder (cam)",
+          sh ? `${sh.x.toFixed(2)} ${sh.y.toFixed(2)} ${shZ.toFixed(2)}` : "—",
+        ],
+        // The verdict that matters: the cut must be UNSEEABLE. Behind the
+        // lens is the strong version (true at every look angle, because the
+        // FP body is rigidly camera-locked) — but off the bottom or the side
+        // of the frustum counts too, and that is how the carry pose gets away
+        // with shoulders shoved forward into the load.
+        ["cut vs frame", sh ? cutVerdict(sh) : "—"],
+        // Where the paw is, in front of the eye, and where the bottom of the
+        // frame is at that same depth. y just under edge = a sliver of glove.
+        [
+          "wrist (cam)",
+          wr ? `${wr.x.toFixed(2)} ${wr.y.toFixed(2)} ${wr.z.toFixed(2)}` : "—",
+        ],
+        [
+          "elbow (cam)",
+          el ? `${el.x.toFixed(2)} ${el.y.toFixed(2)} ${el.z.toFixed(2)}` : "—",
+        ],
+        [
+          "paw aim (cam)",
+          aim
+            ? `${aim.x.toFixed(2)} ${aim.y.toFixed(2)} ${aim.z.toFixed(2)}`
+            : "—",
+        ],
+        ["frame edge @ wrist", (-edge).toFixed(2)],
+        ["body pitch", fpBodyPitch(st.pitch).toFixed(2)],
+        ["carrying", st.carrying ? "yes" : "no"],
+      ];
+    },
+    bars: () => [
+      ["arm drift", rig.speedSm],
+      ["carry blend", rig.carrySm],
     ],
-    bars: () => [["arm drift", rig.speedSm]],
   };
   return inst;
 }
@@ -777,6 +942,12 @@ function buildGouda(gltf: GLTF | null): BenchInstance {
       api.sliderRow(lev, "lift", 0, 0.3, 0.005, gouda.lift, (v) => {
         gouda.lift = v;
       });
+      api.sliderRow(lev, "drift", 0, 0.5, 0.005, gouda.drift, (v) => {
+        gouda.drift = v;
+      });
+      api.sliderRow(lev, "orbit ×", 0, 6, 0.1, gouda.orbit, (v) => {
+        gouda.orbit = v;
+      });
       button(lev, "bones", (b) => {
         bonesOn = !bonesOn;
         for (const arrow of markers) arrow.visible = bonesOn;
@@ -792,7 +963,10 @@ function buildGouda(gltf: GLTF | null): BenchInstance {
         "offset. Carrying it forces the carrier's own torch off: this IS the " +
         'party\'s light. "bones" draws each bit bone along its own +Y — the ' +
         "axis that bit rides out on — parented to the bone, so the arrows " +
-        "move with the rig";
+        'move with the rig. "lift" is travel out of the socket along that ' +
+        'axis, "drift" is the slow float away from the wheel\'s centre, and ' +
+        '"orbit ×" scales how fast each bit revolves about the wheel — turn ' +
+        "it up to see minutes of the field's motion in seconds";
       panel.appendChild(note);
     },
     action() {
@@ -805,6 +979,7 @@ function buildGouda(gltf: GLTF | null): BenchInstance {
       ["held", held ? "yes" : "no"],
       ["bits", `${gouda.bits.length} / 7 bit bones`],
       ["lift", `${gouda.lift.toFixed(3)} u`],
+      ["drift", `${gouda.drift.toFixed(3)} u`],
     ],
   };
 }

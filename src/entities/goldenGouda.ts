@@ -61,7 +61,14 @@ import {
 import { clone as cloneSkinned } from "three/examples/jsm/utils/SkeletonUtils.js";
 import { toonMaterial } from "../render/toon.ts";
 
-export const GOUDA_RADIUS = 0.62; // the wheel — a two-armed load, not a boulder
+// The wheel. Sized against the diver, not against the cavern: a rat diver is
+// ~1.33 u long and its arms are ~0.7 u each, so anything past ~0.45 radius
+// cannot be HELD — the paws land on the near face and the pose reads as
+// pushing a boulder rather than hugging a cheese. The first pass was 0.62
+// (1.24 across, as long as the diver itself) and that is exactly what it
+// looked like, in both views. The prize reads as a prize because of the lamp
+// and the levitating bits, not because it is enormous.
+export const GOUDA_RADIUS = 0.45;
 
 const MODEL_URL = `${import.meta.env.BASE_URL}models/golden_gouda.glb`;
 
@@ -78,13 +85,37 @@ const BODY_LIGHT_CAP = 0.5;
 // Levitation. The bits breathe in and out of their own sockets along the bone
 // axis, so the travel has to stay under the depth of the socket or they read
 // as debris that fell off rather than as a field holding them up: LIFT is a
-// peak-to-rest amplitude of ~7 cm on a 1.24 u wheel, i.e. about half a bit.
-const BIT_LIFT = 0.075; // world u, peak travel OUT of the socket (never in)
+// peak-to-rest amplitude of ~5 cm on a 0.9 u wheel, i.e. about half a bit.
+// (All three amplitudes below are WORLD units, so they were re-scaled with
+// GOUDA_RADIUS — a travel tuned against a bigger wheel throws the bits clear
+// of a smaller one.)
+const BIT_LIFT = 0.055; // world u, peak travel OUT of the socket (never in)
 const BIT_RATE = 0.55; // rad/s, the breathe — slowed per bit by hash below
 const BIT_SPIN = 0.3; // rad/s, slow roll about the bone axis
 const BIT_WOBBLE = 0.12; // rad, tilt off the rest pose — just enough to live
+
+// The two motions that make the bits read as a FIELD rather than as seven
+// pieces glued to a turntable. The socket breathe above only ever moves a bit
+// a centimetre or two, and the wheel's own spin carries all seven at the same
+// rate, so without these they turn on the spot and nothing else.
+//
+//  ORBIT — each bit revolves about the wheel's own axis, at its own rate and
+//  its own direction, so the ring of bits shears apart and re-gathers instead
+//  of holding formation. Rates are small: a bit takes 30–90 s to go round.
+//
+//  DRIFT — each bit floats along its true radial (out of the wheel's centre,
+//  perpendicular to the spin axis) and back in again. Outward travel is the
+//  generous half: inward is clamped to a fraction of it (BIT_DRIFT_IN) so a
+//  bit drifting home never sinks into the paste it came out of.
+const BIT_ORBIT = 0.12; // rad/s about the wheel axis, scaled/signed per bit
+const BIT_DRIFT = 0.115; // world u, peak float away from the centre
+const BIT_DRIFT_IN = 0.3; // …of which this fraction is allowed inward
+const BIT_DRIFT_RATE = 0.21; // rad/s of the in/out float — slower than the breathe
+
 // Held, the wheel is clamped against a chest: pull the travel in so a bit at
-// full extension cannot push through the carrier's body.
+// full extension cannot push through the carrier's body. Rates are untouched
+// (only amplitudes shrink), so picking the wheel up never snaps a bit's
+// position — it just draws the field in tight.
 const BIT_HELD = 0.45;
 
 // The two axes the bits ride, in BONE-LOCAL space — so they are the same two
@@ -107,6 +138,9 @@ const BODY_FLOOR = 0;
 // every vert once, and the per-frame bit update runs 7 times a frame.
 const _v = new THREE.Vector3();
 const _q = new THREE.Quaternion();
+const _qOrbit = new THREE.Quaternion();
+const _out = new THREE.Vector3();
+const _rad = new THREE.Vector3();
 
 // --- The template: the shipped rig, measured -------------------------------
 
@@ -118,9 +152,15 @@ export interface GoudaBitDef {
   rest: THREE.Vector3; // bone rest translation
   restQuat: THREE.Quaternion; // bone rest rotation
   axis: THREE.Vector3; // bone +Y: out of the wheel
+  /** Rest translation measured from the hub — the arm the orbit swings. */
+  offset: THREE.Vector3;
+  /** Unit radial at rest (hub → bit, flattened onto the wheel's plane). */
+  radial: THREE.Vector3;
   phase: number; // deterministic per bit — see hash01
   rate: number;
   spin: number;
+  orbit: number; // rad/s about the wheel axis, signed
+  driftRate: number; // rad/s of the radial float
 }
 
 export interface GoudaTemplate {
@@ -129,6 +169,15 @@ export interface GoudaTemplate {
   bits: GoudaBitDef[];
   /** The wheel's centre, template space — the origin instances are hung from. */
   centre: THREE.Vector3;
+  /**
+   * The same centre, expressed in the BITS' PARENT space — the space
+   * `bone.position` is written in, and therefore the pivot the orbit turns
+   * about. (The shipped armature is flat, so all seven bits share one parent.)
+   */
+  hub: THREE.Vector3;
+  /** The wheel's spin axis in that same space: model +Y, pulled back through
+   * the armature's own transform rather than assumed. */
+  spinAxis: THREE.Vector3;
   /** Template units → world units, so the model matches GOUDA_RADIUS. */
   scale: number;
   map: THREE.Texture | null; // the GLB's baked cheese texture
@@ -272,9 +321,34 @@ export function prepareGoudaTemplate(gltf: GLTF): GoudaTemplate {
   // Every joint that is not the body is a bit — as long as it actually owns
   // geometry. A spare bone the artist left behind owns nothing and would
   // otherwise become an invisible bit burning a slot in the update loop.
+  // The orbit pivot. `centre` is in template space; bone.position is in the
+  // bits' PARENT space, so pull the centre (and the wheel's +Y spin axis)
+  // back through the armature's own transform rather than assuming the two
+  // spaces agree. The shipped armature is flat, so one parent serves all
+  // seven bits — fall back to identity if a re-export ever drops the node.
+  const armature = mesh.skeleton.bones[0]?.parent;
+  const toBoneSpace = new THREE.Matrix4();
+  if (armature) toBoneSpace.copy(armature.matrixWorld).invert();
+  const hub = centre.clone().applyMatrix4(toBoneSpace);
+  const spinAxis = new THREE.Vector3(0, 1, 0)
+    .transformDirection(toBoneSpace)
+    .normalize();
+
   const bits: GoudaBitDef[] = [];
   mesh.skeleton.bones.forEach((bone, j) => {
     if (j === bodyJoint || jointVerts[j] === 0) return;
+    const i = bits.length;
+    // Rest position as an arm off the hub, and the flat radial that arm
+    // points along (the component perpendicular to the spin axis — a bit
+    // sitting near the wheel's pole would otherwise have almost no radial to
+    // drift along, and normalizing the raw offset would send it out of the
+    // wheel's plane instead).
+    const offset = bone.position.clone().sub(hub);
+    const radial = offset
+      .clone()
+      .addScaledVector(spinAxis, -offset.dot(spinAxis));
+    if (radial.lengthSq() < 1e-8) radial.copy(spinAxis); // dead centre: float up
+    radial.normalize();
     bits.push({
       name: bone.name,
       rest: bone.position.clone(),
@@ -282,12 +356,13 @@ export function prepareGoudaTemplate(gltf: GLTF): GoudaTemplate {
       // Bone +Y is "out of the wheel" (the artist aimed them that way), in
       // the parent space bone.position lives in.
       axis: BONE_UP.clone().applyQuaternion(bone.quaternion).normalize(),
-      phase: hash01(bits.length, 1) * Math.PI * 2,
-      rate: BIT_RATE * (0.7 + hash01(bits.length, 2) * 0.6),
-      spin:
-        BIT_SPIN *
-        (0.5 + hash01(bits.length, 3)) *
-        (hash01(bits.length, 4) < 0.5 ? -1 : 1),
+      offset,
+      radial,
+      phase: hash01(i, 1) * Math.PI * 2,
+      rate: BIT_RATE * (0.7 + hash01(i, 2) * 0.6),
+      spin: BIT_SPIN * (0.5 + hash01(i, 3)) * (hash01(i, 4) < 0.5 ? -1 : 1),
+      orbit: BIT_ORBIT * (0.4 + hash01(i, 5)) * (hash01(i, 6) < 0.5 ? -1 : 1),
+      driftRate: BIT_DRIFT_RATE * (0.6 + hash01(i, 7) * 0.8),
     });
   });
 
@@ -295,7 +370,15 @@ export function prepareGoudaTemplate(gltf: GLTF): GoudaTemplate {
     Array.isArray(mesh.material) ? mesh.material[0] : mesh.material
   ) as THREE.MeshStandardMaterial | undefined;
 
-  return { root, bits, centre, scale, map: material?.map ?? null };
+  return {
+    root,
+    bits,
+    centre,
+    hub,
+    spinAxis,
+    scale,
+    map: material?.map ?? null,
+  };
 }
 
 // --- The visual --------------------------------------------------------------
@@ -313,8 +396,12 @@ export interface GoudaVisual {
   /** The turning assembly: the whole rig. Null until the GLB lands. */
   wheel: THREE.Group | null;
   bits: GoudaBit[];
-  /** Peak outward travel of a bit, world u — live-tunable from the bench. */
+  /** Peak outward travel of a bit out of its socket, world u — live-tunable. */
   lift: number;
+  /** Peak radial float away from the wheel's centre, world u — live-tunable. */
+  drift: number;
+  /** Orbit rate multiplier about the wheel's axis — live-tunable (1 = shipped). */
+  orbit: number;
   /**
    * Bone units → world units. Bones live in the model's own space, so anything
    * drawn as a child of one (the bench's axis arrows) is sized in bone units;
@@ -351,6 +438,9 @@ export function createGoudaVisual(
   // against the wheel's radius and a diver's chest), but it is written into
   // bone.position, which the rig group then scales.
   let boneLift = 1;
+  // The orbit pivot and axis, in the bits' parent space (see the template).
+  const hub = new THREE.Vector3();
+  const spinAxis = new THREE.Vector3(0, 1, 0);
   let disposed = false;
 
   const visual: GoudaVisual = {
@@ -360,6 +450,8 @@ export function createGoudaVisual(
     wheel: null,
     bits: [],
     lift: BIT_LIFT,
+    drift: BIT_DRIFT,
+    orbit: 1,
     scale: 1,
 
     update(t: number, held = false) {
@@ -375,28 +467,57 @@ export function createGoudaVisual(
       visual.wheel.rotation.y = t * 0.5 * spin;
       visual.wheel.rotation.z = held ? 0 : Math.sin(t * 0.21) * 0.25;
 
-      // The bits are bones INSIDE the turning assembly, so they stay over
-      // their own sockets while the wheel spins, and all they do here is
-      // levitate: rise out along the bone's own +Y and settle back, roll
-      // slowly about it, and tilt a little so nothing looks keyframed to the
-      // same beat. Writing the rest pose back every frame (rather than
-      // accumulating) keeps this stateless — the pose is a pure function of t.
+      // The bits are bones INSIDE the turning assembly, so the wheel's own
+      // spin carries them along for free. Three motions ride on top of that,
+      // and all three are written back from the rest pose every frame rather
+      // than accumulated — the pose stays a pure function of t, so every
+      // client shows the same wheel without spending a byte on it.
       //
-      // The breathe is 0…1, not −1…1, and that is the whole trick: the rest
-      // pose the artist modelled IS the bit sitting in its socket, so travel
-      // outward is levitation and travel inward is the bit disappearing into
-      // the wheel it just came out of. One-sided, it reads as in→out→in.
-      const lift = visual.lift * (held ? BIT_HELD : 1) * boneLift;
+      //  ORBIT   the bit swings about the wheel's axis, at its own signed
+      //          rate. This is a rotation in the bits' PARENT space, so it
+      //          turns the arm off the hub, the bone's own outward axis, and
+      //          the bit's orientation together — the bit revolves facing
+      //          out, it does not slide sideways while staring one way.
+      //  BREATHE the bit rises out of its socket along the bone's +Y and
+      //          settles back. 0…1, not −1…1, and that is the whole trick:
+      //          the rest pose the artist modelled IS the bit sitting in its
+      //          socket, so travel outward is levitation and travel inward is
+      //          the bit vanishing into the wheel. One-sided, it reads
+      //          in→out→in.
+      //  DRIFT   the bit floats away from the wheel's centre along its flat
+      //          radial and back, the long slow motion that makes the field
+      //          look like it is holding them rather than carrying them.
+      //          Inward is clamped to BIT_DRIFT_IN of the outward travel, so
+      //          coming home never means sinking into the paste.
+      const damp = held ? BIT_HELD : 1;
+      const lift = visual.lift * damp * boneLift;
+      const drift = visual.drift * damp * boneLift;
       for (const bit of visual.bits) {
         const def = bit.def;
         const breathe = 0.5 - 0.5 * Math.cos(t * def.rate + def.phase);
+        const float = Math.sin(t * def.driftRate + def.phase);
+        _qOrbit.setFromAxisAngle(
+          spinAxis,
+          t * def.orbit * visual.orbit + def.phase,
+        );
+        _out.copy(def.axis).applyQuaternion(_qOrbit);
+        _rad.copy(def.radial).applyQuaternion(_qOrbit);
         bit.bone.position
-          .copy(def.rest)
-          .addScaledVector(def.axis, lift * breathe);
-        // Post-multiplied, so both turns are about the BONE's own axes and
-        // the rest pose stays the frame they are measured in.
+          .copy(def.offset)
+          .applyQuaternion(_qOrbit)
+          .add(hub)
+          .addScaledVector(_out, lift * breathe)
+          .addScaledVector(
+            _rad,
+            drift * (float >= 0 ? float : float * BIT_DRIFT_IN),
+          );
+        // The orbit is PRE-multiplied (it is a turn in the parent's frame);
+        // the roll and the wobble are POST-multiplied, so they stay turns
+        // about the BONE's own axes and the rest pose remains the frame they
+        // were measured in.
         bit.bone.quaternion
           .copy(def.restQuat)
+          .premultiply(_qOrbit)
           .multiply(_q.setFromAxisAngle(BONE_UP, t * def.spin + def.phase))
           .multiply(
             _q.setFromAxisAngle(
@@ -436,6 +557,8 @@ export function createGoudaVisual(
     rig.scale.setScalar(tpl.scale);
     rig.position.copy(tpl.centre).multiplyScalar(-tpl.scale);
     boneLift = 1 / tpl.scale;
+    hub.copy(tpl.hub);
+    spinAxis.copy(tpl.spinAxis);
     visual.scale = tpl.scale;
 
     // Private bones per instance. The clone shares the template's geometry

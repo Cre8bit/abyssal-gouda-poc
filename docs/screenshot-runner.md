@@ -5,7 +5,7 @@ player, and capture frames — no ports, no installs.
 
 ## Pieces
 
-- `tools/runner.mjs` (`npm run runner`) — polls `shots/request.json`, keeps
+- `tools/runner.ts` (`npm run runner`) — polls `shots/request.json`, keeps
   one warm headless Chrome (software WebGL) across runs and drives it over the
   DevTools protocol: each shot is a fresh tab, captured a few tabs at a time
   (`SHOT_CONCURRENCY`, default 3), so there is no per-shot browser cold start.
@@ -13,11 +13,10 @@ player, and capture frames — no ports, no installs.
   `state: "done"` means every PNG is finished). Interesting page console /
   error lines are surfaced in `status.json.logs`. The browser is released
   after `SHOT_IDLE_MS` (default 2 min) idle and relaunched on demand.
-- `src/shots.js` — in-game shot mode, active only with `?shot=<name>`.
+- `src/bench/shots.ts` — in-game shot mode, active only with `?shot=<name>`.
   Skips the menu, pins the player at a vantage point, aims the camera, holds
   movement keys, and (optionally) adds a flat inspection light. Signals
-  `window.__shotReady` once the world is built and `settle` frames (default
-  30) have rendered — that's what the runner waits for before capturing.
+  `window.__shotReady` once the world is built and `settle` frames (default 30) have rendered — that's what the runner waits for before capturing.
 
 ## Usage
 
@@ -29,13 +28,30 @@ npm run runner   # terminal 2
 Then write a request:
 
 ```json
-{ "shots": ["fp-down-60", { "name": "fp-forward", "params": { "pitch": -1.2, "keys": "KeyW" } }] }
+{
+  "shots": [
+    "fp-down-60",
+    { "name": "fp-forward", "params": { "pitch": -1.2, "keys": "KeyW" } }
+  ]
+}
 ```
 
 Entries are shot names or `{ name, params }`; params become URL overrides and
-are baked into the output filename. Named shots live in `src/shots.js`
+are baked into the output filename. Named shots live in `src/bench/shots.ts`
 (`fp-forward`, `fp-down-30/60/max`, `fp-up`, `fp-swim`, `fp-swim-down`,
-`fp-swim-sprint`, `world`).
+`fp-swim-sprint`, `world`, `bell`, `gouda`, `gouda-carry`).
+
+`gouda` and `gouda-carry` are **gold-relative**: they resolve their vantage
+point against `getGoldPos()` at capture time, so the seeded hiding place can
+move without the preset needing to be re-measured. `gouda-carry` holds `KeyE`
+at the top of the capture, which is how you get a first-person shot of the
+wheel actually in your hands. Both raise `settle` well past the default — the
+bits' orbit and radial drift are slow by design and 30 frames in, nothing has
+moved yet.
+
+Note the params are baked into the filename, so a re-run with the SAME params
+after a code change can serve a stale page from the warm browser's cache;
+nudge `settle` (or any param) to force a fresh URL.
 
 ## Useful params
 
@@ -44,10 +60,13 @@ are baked into the output filename. Named shots live in `src/shots.js`
 - `light=N` — flat hemisphere light for geometry inspection
 - `settle=N` — frames to render after the pose lands before the capture is
   taken (default 30; raise it to catch animation further into its cycle)
-- `uy ux fy fx hx` / `ox oy oz` / `pb pf` — live overrides of the first-person
-  hand pose, body offset, and screen-anchor pitch base/follow
-  (`configureFpBody` in `src/diverRig.js`), for sweeping candidate poses
-  before baking them in
+- `uy ux fy fx hx hy` / `ox oy oz` / `pb pf` / `rs` — live overrides of the
+  first-person arm pose, body offset, screen-anchor pitch base/follow, and the
+  look-down pitch where the hand reveal starts
+  (`configureFpBody` in `src/entities/diverRig.ts`), for sweeping candidate
+  poses before baking them in
+- `cuy cux cfy cfx chx chy` / `coy coz` — the same knobs for the CARRY pose and
+  carry body offset, swept against `?shot=gouda-carry`
 - Env for the runner: `SHOT_URL`, `SHOT_SIZE`, `SHOT_BUDGET` (max ms to wait
   per shot for the ready signal, default 30000), `SHOT_SEED` (default 7 →
   identical world every run), `SHOT_CONCURRENCY` (parallel tabs, default 3),

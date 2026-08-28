@@ -115,9 +115,6 @@ whether the fish may enter. Adding a biome stops being a code change.
 wedge of a biome rather than one part, so you tune density by looking at
 density.
 
-**M2.5 · Shot regression** *(0.5 d)* — one headless capture per part type and
-per biome via the existing `?shot=` harness, so a generator tweak that ruins
-the reef is visible in a diff.
 
 ---
 

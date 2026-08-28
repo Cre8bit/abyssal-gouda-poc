@@ -40,7 +40,12 @@
            tracker — the Gouda is hidden and stays hidden (register D4). -->
       <div id="carry-prompt"></div>
       <div id="event-center"></div>
-      <button id="scatter-btn" class="hidden">⤨ Scatter (T)</button>
+      <!-- TESTER-ONLY debug aid: jumps straight to the Golden Gouda,
+           bypassing the search entirely (register D4). Remove before
+           shipping — see teleportToGouda() in main.ts. -->
+      <button id="tp-gouda-btn" title="Debug: teleport to the Golden Gouda">
+        🧀 TP to Gouda
+      </button>
       <button id="mini-copy-link-btn" class="hidden" title="Copy invite link">
         📋
       </button>
@@ -67,9 +72,9 @@
         <button id="join-btn">Join Game</button>
         <p class="hint">
           Click the scene to look around · ZQSD/WASD to swim<br />Space / Shift
-          to rise & sink · E dig / lift / hand off · F flashlight · T scatter ·
-          V mute<br />Esc to release the mouse · find the Golden Gouda, haul it
-          back to the bell
+          to rise & sink · E dig / lift / hand off · F flashlight · V mute<br />Esc
+          to release the mouse · find the Golden Gouda, haul it back to the
+          bell
         </p>
       </div>
 

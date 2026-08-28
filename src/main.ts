@@ -14,6 +14,7 @@ import {
   renderLoop,
   toggleFlashlight,
   setPlayerLight,
+  setPlayerCarrying,
   loadWorld,
   rebuildWorld,
   emitBreath,
@@ -131,9 +132,6 @@ const ABYSS_DEPTH = 612; // flavor: depth readout at y = 0
 const PLAYER_RADIUS = 0.6; // collision clearance against the cheese
 const WORLD_LIMIT = WORLD_R + 25; // soft leash, just inside the boundary veil
 
-const SCATTER_MIN = 20; // min/max distance between the two divers
-const SCATTER_MAX = 34;
-
 const DIG_RADIUS = 2.4; // carve sphere radius (world units)
 const DIG_RANGE = 7; // how far the dig tool reaches
 const DIG_COOLDOWN_MS = 400;
@@ -162,7 +160,7 @@ const hud = el("hud");
 const compassCanvas = el<HTMLCanvasElement>("compass");
 const depthText = el("depth");
 const voiceText = el("voice-indicator");
-const scatterBtn = el("scatter-btn");
+const tpGoudaBtn = el("tp-gouda-btn");
 const eventCenter = el("event-center");
 const o2Fill = el("o2-fill");
 const o2Bar = el("o2-bar");
@@ -175,11 +173,6 @@ const carryPrompt = el("carry-prompt");
 
 // Network events arrive as loose GameEvent records — each handled kind
 // trusts its payload shape exactly as the JS did (same-version peers).
-interface TpEvent {
-  x: number;
-  y?: number;
-  z: number;
-}
 // The carve shape is shared with state.ts — mid-build digs are queued there.
 type DigEvent = SphereDig;
 interface SeedEvent {
@@ -399,7 +392,7 @@ if (joinParam) {
   join(joinParam, mode === "local" || mode === "cloud" ? mode : null);
 }
 
-scatterBtn.addEventListener("click", scatter);
+tpGoudaBtn.addEventListener("click", teleportToGouda);
 
 // Action keys (physical positions — layout-agnostic).
 window.addEventListener("keydown", (e) => {
@@ -419,8 +412,6 @@ window.addEventListener("keydown", (e) => {
     broadcastNow();
   } else if (e.code === "KeyV") {
     toggleMute();
-  } else if (e.code === "KeyT" && isConnected()) {
-    scatter();
   } else if (e.code === "KeyE") {
     // One contextual verb: the Gouda first (lift it, or hand it over), the
     // pickaxe otherwise. They can never both apply — you cannot dig with
@@ -465,25 +456,27 @@ function tryDig() {
   }
 }
 
-// --- Scatter teleport: throw EVERY diver into their own random open pocket
-// of the labyrinth, each 20-34 units from the previous one.
-function scatter() {
-  if (!isConnected()) {
-    showStatus("No diver connected yet.");
+// --- TEMPORARY playtest aid: jump straight to the Golden Gouda -------------
+// Same spirit as SHOW_GOUDA_BEARING below: it deliberately breaks register D4
+// (the wheel is hidden and found by searching, never handed to you) so a
+// tester can reach the cargo without digging the whole labyrinth first.
+// Remove the button (index.html + style.css) and this handler once testing
+// no longer needs the shortcut.
+function teleportToGouda() {
+  if (!game.worldReady) return;
+  // The live item position once it exists (it moves as soon as anyone
+  // touches it); the seed position is the only thing there is before that.
+  const target = getItem("gouda") ?? getGoldPos();
+  if (!target) {
+    showEvent("🧀 No Gouda in this world yet.");
     return;
   }
-  let prev = findOpenSpot();
-  teleportLocal(prev.x, prev.y, prev.z);
+  // Land well inside pickup range (CARGO.PICKUP_RANGE is 3.2) but not on
+  // top of the wheel itself, and findOpenSpot keeps us clear of the cheese.
+  const spot = findOpenSpot(target, 1.5, 2.8);
+  teleportLocal(spot.x, spot.y, spot.z);
   playWhoosh();
-  // Each peer gets a DISTINCT spot (the old broadcast sent everyone to the
-  // same one — fine at 2 players, a pile-up at 4).
-  for (const peerId of getPeerIds()) {
-    prev = findOpenSpot(prev, SCATTER_MIN, SCATTER_MAX);
-    sendEventTo(peerId, { kind: "tp", x: prev.x, y: prev.y, z: prev.z });
-  }
-  showEvent(
-    "⨨ Scattered! Find your teammates — look for their lights, listen for their voices.",
-  );
+  showEvent("🧪 [DEBUG] Teleported to the Golden Gouda");
 }
 
 function teleportLocal(x: number, y: number, z: number) {
@@ -552,7 +545,6 @@ onPeerConnected((peerId, { initiator }) => {
   }
   broadcastNow(); // let them place us immediately
   statusPanel.classList.add("hidden");
-  scatterBtn.classList.remove("hidden");
   if (game.hostedId) miniCopyLinkBtn.classList.remove("hidden"); // only the host has a link to share
 });
 
@@ -566,7 +558,6 @@ onPeerDisconnected((peerId) => {
   // election here (deterministic, zero coordination messages).
   notifySystemsPeerDisconnected(peerId);
   if (getPeerIds().length === 0) {
-    scatterBtn.classList.add("hidden");
     miniCopyLinkBtn.classList.add("hidden");
   }
   showStatus("Diver disconnected.");
@@ -577,21 +568,20 @@ onPeerDisconnected((peerId) => {
 onStateReceived((peerId, { x, y, z, yaw, pitch, light, sy, sp, status }) => {
   game.remoteBuffers.get(peerId)?.push({ x, y, z, yaw, pitch, sy, sp });
   setPlayerLight(peerId, light !== false);
-  if (status !== undefined) setPeerStatus(peerId, status);
+  if (status !== undefined) {
+    setPeerStatus(peerId, status);
+    // Their rig wraps both arms around the wheel while this bit is set — the
+    // exterior half of the carry animation (the first-person half rides the
+    // local body's own status, in updateLocalPlayer above).
+    setPlayerCarrying(peerId, (status & STATUS.CARRYING) !== 0);
+  }
 });
 
 onEventReceived((peerId, data) => {
   // Systems first (fish states, item replication…) — the registry routes by
   // declared kind. What remains is world/orchestrator business.
   if (dispatchSystemEvent(peerId, data.kind, data)) return;
-  if (data.kind === "tp") {
-    const d = data as unknown as TpEvent;
-    teleportLocal(d.x, d.y ?? 5, d.z);
-    playWhoosh();
-    showEvent(
-      "⨨ Scattered! Find your teammates — look for their lights, listen for their voices.",
-    );
-  } else if (data.kind === "dig") {
+  if (data.kind === "dig") {
     // Teammate dug somewhere: apply the same carve locally.
     const d = data as unknown as DigEvent;
     if (!game.worldReady) {
@@ -745,7 +735,15 @@ renderLoop((delta) => {
 
   // 4b. First-person body: trails the lazy swim orientation while the head
   // (camera) looks around freely — arms come into view when you look down.
-  updateLocalPlayer(pos, yaw, pitch, swimYaw, swimPitch, vel);
+  updateLocalPlayer(
+    pos,
+    yaw,
+    pitch,
+    swimYaw,
+    swimPitch,
+    vel,
+    hasLocalStatus(STATUS.CARRYING),
+  );
   // 4c. …and whatever is in those arms rides the body it is strapped to.
   cargoSys.followCarrier();
 

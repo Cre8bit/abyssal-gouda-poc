@@ -294,7 +294,9 @@ button:active {
   transform: translateX(0);
 }
 
-#scatter-btn {
+/* TESTER-ONLY debug aid (see index.html) — amber to read as "not a real
+   HUD control". */
+#tp-gouda-btn {
   position: absolute;
   bottom: 1.25rem;
   right: 1.5rem;
@@ -304,7 +306,8 @@ button:active {
   font-family: monospace;
   font-size: 0.85rem;
   pointer-events: auto;
-  background: rgba(0, 40, 60, 0.7);
+  background: rgba(70, 45, 0, 0.75);
+  border: 1px dashed rgba(255, 208, 96, 0.6);
 }
 
 #mini-copy-link-btn {
@@ -386,7 +389,7 @@ button:active {
   opacity: 0.5;
 }
 
-/* Teammate status flags (🧀🪤…), right side above the scatter button. */
+/* Teammate status flags (🧀🪤…), right side above the TP-to-Gouda button. */
 #peer-status {
   position: absolute;
   bottom: 3.4rem;

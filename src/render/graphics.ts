@@ -28,7 +28,7 @@ import {
   prepareDiverTemplate,
   createDiverRig,
   updateDiverRig,
-  FP_VIEW,
+  fpBodyPitch,
 } from "../entities/diverRig.ts";
 import { initCatfishSystem } from "../entities/catfish.ts";
 import { setGoudaScene } from "../entities/goldenGouda.ts";
@@ -102,6 +102,7 @@ interface RemotePlayer {
   velEst: THREE.Vector3;
   lastPos: THREE.Vector3;
   hasLast: boolean;
+  carrying: boolean;
 }
 
 // traverse() hands back plain Object3Ds; disposables are found by probing.
@@ -225,7 +226,27 @@ const localState = {
   swimYaw: 0,
   swimPitch: 0,
   vel: new THREE.Vector3(),
+  carrying: false,
 };
+
+// Your own suit, as only you see it. The FP arms carry TWO materials (the
+// suit, and the flat lining of the shoulder cut — see diverRig's
+// capOpenLoops), so this maps over the array rather than assuming one.
+//  - Double-sided: a hard bank can swing a sleeve's cut end past the lens,
+//    and a culled backface there reads as a hole punched through the arm.
+//  - Darkened below the world's albedo so arms and gloves never blow out
+//    inside the torch's beam core, with enough left to keep definition.
+function dressOwnSuit(
+  material: THREE.Material | THREE.Material[],
+): THREE.Material | THREE.Material[] {
+  const dress = (m: THREE.Material) => {
+    const c = m.clone() as THREE.Material & { color?: THREE.Color };
+    c.side = THREE.DoubleSide;
+    c.color?.multiplyScalar(0.58);
+    return c;
+  };
+  return Array.isArray(material) ? material.map(dress) : dress(material);
+}
 
 // No clip planes anywhere anymore: the FP rig renders only the two gloves
 // (diverRig.js drops every other triangle at prep time), so nothing can
@@ -239,19 +260,9 @@ function createLocalBody() {
     const rig = createDiverRig(template, { firstPerson: true });
     rig.root.traverse((obj: THREE.Object3D) => {
       if ((obj as THREE.Mesh).isMesh) {
-        const mesh = obj as THREE.Mesh<
-          THREE.BufferGeometry,
-          THREE.Material & { color?: THREE.Color }
-        >;
-        mesh.material = mesh.material.clone();
-        // Double-sided: with the arms reaching forward the wrist/shoulder
-        // tube cuts are seen end-on, and a culled backface there reads as a
-        // severed arm. A dark interior wall reads as the sleeve's inside.
-        mesh.material.side = THREE.DoubleSide;
-        // Your own suit soaks the torch: darkened below the world's albedo
-        // so arms/gloves never blow out inside the beam core, but with
-        // enough albedo left to keep material definition.
-        mesh.material.color?.multiplyScalar(0.58);
+        (obj as THREE.Mesh).material = dressOwnSuit(
+          (obj as THREE.Mesh).material,
+        );
       }
     });
     pivot.add(rig.root);
@@ -268,8 +279,10 @@ export function updateLocalPlayer(
   swimYaw: number,
   swimPitch: number,
   vel: Vec3,
+  carrying: boolean = false,
 ): void {
   localState.active = true;
+  localState.carrying = carrying;
   localState.pos.set(pos.x, pos.y, pos.z);
   localState.yaw = yaw;
   localState.pitch = pitch;
@@ -281,13 +294,13 @@ export function updateLocalPlayer(
 function updateLocalBody(delta: number): void {
   if (!localBody || !localState.active) return;
 
-  // The gloves are SCREEN-ANCHORED, FPS-style: the invisible body yaws and
-  // pitches WITH the camera (not with the swim direction), so the hands hold
-  // a fixed spot at the bottom of the frame instead of the view rotating
-  // onto them. FP_VIEW.base tips the rig so a level view only grazes the
-  // glove tops; follow < 1 lets them rise slightly on a full look-down while
-  // still hugging the bottom edge.
-  const bodyPitch = FP_VIEW.base + localState.pitch * FP_VIEW.follow;
+  // The arms are SCREEN-ANCHORED, FPS-style: the invisible body yaws and
+  // pitches WITH the camera (not with the swim direction), rigidly, so the
+  // shoulders keep one fixed spot in camera space — which is what keeps the
+  // FP geometry's only cut permanently behind the lens. The "see more of your
+  // arms when you look down" job is done by the pose instead (diverRig's
+  // ARM_POSE_FP_DOWN), which can do it without moving the shoulder.
+  const bodyPitch = fpBodyPitch(localState.pitch);
   localBody.group.position.copy(localState.pos);
   localBody.group.rotation.y = localState.yaw;
   localBody.pivot.rotation.x = bodyPitch;
@@ -297,6 +310,7 @@ function updateLocalBody(delta: number): void {
     lookYaw: localState.yaw,
     lookPitch: localState.pitch,
     vel: localState.vel,
+    carrying: localState.carrying,
   });
 }
 
@@ -1231,6 +1245,7 @@ export function addPlayer(id: string, color: THREE.ColorRepresentation): void {
     velEst: new THREE.Vector3(),
     lastPos: new THREE.Vector3(),
     hasLast: false,
+    carrying: false,
   };
   players.set(id, player);
 
@@ -1300,6 +1315,7 @@ function updateRemoteDiver(player: RemotePlayer, delta: number): void {
     lookYaw: player.lookYaw,
     lookPitch: player.lookPitch,
     vel: player.velEst,
+    carrying: player.carrying,
   });
 
   // Torch beam leaves the helmet along the exact look direction.
@@ -1357,6 +1373,14 @@ export function updatePlayerPosition(
   if (pitch !== null) player.lookPitch = pitch;
   player.swimYaw = swimYaw ?? yaw ?? player.swimYaw;
   player.swimPitch = swimPitch ?? pitch ?? player.swimPitch;
+}
+
+// Their replicated STATUS.CARRYING bit, pushed in by main.ts the same way
+// their flashlight is — the rig holds the wheel with both arms while it is
+// set, so the wheel you see in their hands is the one holdPose() put there.
+export function setPlayerCarrying(id: string, carrying: boolean): void {
+  const player = players.get(id);
+  if (player) player.carrying = carrying;
 }
 
 export function setPlayerLight(id: string, on: boolean): void {

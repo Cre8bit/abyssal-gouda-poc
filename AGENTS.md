@@ -122,6 +122,12 @@ first-person gloves (the local player's FP body), lantern-catfish (baked
 swim/bite/flicker clips + lantern moods), tin bell (the bathyscaphe prop,
 `world/bathyscaphe.ts`), golden gouda (the cargo, `entities/goldenGouda.ts`).
 
+Both diver entries carry a **carrying** toggle that blends the rig into its
+carry pose and drops a stand-in Golden Gouda at exactly the offset
+`game/cargo.ts` hands it — third person at `HOLD_*`, first person at
+`FP_HOLD_*` (see below). The arms have to land ON the wheel at every look
+pitch, and that toggle is how you check it without a second player.
+
 **Lighting gotcha for anything that glows from inside itself:** the shared
 cel ramp (`render/toon.ts`) floors at 40/255, so an "unlit" face still takes
 16% of a light — and a light inside its own body is a light 0.6 u away. That
@@ -149,6 +155,19 @@ matched by name, so a renamed armature still lands), the wheel's centre and
 scale, and each bit bone's rest pose plus its own +Y, which is the direction
 that bit levitates along. The levitation is then plain bone animation, written
 back from the rest pose every frame so the pose stays a pure function of `t`.
+
+The bits do three things on top of the wheel's own spin: they **breathe** out
+of their sockets along that +Y, they **orbit** the wheel's axis at their own
+signed rate, and they **drift** in and out along their true radial. Orbit and
+drift need a pivot, so the template also measures the wheel's centre and spin
+axis in the BITS' PARENT space (`hub` / `spinAxis`, pulled back through the
+armature's own transform rather than assumed to match model space). The orbit
+is PRE-multiplied onto the rest quaternion — it is a turn in the parent's
+frame, and it has to carry the bone's outward axis and the bit's orientation
+with it, or a bit slides sideways while staring one way. Drift is one-sided by
+design: outward travel is generous, inward is a fraction of it, so a bit
+coming home never sinks into the paste it came out of. `held` shrinks the
+amplitudes only, never the rates, so picking the wheel up cannot snap a bit.
 
 The binding is exact and one-sided — every vertex has exactly one influence at
 weight 1.0, and no triangle spans two joints — and that is what lets ONE mesh
@@ -183,3 +202,55 @@ bone along its +Y, so the arrows ride the real animated transform.
 async GLB mount, so it captures the loading screen — drive CDP instead
 (`Page.navigate`, real `setTimeout` wait, `Page.captureScreenshot`). The
 bench logs `bench: built <id>` to the console when the model is mounted.
+
+## The first-person body (`entities/diverRig.ts`)
+
+`buildFpGeometry()` keeps the two ARMS — shoulder to fingertip — and deletes
+everything else at prep time. The cut used to be at the ELBOW, which read as
+two floating sleeves with their hollow interiors facing the camera whenever
+you looked down; keeping the upper arm moves the only cut to the SHOULDER,
+which the FP body offset parks below the frame.
+
+`capOpenLoops()` closes that cut, and both halves of how it does it matter:
+rings are found on **welded** positions (the export splits verts along UV
+seams, so by raw index one ring is several unclosed arcs), and each ring is
+fanned from a fresh **centroid** vertex appended to every attribute (the ring
+is neither convex nor planar, so a fan anchored on one of its own vertices
+throws long blades across the arm). The caps land at the tail of the index
+buffer, which makes them a contiguous geometry **group** — so the cut can
+carry its own flat, untextured material, because a centroid's borrowed UV
+smears the atlas into stripes across the hole. Mount sites therefore have to
+handle a material ARRAY on the FP mesh (`dressOwnSuit` in `render/graphics.ts`,
+and the bench's own copy).
+
+Placement is screenshot-tuned (`npm run runner`, the `fp-*` shots). The knob
+that keeps the cut out of frame is the upper arm being swept BACK (`uy < 0`)
+with the elbow folded hard: straighten the arm and the shoulder swings up into
+view. The hands are HIDDEN BY DEFAULT: the level pose parks them under the
+bottom frame edge with margin for the idle sway, and the look-down reveal has
+a dead zone (`FP_REVEAL_START`) so small pitches — swimming along a floor,
+glancing at the compass — never show them. The reveal ramps from there to
+`FP_LOOK_DOWN`, landing the paws in the lower third angled in toward each
+other: a neutral "ready to hold" shape for future held items. Carrying is its own pose, its own body offset AND its own scale — a rat
+diver's arm is half a metre and the wheel rides over a metre out, so the arms
+simply get longer while they are holding something (`FP_SCALE_CARRY`); nothing
+but the arms is rendered, so there is no body to be out of proportion with.
+All three cross-fade on `rig.carrySm`, and the FP pivot switches to tracking
+the look EXACTLY (`fpBodyPitch`) because the wheel does.
+
+## Two hold offsets (`game/cargo.ts`)
+
+`HOLD_*` is where the Golden Gouda actually IS — the replicated item position,
+and what every other diver sees in your arms. It has to be inside a rat
+diver's reach or the wheel floats a body-length ahead of its carrier.
+
+`FP_HOLD_*` is where the carrier's OWN camera draws it (`fpHoldPose`, used by
+`systems/cargoSystem.ts` for the local visual only). It is further out because
+the wheel is 1.24 u across in a 72° view and at the true offset it swallows the
+crosshair. The gap is a first-person cosmetic, exactly like `FP_SCALE` and
+`FP_OFFSET`: nobody else's view moves.
+
+Both are RIGID IN THE VIEW FRAME — forward and down rotate with the look — so
+the wheel holds one spot relative to its carrier however they tilt. It has to:
+the arms are posed in that same frame, and a world-vertical drop would slide
+the wheel through the hands on every pitch.

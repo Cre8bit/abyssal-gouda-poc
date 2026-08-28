@@ -32,6 +32,7 @@ import {
   CARGO,
   LOCAL_ID,
   distance,
+  fpHoldPose,
   holdPose,
   isSelf,
   looseSinkRate,
@@ -112,10 +113,12 @@ export function createCargoSystem({
   let regrabUntil = 0; // the fumbler's own brief lockout
   let torchBeforeCarry = true; // what to give back when the wheel leaves you
   let looseSyncTimer = 0;
+  let sprintHeld = 0; // seconds of unbroken sprinting while carrying
   let won = false;
 
   const _pos: Vec3 = { x: 0, y: 0, z: 0 };
   const _hold: Vec3 = { x: 0, y: 0, z: 0 };
+  const _view: Vec3 = { x: 0, y: 0, z: 0 }; // the carrier's own framing offset
 
   // --- Authority ------------------------------------------------------------
   // mesh.ts keeps hostId null on the host and in solo play — "nobody above
@@ -219,6 +222,7 @@ export function createCargoSystem({
       torchBeforeCarry = game.flashlightOn;
       setTorch(false);
       regrabUntil = 0;
+      sprintHeld = 0; // a fresh grip gets the full grace window
       showEvent("🧀 The Golden Gouda — heavy, warm, and still humming.");
     } else if (!isMine && wasMine) {
       setLocalStatus(STATUS.CARRYING, false);
@@ -310,6 +314,22 @@ export function createCargoSystem({
     }
   }
 
+  // Draw the wheel. Everyone but the carrier sees it exactly where the item
+  // is; the carrier's own camera gets it pushed out to the first-person
+  // framing offset (game/cargo.ts FP_HOLD_*), because at the true offset a
+  // 1.24 u wheel fills a 72° view. Nothing else moves — the item, the
+  // hand-off checks and every other client are on the real position.
+  function placeVisual(item: ItemInstance, holder: string | null): void {
+    const visual = getMountedGouda();
+    if (!visual) return;
+    if (isSelf(holder)) {
+      fpHoldPose(game.localPosition, getYaw(), getPitch(), _view);
+      visual.group.position.set(_view.x, _view.y, _view.z);
+    } else {
+      visual.group.position.set(item.x, item.y, item.z);
+    }
+  }
+
   // --- HUD ------------------------------------------------------------------
   // A single contextual line: what the action key does right now. The wheel
   // is never on the compass and never gets a marker (D4) — this only ever
@@ -384,7 +404,7 @@ export function createCargoSystem({
       item.x = _hold.x;
       item.y = _hold.y;
       item.z = _hold.z;
-      getMountedGouda()?.group.position.set(item.x, item.y, item.z);
+      placeVisual(item, holderOf(item));
     },
 
     rebindLocalId() {
@@ -416,8 +436,14 @@ export function createCargoSystem({
           item.y = _hold.y;
           item.z = _hold.z;
           // Sprinting with both arms full is how you lose it (G2). Never a
-          // random tick: this only rolls while YOU chose to sprint.
-          if (isSprinting() && Math.random() < sprintFumbleChance(dt)) {
+          // random tick: this only rolls while YOU chose to sprint, and only
+          // once you have HELD the sprint past the grace window — the timer
+          // resets the moment you let go, so short bursts are always free.
+          sprintHeld = isSprinting() ? sprintHeld + dt : 0;
+          if (
+            isSprinting() &&
+            Math.random() < sprintFumbleChance(dt, sprintHeld)
+          ) {
             fumble("🧀 It slips! Too fast, too heavy — catch it!");
           }
         } else {
@@ -444,7 +470,7 @@ export function createCargoSystem({
       }
 
       visual?.update(performance.now() / 1000, holder !== null);
-      visual?.group.position.set(item.x, item.y, item.z);
+      placeVisual(item, holder);
 
       // Home. The bell's hatch radius is the finish line (M1.3).
       if (
@@ -494,6 +520,7 @@ export function createCargoSystem({
       vy = 0;
       regrabUntil = 0;
       looseSyncTimer = 0;
+      sprintHeld = 0;
       won = false;
       torchBeforeCarry = true;
       setPrompt(null);

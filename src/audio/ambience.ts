@@ -471,7 +471,7 @@ export function playClick() {
   });
 }
 
-// Teleport/scatter: a rushing whoosh, disorienting.
+// Teleport: a rushing whoosh, disorienting.
 export function playWhoosh() {
   if (!ctx) return;
   noiseBurst({

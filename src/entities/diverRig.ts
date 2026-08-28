@@ -10,7 +10,7 @@
 //   legs   L/R_Thigh → L/R_Calf → L/R_Foot        (flutter kick)
 //   spine  Waist → Spine01 → Spine02              (undulation)
 //   neck   NeckTwist01/02 → Head                  (camera-synced look)
-//   arms   L/R_Upperarm → L/R_Forearm → L/R_Hand  (stroke; FP shows gloves only)
+//   arms   L/R_Upperarm → L/R_Forearm → L/R_Hand  (stroke; FP shows arms only)
 // The 14 *Twist* helper bones are identity passthroughs and are never
 // touched; Root/Hip/Pelvis/Clavicles/ToeBases stay at rest. Whole-body
 // motion (prone lean, bank into strafes, nose-toward-travel) lives on the
@@ -34,93 +34,225 @@
 import * as THREE from "three";
 import * as SkeletonUtils from "three/examples/jsm/utils/SkeletonUtils.js";
 import type { GLTF } from "three/examples/jsm/loaders/GLTFLoader.js";
-import { toonify } from "../render/toon.ts";
+import { toonify, toonMaterial } from "../render/toon.ts";
 
 export const DIVER_SCALE = 1.4; // template ~0.95 tall → ~1.33 world units
 // The FIRST-PERSON body renders smaller than reality: at true scale the
 // arms loom huge and wide across the whole view when looking down (a
 // wide-FOV camera sitting right at the shoulders). A reduced visual scale
 // keeps them readable as "my arms" without dominating the frame.
-const FP_SCALE = 1.2;
+let FP_SCALE = 2.24;
 const LEAN = 1.0; // prone swimming lean (rad) — body pitches under the head
+// …but the FIRST-PERSON body barely leans at all. The prone lean is a
+// third-person read (a swimmer seen from outside); applied to the FP body it
+// swings the shoulders up and BEHIND the head, so the arms have to reach up
+// and over to get in frame and the elbows fold backwards. That is the broken
+// shoulder angle you see looking down. Nearly upright, the shoulders sit
+// where a shoulder sits — below the eye and a little behind it — and the arms
+// simply hang forward.
+const FP_LEAN = 0.22;
 const REF_SPEED = 10; // world speed that maps to a full-effort kick
 
-// First-person body cheat: the (invisible) body sits well below and slightly
-// FORWARD of the true eye anchor, so at idle the gloves stay off screen and
-// looking down they appear at a natural distance, never looming at the lens.
-const FP_OFFSET = new THREE.Vector3(0, -0.5, -0.2);
+// First-person body cheat: the (invisible) body sits below the true eye
+// anchor and slightly BEHIND it. Behind is the important half — see
+// FP_VIEW: the FP body is rigidly locked to the camera, so a shoulder placed
+// behind the lens is behind it at every look angle, forever, and the one cut
+// in the FP geometry can never be in frame.
+const FP_OFFSET = new THREE.Vector3(0, -0.16, 0.1);
 
-// Base arm poses (template-space angles), numerically solved per view:
-// the FP pose reaches further forward-down so your own hands stay in frame.
+// Base arm poses (template-space angles), numerically solved per view.
 interface ArmPose {
-  uy: number;
-  ux: number;
-  fy: number;
-  fx: number;
-  hx: number;
+  uy: number; // upper arm: swing out/back (mirrored L/R)
+  ux: number; // upper arm: raise/lower
+  fy: number; // elbow fold (mirrored L/R)
+  fx: number; // elbow: lift the forearm
+  fz: number; // forearm ROLL — pronation, i.e. which way the palm faces
+  hx: number; // wrist: bend the hand up/down
+  hy: number; // wrist turn: palms roll inward to close around a load
+  hz: number; // wrist roll — the last of the palm's aim
 }
 const ARM_POSE_THIRD: ArmPose = {
   uy: 1.45,
   ux: -0.45,
   fy: 0.25,
   fx: -0.15,
+  fz: 0,
   hx: 0.18,
+  hy: 0,
+  hz: 0,
 };
-// FP pose places the gloves+forearms (the only FP geometry) LOW and WIDE
-// (screenshot-tuned via tools/runner.mjs pose sweeps): spaced across the
-// whole view width, forearms sweeping off the bottom corners, pure-POV style.
+// FP pose, LEVEL VIEW: the arms hang forward and down from shoulders that sit
+// just behind the lens, and only the backs of the gloves graze the bottom
+// edge of the frame. Solved numerically (see the bench's `gloves` entry,
+// which reads the hand and shoulder positions back in camera space).
+// (fx/hx sit lower than the old graze so the idle water-sway and the swim
+// drift can never bob a knuckle up into the frame: hidden means hidden.)
 const ARM_POSE_FP: ArmPose = {
-  uy: -0.2,
-  ux: -0.7,
-  fy: 1.1,
-  fx: -0.15,
-  hx: -0.05,
+  uy: 1.43,
+  ux: -1.44,
+  fy: 0.57,
+  fx: 0.42,
+  fz: 0.3,
+  hx: 0.28,
+  hy: 0,
+  hz: 0.45,
 };
+// …and LOOKING DOWN. The FP body is rigidly locked to the camera (FP_VIEW),
+// which is what keeps the shoulder cut out of frame at every angle — but it
+// also means that on its own you would see exactly the same sliver of glove
+// however far you looked down. So the REVEAL is done in the pose instead:
+// the arms draw in and up as you tip your head, blended by how far down you
+// are looking, and what comes into frame is forearm and paw — never the whole
+// arm, and never the shoulder. This is also what a swimmer looking at their
+// own chest actually does with their arms.
+// The reveal lands the paws in the lower third, angled IN toward each other
+// (hy) — not parked in the corners. Two hands already turned toward a point
+// between them is the neutral "ready to hold" shape, which is what lets a
+// future held item sit at the natural spot without a new pose per item.
+const ARM_POSE_FP_DOWN: ArmPose = {
+  uy: 1.43,
+  ux: -1.44,
+  fy: 1.2,
+  fx: 0.85,
+  fz: 0.32,
+  hx: 0.38,
+  hy: 0.3,
+  hz: 0.75,
+};
+// Look pitch (rad, negative = down) at which the down pose is fully in…
+const FP_LOOK_DOWN = 1.0;
+// …and the pitch at which the reveal STARTS. Below this the hands are fully
+// out of frame — the level pose parks them under the bottom edge, and this
+// dead zone is what keeps them there through ordinary small look-downs
+// (swimming along a floor, glancing at the compass). The hands are a
+// deliberate reveal, not standing furniture.
+let FP_REVEAL_START = 0.25;
 
-// FP hands are SCREEN-ANCHORED, FPS-style: the invisible body yaws with the
-// camera and pitches with it too — `base` tips the rig so at level view only
-// the glove tops graze the bottom edge, and `follow` < 1 lets the hands rise
-// just a little on a full look-down while still hugging the frame bottom.
-// (graphics.js applies base + pitch * follow to the FP pivot every frame.)
-export const FP_VIEW = { base: 0.3, follow: 0.7 };
+// CARRYING THE GOLDEN GOUDA. Both views get their own pose, and the rig
+// cross-fades into it over ~0.2 s (rig.carrySm) so a hand-off is a movement,
+// not a cut. The swim stroke is damped away at the same time: a diver with a
+// wheel of cheese in both arms does not also do the breaststroke.
+//
+// The target is the wheel itself — game/cargo.ts's holdPose puts its centre
+// CARGO.HOLD_FORWARD ahead and CARGO.HOLD_DOWN below the eye, with a radius
+// of GOUDA_RADIUS. These poses are solved to put the paws on its FLANKS, not
+// on the face nearest the camera: hands on the near face read as pushing a
+// boulder, hands on the sides read as carrying. Retune them together — move
+// the wheel or resize it and the hands stop touching it.
+const ARM_POSE_CARRY_THIRD: ArmPose = {
+  uy: 0.95,
+  ux: -0.15,
+  fy: 1.05,
+  fx: 0.15,
+  fz: -0.5,
+  hx: 0.25,
+  hy: 0.55,
+  hz: -0.6,
+};
+// (ux/fx lift the paws up onto the wheel's equator — at the old values the
+// wheel read as RESTING on the forearms; hy turns the palms hard onto the
+// flanks so the grip reads as holding, not supporting.)
+const ARM_POSE_CARRY_FP: ArmPose = {
+  uy: 1.35,
+  ux: 0.5,
+  fy: 0.69,
+  fx: 0.4,
+  fz: -0.2,
+  hx: 0.6,
+  hy: 0.5,
+  hz: -0.02,
+};
+// The FP body is shoved FORWARD and DOWN while carrying, so the shoulders sit
+// inside the wheel's upper crust and the arms come out of its flanks. This is
+// the one moment the cut is in front of the lens — and it is buried in half a
+// metre of cheese, which is exactly why it is allowed to be.
+const FP_OFFSET_CARRY = new THREE.Vector3(0, -0.19, -0.21);
+
+// FP hands are SCREEN-ANCHORED, FPS-style, and RIGIDLY so: the invisible body
+// takes the camera's yaw and its pitch, one for one. That is not a stylistic
+// choice, it is the whole safety property — the shoulder (and the only cut in
+// the FP geometry) keeps one fixed spot in camera space, so once it is behind
+// the lens it is behind the lens at every look angle, in every bank, forever.
+// A follow of less than 1 lets the camera swing relative to the body, and the
+// cut sweeps up into frame as a dark wedge on a hard look-down. That was the
+// bug. The "you see more of your arms when you look down" job belongs to the
+// pose (ARM_POSE_FP_DOWN), which can do it without moving the shoulder.
+export const FP_VIEW = { base: 0, follow: 1 };
+
+// The FP pivot's pitch. Callers own the pivot, so they need this before
+// updateDiverRig runs.
+export function fpBodyPitch(lookPitch: number): number {
+  return FP_VIEW.base + lookPitch * FP_VIEW.follow;
+}
 
 // Shot-harness tuning hook (shots.js): override the FP pose/offset straight
 // from URL params, so arm placement can be swept from the screenshot runner
 // without touching code. Mutates the live objects — rigs read them by
 // reference every frame.
-export function configureFpBody({
-  uy,
-  ux,
-  fy,
-  fx,
-  hx,
-  ox,
-  oy,
-  oz,
-  pb,
-  pf,
-}: {
+export interface FpBodyOverrides {
   uy?: number;
   ux?: number;
   fy?: number;
   fx?: number;
+  fz?: number;
   hx?: number;
+  hy?: number;
+  hz?: number;
   ox?: number;
   oy?: number;
   oz?: number;
+  sc?: number; // FP_SCALE — how long the arms are relative to the FOV
   pb?: number;
   pf?: number;
-} = {}) {
-  if (uy !== undefined) ARM_POSE_FP.uy = uy;
-  if (ux !== undefined) ARM_POSE_FP.ux = ux;
-  if (fy !== undefined) ARM_POSE_FP.fy = fy;
-  if (fx !== undefined) ARM_POSE_FP.fx = fx;
-  if (hx !== undefined) ARM_POSE_FP.hx = hx;
-  if (ox !== undefined) FP_OFFSET.x = ox;
-  if (oy !== undefined) FP_OFFSET.y = oy;
-  if (oz !== undefined) FP_OFFSET.z = oz;
-  if (pb !== undefined) FP_VIEW.base = pb;
-  if (pf !== undefined) FP_VIEW.follow = pf;
+  rs?: number; // FP_REVEAL_START — look-down pitch where the hands start in
+  // …the same knobs for the LOOK-DOWN pose (`d` prefix)…
+  duy?: number;
+  dux?: number;
+  dfy?: number;
+  dfx?: number;
+  dfz?: number;
+  dhx?: number;
+  dhy?: number;
+  dhz?: number;
+  // …and for the CARRY pose (`c` prefix), so the grip on the Golden Gouda can
+  // be swept from the runner exactly like the idle pose.
+  cuy?: number;
+  cux?: number;
+  cfy?: number;
+  cfx?: number;
+  cfz?: number;
+  chx?: number;
+  chy?: number;
+  chz?: number;
+  coy?: number;
+  coz?: number;
+}
+export function configureFpBody(o: FpBodyOverrides = {}) {
+  const set = <K extends keyof ArmPose>(
+    pose: ArmPose,
+    key: K,
+    v: number | undefined,
+  ) => {
+    if (v !== undefined) pose[key] = v;
+  };
+  const setAll = (pose: ArmPose, p: string) => {
+    const src = o as Record<string, number | undefined>;
+    for (const k of ["uy", "ux", "fy", "fx", "fz", "hx", "hy", "hz"] as const) {
+      set(pose, k, src[p ? p + k : k]);
+    }
+  };
+  setAll(ARM_POSE_FP, "");
+  setAll(ARM_POSE_FP_DOWN, "d");
+  setAll(ARM_POSE_CARRY_FP, "c");
+  if (o.sc !== undefined) FP_SCALE = o.sc;
+  if (o.ox !== undefined) FP_OFFSET.x = o.ox;
+  if (o.oy !== undefined) FP_OFFSET.y = o.oy;
+  if (o.oz !== undefined) FP_OFFSET.z = o.oz;
+  if (o.coy !== undefined) FP_OFFSET_CARRY.y = o.coy;
+  if (o.coz !== undefined) FP_OFFSET_CARRY.z = o.coz;
+  if (o.pb !== undefined) FP_VIEW.base = o.pb;
+  if (o.pf !== undefined) FP_VIEW.follow = o.pf;
+  if (o.rs !== undefined) FP_REVEAL_START = o.rs;
 }
 
 // Only these bones are ever posed (twist helpers excluded = simplified rig).
@@ -159,6 +291,7 @@ const HEAD_CHAIN = [
 
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
+const _v3 = new THREE.Vector3();
 const _e1 = new THREE.Euler();
 const _q1 = new THREE.Quaternion();
 const _q2 = new THREE.Quaternion();
@@ -190,9 +323,19 @@ export interface DiverRig {
   bones: Map<string, THREE.Object3D>;
   data: Map<string, BoneAxes>;
   headFix: THREE.Quaternion;
+  /** Head rest position in rig space at unit scale — anchor = this × scale. */
+  anchorUnit: THREE.Vector3;
   anchor: THREE.Vector3;
   firstPerson: boolean;
+  /** The idle pose for this view, the look-down reveal, and the carry grip. */
   armPose: ArmPose;
+  downPose: ArmPose;
+  carryPose: ArmPose;
+  /** Scratch the three are blended into each frame — never allocated here. */
+  pose: ArmPose;
+  poseTmp: ArmPose;
+  /** 0 = idle, 1 = carrying. Eased, so a hand-off reads as a movement. */
+  carrySm: number;
   head: THREE.Object3D | null;
   chain: THREE.Object3D[];
   cycle: number;
@@ -252,17 +395,31 @@ export function prepareDiverTemplate(gltf: GLTF): DiverTemplate {
   return { scene, data, headFix, headRest, fpGeometry: buildFpGeometry(scene) };
 }
 
-// First-person geometry: ONLY the gloves + forearms survive. Everything
-// else — torso, head, upper arms, legs — is deleted at prep time. Rendering
-// any connected body from a camera parked at the head reads as "floating
-// behind a mannequin"; hands riding the bottom of the frame is the classic
+// First-person geometry: the two ARMS survive — shoulder to fingertip —
+// and everything else (torso, head, legs) is deleted at prep time. Rendering
+// a connected body from a camera parked at the head reads as "floating
+// behind a mannequin"; arms riding the bottom of the frame is the classic
 // FPS proprioception cheat, and there is nothing near the lens to clip,
-// slice, or see through. A triangle survives if all three verts are
-// majority-weighted to a Hand/Forearm bone; the elbow cut is fan-capped so
-// the sleeve reads as a closed object from every angle. This is also the
-// cheap way to do it: one draw call on a reduced index buffer, so the GPU
-// only skins/shades the verts that are actually visible. Built once, shared
-// by FP rigs.
+// slice, or see through.
+//
+// The cut used to be at the ELBOW, and that was the bug: looking down showed
+// two short sleeves ending in mid-water with their hollow interiors facing
+// the camera (the FP material is double-sided). An arm has to come from
+// somewhere. Keeping the upper arm moves the only cut up to the SHOULDER,
+// which the FP body offset parks behind and below the lens — so the arms
+// read as attached to a body you cannot see, and the cut is never in frame.
+//
+// A triangle survives if all three verts are majority-weighted to an arm
+// bone; the shoulder cut is then capped (capOpenLoops) so the sleeve is a
+// closed object from every angle — a glance up the arm while banking hard
+// must not look into a hollow tube. This is also the cheap way to do it: one
+// draw call on a reduced index buffer, so the GPU only skins/shades the
+// verts that are actually visible. Built once, shared by FP rigs.
+const FP_ARM_BONES = /Hand|Forearm|Upperarm/;
+// The cut's own colour: the suit's shadowed lining. Near-black reads as a
+// HOLE punched in the arm wherever the cap does show; a dark suit tone reads
+// as the shoulder of a body you cannot see, which is what it is standing in for.
+const FP_CUT_COLOR = 0x6b5a3c;
 function buildFpGeometry(scene: THREE.Object3D) {
   let mesh: THREE.SkinnedMesh | undefined;
   scene.traverse((o) => {
@@ -274,7 +431,7 @@ function buildFpGeometry(scene: THREE.Object3D) {
   const sw = geo.attributes.skinWeight;
   const handSet = new Set<number>();
   mesh!.skeleton.bones.forEach((b, i) => {
-    if (/Hand|Forearm/.test(b.name)) handSet.add(i);
+    if (FP_ARM_BONES.test(b.name)) handSet.add(i);
   });
   const handW = (i: number) => {
     let w = 0;
@@ -294,53 +451,132 @@ function buildFpGeometry(scene: THREE.Object3D) {
     }
   }
   const hands = geo.clone();
-  hands.setIndex(capOpenLoops(keep));
+  hands.setIndex(keep);
+  capOpenLoops(hands);
   return { hands };
 }
 
-// Deleting the torso leaves the arm/leg sleeves as OPEN TUBES — and in first
-// person the camera sits right behind the shoulder cut, looking straight down
-// the hollow arm. Cap every boundary loop with a triangle fan so the cuts
-// read as solid shoulder/hip mass instead of glowing rings into an empty
-// sleeve. (Winding doesn't matter: the FP material is double-sided.)
-function capOpenLoops(index: number[]) {
-  const edges = new Map<string, number>(); // "lo_hi" -> count
+// Deleting the torso leaves the arms as OPEN TUBES — and in first person the
+// camera sits just above and behind the shoulder cut, so a hollow ring there
+// reads as a severed sleeve (the FP material is double-sided: you see the
+// inside wall). Cap every boundary loop so the cut is solid shoulder mass.
+//
+// A triangle FAN from one loop vertex is not enough, and this is where the
+// naive version failed: the cut ring is not convex and not planar, so a fan
+// anchored on one of its own vertices throws long blades across the arm. Cap
+// from the loop's CENTROID instead — a new vertex, appended to every
+// attribute — so every triangle stays inside the ring.
+//
+// The ring also has to be found on WELDED positions. The export splits verts
+// along UV seams, so by raw index a single cut ring is several disconnected
+// arcs, each capped separately and none of them closed. Welding by quantized
+// position merges the duplicates (and, as a bonus, makes seam edges count 2
+// so they are correctly not boundary).
+//
+// Winding doesn't matter: the FP material is double-sided.
+const WELD = 1e4; // position quantum for the weld: 0.1 mm on a 1 u model
+function capOpenLoops(geo: THREE.BufferGeometry): void {
+  const index = Array.from(geo.index!.array);
+  const armTris = index.length; // everything after this is cap (see groups below)
+  const pos = geo.attributes.position;
+
+  // Weld: every vertex maps to the first index seen at its position.
+  const rep = new Int32Array(pos.count);
+  const byPos = new Map<string, number>();
+  for (let v = 0; v < pos.count; v++) {
+    const k = `${Math.round(pos.getX(v) * WELD)}_${Math.round(pos.getY(v) * WELD)}_${Math.round(pos.getZ(v) * WELD)}`;
+    const first = byPos.get(k);
+    if (first === undefined) {
+      byPos.set(k, v);
+      rep[v] = v;
+    } else rep[v] = first;
+  }
+
+  // Boundary = an edge carried by exactly one triangle, in welded space.
+  const edges = new Map<string, number>();
   for (let t = 0; t < index.length; t += 3) {
     for (let e = 0; e < 3; e++) {
-      const a = index[t + e];
-      const b = index[t + ((e + 1) % 3)];
-      const k = a < b ? `${a}_${b}` : `${b}_${a}`;
-      edges.set(k, (edges.get(k) ?? 0) + 1);
+      const a = rep[index[t + e]];
+      const b = rep[index[t + ((e + 1) % 3)]];
+      if (a === b) continue; // degenerate after welding
+      edges.set(
+        a < b ? `${a}_${b}` : `${b}_${a}`,
+        (edges.get(a < b ? `${a}_${b}` : `${b}_${a}`) ?? 0) + 1,
+      );
     }
   }
-  const link = new Map<number, number[]>(); // boundary vert -> neighbors along the boundary
+  const link = new Map<number, number[]>();
   for (const [k, count] of edges) {
     if (count !== 1) continue;
     const [a, b] = k.split("_").map(Number);
     (link.get(a) ?? link.set(a, []).get(a)!).push(b);
     (link.get(b) ?? link.set(b, []).get(b)!).push(a);
   }
-  const capped = index.slice();
+
+  // Walk each ring, then fan it from a fresh centroid vertex. Rings shorter
+  // than a triangle are noise from a stray unshared edge, not a cut.
+  const centroids: { p: THREE.Vector3; src: number }[] = [];
   const seen = new Set<number>();
   for (const start of link.keys()) {
     if (seen.has(start)) continue;
     const loop = [start];
     seen.add(start);
-    let prev = -1;
-    let cur = start;
-    for (;;) {
-      const nxt = (link.get(cur) ?? []).find((v) => v !== prev && !seen.has(v));
-      if (nxt === undefined) break;
-      loop.push(nxt);
-      seen.add(nxt);
-      prev = cur;
-      cur = nxt;
+    for (let cur = start; ;) {
+      const next = (link.get(cur) ?? []).find((v) => !seen.has(v));
+      if (next === undefined) break;
+      loop.push(next);
+      seen.add(next);
+      cur = next;
     }
-    for (let i = 1; i + 1 < loop.length; i++) {
-      capped.push(loop[0], loop[i], loop[i + 1]);
+    if (loop.length < 3) continue;
+    const centre = new THREE.Vector3();
+    for (const v of loop) centre.add(_v1.fromBufferAttribute(pos, v));
+    centre.multiplyScalar(1 / loop.length);
+    const c = pos.count + centroids.length;
+    centroids.push({ p: centre, src: loop[0] });
+    for (let i = 0; i < loop.length; i++) {
+      index.push(c, loop[i], loop[(i + 1) % loop.length]);
     }
   }
-  return capped;
+  if (!centroids.length) {
+    geo.clearGroups();
+    geo.addGroup(0, armTris, 0); // no cut to cap: one group, one material
+    return;
+  }
+
+  // Append the centroids. Every attribute grows by the same count; the new
+  // vertex inherits its ring's skinning (a cut ring sits inside one bone's
+  // territory by construction — that is how the triangles were selected),
+  // and position is overwritten with the centroid afterwards.
+  for (const name of Object.keys(geo.attributes)) {
+    const attr = geo.attributes[name] as THREE.BufferAttribute;
+    const size = attr.itemSize;
+    const grown = new (attr.array.constructor as Float32ArrayConstructor)(
+      (attr.count + centroids.length) * size,
+    );
+    grown.set(attr.array as ArrayLike<number>);
+    centroids.forEach((c, i) => {
+      for (let k = 0; k < size; k++) {
+        grown[(attr.count + i) * size + k] = attr.array[c.src * size + k];
+      }
+    });
+    const next = new THREE.BufferAttribute(grown, size, attr.normalized);
+    if (name === "position") {
+      centroids.forEach((c, i) =>
+        next.setXYZ(attr.count + i, c.p.x, c.p.y, c.p.z),
+      );
+    }
+    geo.setAttribute(name, next);
+  }
+  geo.setIndex(index);
+  // Two groups, so the cut can carry its own material. The caps are the tail
+  // of the index buffer by construction (they were pushed after the kept
+  // triangles), which is exactly the contiguous range a group needs. Without
+  // this the cut inherits the suit texture through a centroid UV borrowed
+  // from one ring vertex, and smears the atlas into stripes across the hole.
+  geo.clearGroups();
+  geo.addGroup(0, armTris, 0);
+  geo.addGroup(armTris, index.length - armTris, 1);
 }
 
 // Build one rig instance. Returns { root, ... } — mount `root` under a
@@ -365,8 +601,8 @@ export function createDiverRig(
   });
 
   if (firstPerson) {
-    // FP renders ONLY the two gloves (see buildFpGeometry) — the invisible
-    // arm bones still pose them, so placement is tuned via ARM_POSE_FP and
+    // FP renders ONLY the two arms (see buildFpGeometry) — the invisible
+    // torso bones still pose them, so placement is tuned via ARM_POSE_FP and
     // they keep the subtle swim drift.
     let fpMesh: THREE.SkinnedMesh | null = null;
     model.traverse((o) => {
@@ -374,16 +610,30 @@ export function createDiverRig(
         fpMesh ??= o as THREE.SkinnedMesh;
     });
     // (skinned mesh always present — same assumption as buildFpGeometry)
-    fpMesh!.geometry = template.fpGeometry.hands;
-    fpMesh!.castShadow = false; // two floating gloves cast a nonsense shadow
+    const skin = fpMesh!;
+    // Group 1 is the shoulder cut (capOpenLoops). It gets its own material —
+    // flat, dark, untextured suit lining — because the cap vertices carry a
+    // borrowed UV and would otherwise smear the atlas across the hole. It is
+    // meant to be off screen at every look angle; this is what it looks like
+    // in the frame or two where a hard bank swings it past the lens.
+    const skinMat = skin.material;
+    skin.geometry = template.fpGeometry.hands;
+    skin.material = [
+      Array.isArray(skinMat) ? skinMat[0] : skinMat,
+      toonMaterial({ color: FP_CUT_COLOR, side: THREE.DoubleSide }),
+    ];
+    skin.castShadow = false; // two floating arms cast a nonsense shadow
   }
 
-  // Head rest position, template space → rig space (rotY(π) flips x/z).
-  const anchor = new THREE.Vector3(
+  // Head rest position, template space → rig space (rotY(π) flips x/z). Kept
+  // at unit scale as well, because a first-person rig rescales itself while
+  // carrying and the anchor has to follow or the head slides off the camera.
+  const anchorUnit = new THREE.Vector3(
     -template.headRest.x,
     template.headRest.y,
     -template.headRest.z,
-  ).multiplyScalar(scale);
+  );
+  const anchor = anchorUnit.clone().multiplyScalar(scale);
 
   const rig: DiverRig = {
     root,
@@ -391,9 +641,17 @@ export function createDiverRig(
     bones,
     data: template.data,
     headFix: template.headFix,
+    anchorUnit,
     anchor,
     firstPerson,
     armPose: firstPerson ? ARM_POSE_FP : ARM_POSE_THIRD,
+    // Third person has no reveal to do — its "look down" pose IS its pose,
+    // so the blend below is a no-op there rather than a special case.
+    downPose: firstPerson ? ARM_POSE_FP_DOWN : ARM_POSE_THIRD,
+    carryPose: firstPerson ? ARM_POSE_CARRY_FP : ARM_POSE_CARRY_THIRD,
+    pose: { uy: 0, ux: 0, fy: 0, fx: 0, fz: 0, hx: 0, hy: 0, hz: 0 },
+    poseTmp: { uy: 0, ux: 0, fy: 0, fx: 0, fz: 0, hx: 0, hy: 0, hz: 0 },
+    carrySm: 0,
     head: bones.get("Head") ?? null,
     chain: HEAD_CHAIN.map((n) => bones.get(n)).filter(
       Boolean,
@@ -418,9 +676,44 @@ export function createDiverRig(
 // head never drifts off the camera/broadcast position however the body
 // swings beneath it). First-person bodies also get the FP_OFFSET cheat.
 function applyRootPose(rig: DiverRig, swayX = 0, swayZ = 0) {
-  rig.root.rotation.set(-LEAN + rig.leanAdj + swayX, 0, rig.roll + swayZ);
+  if (rig.firstPerson) {
+    // Re-read every frame: FP_SCALE is a live tuning knob (configureFpBody),
+    // and the anchor is derived from it — the head has to stay pinned to the
+    // camera whatever the arms are scaled to. The arms are the SAME LENGTH
+    // carrying as not: an arm that grows on pickup pops, and once the body
+    // itself slides forward to meet the load there is nothing left for a
+    // scale change to buy.
+    rig.model.scale.setScalar(FP_SCALE);
+    rig.anchor.copy(rig.anchorUnit).multiplyScalar(FP_SCALE);
+  }
+  rig.root.rotation.set(
+    -(rig.firstPerson ? FP_LEAN : LEAN) + rig.leanAdj + swayX,
+    0,
+    rig.roll + swayZ,
+  );
   rig.root.position.copy(rig.anchor).applyEuler(rig.root.rotation).negate();
-  if (rig.firstPerson) rig.root.position.add(FP_OFFSET);
+  if (rig.firstPerson) {
+    rig.root.position.add(
+      _v3.lerpVectors(FP_OFFSET, FP_OFFSET_CARRY, rig.carrySm),
+    );
+  }
+}
+
+// How fast the carry blend closes (1/s). Fast enough that pressing E feels
+// like the hands answering, slow enough that it is a movement and not a cut.
+const CARRY_EASE = 5;
+
+// Blend two arm poses into `out` (a per-rig scratch, never allocated here).
+function blendPose(a: ArmPose, b: ArmPose, k: number, out: ArmPose): ArmPose {
+  out.uy = a.uy + (b.uy - a.uy) * k;
+  out.ux = a.ux + (b.ux - a.ux) * k;
+  out.fy = a.fy + (b.fy - a.fy) * k;
+  out.fx = a.fx + (b.fx - a.fx) * k;
+  out.fz = a.fz + (b.fz - a.fz) * k;
+  out.hx = a.hx + (b.hx - a.hx) * k;
+  out.hy = a.hy + (b.hy - a.hy) * k;
+  out.hz = a.hz + (b.hz - a.hz) * k;
+  return out;
 }
 
 // Absolute pose: rest ∘ rotation about a template axis. Never accumulates.
@@ -454,14 +747,35 @@ export function updateDiverRig(
     lookYaw,
     lookPitch,
     vel,
+    carrying = false,
   }: {
     bodyYaw: number;
     bodyPitch: number;
     lookYaw: number;
     lookPitch: number;
     vel: { x: number; y: number; z: number };
+    // Both arms are around the Golden Gouda: hold the carry pose and stop
+    // stroking. True for the local carrier and for every remote diver whose
+    // replicated status carries STATUS.CARRYING, so what you see someone
+    // holding is where the wheel actually is.
+    carrying?: boolean;
   },
 ) {
+  // --- Carry blend --------------------------------------------------------
+  // Eased first, because applyRootPose (below) reads it: the FP body slides
+  // forward toward the wheel over the same ~0.2 s the arms take to close.
+  rig.carrySm +=
+    ((carrying ? 1 : 0) - rig.carrySm) * Math.min(1, dt * CARRY_EASE);
+  // Level pose → look-down reveal → carry grip, in that order. The reveal is
+  // driven straight off the look (no easing: it IS the look, and the camera
+  // is already smoothed), the grip off the carry ease.
+  const down = Math.min(
+    1,
+    Math.max(0, (-lookPitch - FP_REVEAL_START) / (FP_LOOK_DOWN - FP_REVEAL_START)),
+  );
+  blendPose(rig.armPose, rig.downPose, down, rig.poseTmp);
+  blendPose(rig.poseTmp, rig.carryPose, rig.carrySm, rig.pose);
+
   // --- Movement analysis --------------------------------------------------
   _q1.setFromEuler(_e1.set(bodyPitch, bodyYaw, 0, "YXZ")); // body world quat
   _v1.set(vel.x, vel.y, vel.z);
@@ -539,13 +853,18 @@ export function updateDiverRig(
   // feel alive. They're a stable anchor (think: future tools, a wrist
   // watch), not an animation showcase; the full strokes are for the
   // third-person view only.
-  const arm = (0.25 + 0.85 * effort) * (rig.firstPerson ? 0.06 : 1);
+  // …and while carrying they barely move at all: a diver hugging a wheel of
+  // cheese is not also swimming with its arms. What is left is a slow settle
+  // against the load, which is what keeps the pose from looking frozen.
+  const free = 1 - 0.92 * rig.carrySm;
+  const arm = (0.25 + 0.85 * effort) * (rig.firstPerson ? 0.06 : 1) * free;
   const sw = s(c * 0.5);
   const sw2 = s(c * 0.5 - 0.9);
-  const ap = rig.armPose; // numerically solved base pose (FP reaches further)
+  const ap = rig.pose; // idle pose blended toward the carry pose (see above)
   // Strafing: both arms sweep toward the travel side — the diver visibly
-  // pulls itself sideways with its arms (third person only).
-  const sOff = rig.firstPerson ? 0 : rig.strafeSm * 0.5;
+  // pulls itself sideways with its arms (third person only, and not with its
+  // hands full).
+  const sOff = rig.firstPerson ? 0 : rig.strafeSm * 0.5 * free;
   // (Signs validated numerically: hands settle below-forward of the eyes,
   // elbows slightly out — a relaxed prone glide.)
   pose(rig, "L_Upperarm", "aY", -ap.uy + arm * 0.7 * sw + sOff);
@@ -559,6 +878,7 @@ export function updateDiverRig(
     -ap.fy - arm * 0.6 * Math.max(0, sw2) + sOff * 0.6,
   );
   poseAdd(rig, "L_Forearm", "aX", ap.fx);
+  poseAdd(rig, "L_Forearm", "aZ", -ap.fz);
   pose(
     rig,
     "R_Forearm",
@@ -566,9 +886,23 @@ export function updateDiverRig(
     ap.fy + arm * 0.6 * Math.max(0, sw2) + sOff * 0.6,
   );
   poseAdd(rig, "R_Forearm", "aX", ap.fx);
-  const handWiggle = rig.firstPerson ? 0.04 : 0.16;
+  poseAdd(rig, "R_Forearm", "aZ", ap.fz);
+  const handWiggle = (rig.firstPerson ? 0.04 : 0.16) * free;
+  // Three axes, because a hand that is going to CLOSE ON something needs all
+  // three and a hand laid flat needs none of them:
+  //   hx  bends the wrist up/down,
+  //   hy  turns the palms IN toward each other — this is what makes a pair of
+  //       hands read as closed around a load rather than pressed flat on it,
+  //   hz  rolls the palm to face the load, together with the forearm's own
+  //       pronation (fz). Without it the paws meet the wheel BACK-first, with
+  //       the fingers splayed away from the thing they are supposed to hold.
+  // All three are mirrored between the two hands, like uy and fy above.
   pose(rig, "L_Hand", "aX", ap.hx + handWiggle * sw);
+  poseAdd(rig, "L_Hand", "aY", -ap.hy);
+  poseAdd(rig, "L_Hand", "aZ", -ap.hz);
   pose(rig, "R_Hand", "aX", ap.hx + handWiggle * sw);
+  poseAdd(rig, "R_Hand", "aY", ap.hy);
+  poseAdd(rig, "R_Hand", "aZ", ap.hz);
 
   // First person: the head is collapsed/invisible and the local torch is
   // camera-mounted — skip the whole look solve.
