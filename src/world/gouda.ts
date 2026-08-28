@@ -1,4 +1,4 @@
-// gouda.js — the procedural abyssal gouda labyrinth, v4 (recipe-driven).
+// gouda.js — the procedural abyssal gouda labyrinth, v5 (layer bodies).
 //
 // SHAPE GRAMMAR — every chunk is an analytic SDF built from:
 //   · a squashed ellipsoid base ("wheel": flattened round; "hunk": rounder)
@@ -8,6 +8,17 @@
 //   · minus perfectly spherical eyes (caverns/chambers) and pores
 //   · minus winding tunnel capsules (bent polylines)
 //   · minus PLAYER DIGS (runtime sphere carves — see digAt)
+//
+// LAYER BODIES (M2 map) — "fused" and "hull" biomes swap the ellipsoid base
+// for ONE analytic body shared by the whole biome: a radial band of solid
+// cheese, or the Great Wheel's rounded-cylinder husk. The body is meshed by
+// lattice-aligned cube tiles (spacing 2s(res-3)/res, the marched extent of
+// three's MarchingCubes) so adjacent tiles sample identical world points and
+// abut seamlessly. Carves are generated in WORLD space per layer — per-tile
+// eye clusters, an inter-tile spanning tree, side exits, and the world SPINE
+// (the seeded descent route) — then distributed into every tile they touch.
+// Layer radii live in the world FRAME (vertical squash + tilt), which is how
+// the whole onion lies flat inside a squat tilted wheel.
 //
 // NUMBERS LIVE IN world/recipes.ts (M2) — this file owns the shape-family
 // IMPLEMENTATIONS: makeChunkData() turns a PartRecipe into SDF params,
@@ -49,6 +60,7 @@ import type { Vec3 } from "../state.ts";
 import {
   DEFAULT_WORLD,
   pickPart,
+  validateWorld,
   type BiomeMaterial,
   type BiomePlacement,
   type BiomeRecipe,
@@ -141,6 +153,8 @@ export interface Chunk {
   mesh: THREE.Mesh | null;
   biggestEye?: SphereCarve | null; // set by makeChunkData
   zone?: ZoneName; // set by buildGoudaWorld
+  body?: LayerBody; // layer-body tile: base SDF comes from the layer, not the ellipsoid
+  sealed?: boolean; // seal tiles never receive foreign carves (noCarveWithin)
 }
 
 export interface ChunkSpec {
@@ -151,6 +165,21 @@ export interface ChunkSpec {
   zone: ZoneName;
   part: PartRecipe;
   axis?: Vec3; // radial through-route direction (shell placements)
+  body?: LayerBody; // layer-body tile (fused/hull placements)
+}
+
+// One point of the seeded descent route: a through-point per layer boundary.
+export interface SpinePoint {
+  x: number;
+  y: number;
+  z: number;
+  r: number; // frame radius of the boundary it sits on
+}
+
+export interface WorldPlan {
+  specs: ChunkSpec[];
+  spine: SpinePoint[];
+  softSpots: SoftSpot[];
 }
 
 interface Debris {
@@ -173,6 +202,9 @@ let goldPos: Vec3 | null = null; // where the Gouda is seeded (M1.2)
 let markerMaterial: THREE.SpriteMaterial | null = null;
 let spawnPoint: THREE.Vector3 | null = null;
 let lastCull = -1;
+let worldFrame: WorldFrame | null = null;
+let worldSpine: SpinePoint[] = [];
+let worldSoftSpots: SoftSpot[] = [];
 
 const uGoudaTime = { value: 0 };
 
@@ -250,8 +282,163 @@ function segDist(
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
+function smoothMin(a: number, b: number, k: number): number {
+  const h = Math.max(k - Math.abs(a - b), 0) / k;
+  return Math.min(a, b) - h * h * k * 0.25;
+}
+
+// --- World frame (squash + tilt) — layer-body radii are measured here ------------
+
+// Precomputed rotation (tilt about X) + vertical squash. null = identity,
+// and the identity path must not touch the numbers (classic-onion compat).
+export interface WorldFrame {
+  cos: number;
+  sin: number;
+  squash: number;
+}
+
+export function makeFrame(
+  recipe: { squash: number; tiltDeg: number } | undefined,
+): WorldFrame | null {
+  if (!recipe) return null;
+  const rad = (recipe.tiltDeg * Math.PI) / 180;
+  return { cos: Math.cos(rad), sin: Math.sin(rad), squash: recipe.squash };
+}
+
+// Frame radius of a world point (identity: plain length).
+export function frameRadius(
+  f: WorldFrame | null,
+  x: number,
+  y: number,
+  z: number,
+): number {
+  if (!f) return Math.sqrt(x * x + y * y + z * z);
+  const fy = (f.cos * y - f.sin * z) / f.squash;
+  const fz = f.sin * y + f.cos * z;
+  return Math.sqrt(x * x + fy * fy + fz * fz);
+}
+
+// Frame-space direction+radius → world point.
+function frameToWorld(f: WorldFrame | null, v: THREE.Vector3): THREE.Vector3 {
+  if (!f) return v;
+  const y = v.y * f.squash;
+  const z = v.z;
+  v.y = f.cos * y + f.sin * z;
+  v.z = -f.sin * y + f.cos * z;
+  return v;
+}
+
+// --- Layer bodies (fused bands, hulls) --------------------------------------------
+
+export interface SoftSpot {
+  x: number;
+  y: number;
+  z: number;
+  r: number;
+}
+
+export interface LayerBody {
+  kind: "band" | "hull";
+  frame: WorldFrame | null;
+  nOff: number; // layer-level crust noise offset (tile continuity)
+  // band
+  rMin: number;
+  rMax: number;
+  warpAmp: number;
+  warpFreq: number;
+  // hull ("wheel" = squat rounded cylinder in the tilted frame; "sphere")
+  surface: "wheel" | "sphere";
+  R: number;
+  halfH: number;
+  rim: number;
+  thickness: number;
+  ridgeAmp: number;
+  ridgeFreq: number;
+  softSpots: SoftSpot[];
+}
+
+// The hull's FULL solid (wheel/sphere before hollowing) — the husk is
+// max(solid, -solid - thickness), and soft-spot projection bisects this.
+function hullSolidSdf(b: LayerBody, x: number, y: number, z: number): number {
+  // Untilt only (no squash): the wheel has its own height.
+  const f = b.frame;
+  let qy = y,
+    qz = z;
+  if (f) {
+    qy = f.cos * y - f.sin * z;
+    qz = f.sin * y + f.cos * z;
+  }
+  if (b.surface === "sphere") return Math.sqrt(x * x + qy * qy + qz * qz) - b.R;
+  const rxz = Math.sqrt(x * x + qz * qz);
+  const d2 = rxz - (b.R - b.rim);
+  const dy = Math.abs(qy) - (b.halfH - b.rim);
+  const mx = Math.max(d2, 0);
+  const my = Math.max(dy, 0);
+  let solid =
+    Math.min(Math.max(d2, dy), 0) + Math.sqrt(mx * mx + my * my) - b.rim;
+  if (b.ridgeAmp > 0 && dy > d2)
+    solid += b.ridgeAmp * Math.sin(rxz * b.ridgeFreq);
+  return solid;
+}
+
+// World-unit distance to the layer's solid. Approximate SDF (anisotropic
+// squash + warp break exactness) but sign-correct, which is all marching
+// cubes and sphere-tracing with conservative steps need.
+function bodySdfWorld(b: LayerBody, x: number, y: number, z: number): number {
+  const f = b.frame;
+  let d: number;
+  if (b.kind === "band") {
+    let rr = frameRadius(f, x, y, z);
+    if (b.warpAmp > 0)
+      rr +=
+        b.warpAmp *
+        fbm3(
+          x * b.warpFreq + b.nOff,
+          y * b.warpFreq + b.nOff * 1.7,
+          z * b.warpFreq + b.nOff * 0.6,
+        );
+    d = Math.max(rr - b.rMax, b.rMin - rr);
+    if (f) d *= Math.min(1, f.squash);
+  } else {
+    const solid = hullSolidSdf(b, x, y, z);
+    d = Math.max(solid, -solid - b.thickness);
+    for (const s of b.softSpots) {
+      const dx = x - s.x,
+        dyy = y - s.y,
+        dz = z - s.z;
+      d = smoothMin(
+        d,
+        Math.sqrt(dx * dx + dyy * dyy + dz * dz) - s.r,
+        s.r * 0.8,
+      );
+    }
+  }
+  return d;
+}
+
 // Uncarved body SDF: rind (outer) vs. paste (carved interior).
 function baseSdf(c: Chunk, x: number, y: number, z: number): number {
+  if (c.body) {
+    // Layer tile: world-space body + world-continuous crust, back to local.
+    const wx = c.center.x + x * c.s,
+      wy = c.center.y + y * c.s,
+      wz = c.center.z + z * c.s;
+    let dw = bodySdfWorld(c.body, wx, wy, wz);
+    const depthW = c.crustDepth * c.s;
+    const adw = Math.abs(dw);
+    if (adw < depthW && c.amp > 0) {
+      let fade = 1 - adw / depthW;
+      fade = fade * fade * (3 - 2 * fade);
+      const wf = c.freq / c.s;
+      dw +=
+        fbm3(wx * wf + c.nOff, wy * wf + c.nOff * 1.7, wz * wf + c.nOff * 0.6) *
+        c.amp *
+        c.s *
+        fade;
+    }
+    return dw / c.s;
+  }
+
   const ex = x * c.ix,
     ey = y * c.iy,
     ez = z * c.iz;
@@ -285,12 +472,20 @@ function chunkSdf(c: Chunk, x: number, y: number, z: number): number {
 
   if (d > CARVE_SKIP) return d;
 
+  // Per-axis carve rejection. A carve is a no-op when its cut distance stays
+  // above d + k; below -0.25 the exact value can be distorted safely — those
+  // samples are never adjacent to a sign change, so the isosurface (and the
+  // extracted mesh) is bit-identical.
   const holes = c.holes;
   for (let i = 0; i < holes.length; i++) {
     const h = holes[i];
-    const dx = x - h.x,
-      dy = y - h.y,
-      dz = z - h.z;
+    const lim = d < -0.25 ? h.r + 0.31 : h.r - d + 0.06;
+    const dx = x - h.x;
+    if (dx > lim || dx < -lim) continue;
+    const dy = y - h.y;
+    if (dy > lim || dy < -lim) continue;
+    const dz = z - h.z;
+    if (dz > lim || dz < -lim) continue;
     d = smoothCut(d, Math.sqrt(dx * dx + dy * dy + dz * dz) - h.r, SMOOTH_K);
     if (d > 0.45) return d; // deep in a cavern: no surface near, bail out
   }
@@ -298,6 +493,13 @@ function chunkSdf(c: Chunk, x: number, y: number, z: number): number {
   const tunnels = c.tunnels;
   for (let i = 0; i < tunnels.length; i++) {
     const t = tunnels[i];
+    const lim = d < -0.25 ? t.r + 0.31 : t.r - d + 0.06;
+    if (x > Math.max(t.ax, t.bx) + lim || x < Math.min(t.ax, t.bx) - lim)
+      continue;
+    if (y > Math.max(t.ay, t.by) + lim || y < Math.min(t.ay, t.by) - lim)
+      continue;
+    if (z > Math.max(t.az, t.bz) + lim || z < Math.min(t.az, t.bz) - lim)
+      continue;
     d = smoothCut(
       d,
       segDist(x, y, z, t.ax, t.ay, t.az, t.bx, t.by, t.bz) - t.r,
@@ -443,6 +645,20 @@ export function makeChunkData(
     const core = { x: 0, y: 0, z: 0, r: part.coreEye };
     eyes.push(core);
     c.holes.push(core);
+  }
+
+  // Rare oversized rooms (mite-bore's authored exception).
+  if (part.chambers && rng() < part.chambers.chance) {
+    randDir(rng, _dir);
+    const t = R0 * (0.1 + 0.4 * rng());
+    const room = {
+      x: _dir.x * t * sx,
+      y: _dir.y * t * sy,
+      z: _dir.z * t * sz,
+      r: part.chambers.rBase + part.chambers.rVar * rng(),
+    };
+    eyes.push(room);
+    c.holes.push(room);
   }
 
   const nEyes =
@@ -714,7 +930,7 @@ export function digAt(x: number, y: number, z: number, r: number): boolean {
       dy = y - c.center.y,
       dz = z - c.center.z;
     const dc = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (dc > c.s * 1.35 + r) continue;
+    if (dc > (c.body ? c.s * 1.74 : c.s * 1.35) + r) continue;
 
     const lx = dx / c.s,
       ly = dy / c.s,
@@ -1000,7 +1216,8 @@ export function updateGouda(
     lastCull = elapsed;
     const cullDist = Math.min(Math.max(visibility * 1.25, 80), 720);
     for (const child of worldGroup.children) {
-      const reach = child.scale.x * 1.4;
+      const reach =
+        (child.userData.reach as number | undefined) ?? child.scale.x * 1.4;
       child.visible = child.position.distanceTo(cameraPos) - reach < cullDist;
     }
   }
@@ -1008,11 +1225,75 @@ export function updateGouda(
 
 // --- World assembly -----------------------------------------------------------------------------
 
+// Direction (frame space) of a world point; out = unit vector.
+function frameDirOf(
+  f: WorldFrame | null,
+  x: number,
+  y: number,
+  z: number,
+  out: THREE.Vector3,
+): THREE.Vector3 {
+  if (!f) out.set(x, y, z);
+  else out.set(x, (f.cos * y - f.sin * z) / f.squash, f.sin * y + f.cos * z);
+  const l = out.length() || 1;
+  return out.multiplyScalar(1 / l);
+}
+
+// The descent route: one through-point per layer boundary, stepping 40–80°
+// around and drifting downward. Boundaries come from fused bands + hulls,
+// merged when nearly coincident so adjacent layers chain through one door.
+function computeSpine(
+  rng: Rng,
+  world: WorldRecipe,
+  frame: WorldFrame | null,
+): SpinePoint[] {
+  const sp = world.spine;
+  if (!sp) return [];
+  const radii: number[] = [];
+  for (const b of world.biomes) {
+    const pl = b.placement;
+    if (pl.mode === "hull") radii.push(pl.radius);
+    else if (pl.mode === "fused") radii.push(pl.rMax, pl.rMin);
+  }
+  radii.sort((a, b) => b - a);
+  const merged: number[] = [];
+  for (const r of radii) {
+    if (merged.length && merged[merged.length - 1] - r < 12)
+      merged[merged.length - 1] = (merged[merged.length - 1] + r) / 2;
+    else merged.push(r);
+  }
+
+  const dir = new THREE.Vector3(
+    (rng() - 0.5) * 0.7,
+    -0.15 - sp.drift * 0.3,
+    1,
+  ).normalize();
+  const pts: SpinePoint[] = [];
+  for (const r of merged) {
+    const w = frameToWorld(frame, dir.clone().multiplyScalar(r));
+    pts.push({ x: w.x, y: w.y, z: w.z, r });
+    const step =
+      ((sp.stepDeg.min + rng() * (sp.stepDeg.max - sp.stepDeg.min)) * Math.PI) /
+      180;
+    randDir(rng, _dir2);
+    _dir2.addScaledVector(dir, -_dir2.dot(dir));
+    if (_dir2.lengthSq() < 1e-4) _dir2.set(1, 0, 0);
+    _dir2.normalize();
+    dir.multiplyScalar(Math.cos(step)).addScaledVector(_dir2, Math.sin(step));
+    dir.y -= sp.drift * 0.4;
+    dir.normalize();
+  }
+  return pts;
+}
+
 // BiomeRecipe placements → chunk layout, in table order (inside → out).
 // The rng stream is a pure function of the tables: sizeVar 0 and single-part
 // biomes consume no rng, so the default tables reproduce the v3 worlds.
-function placeChunks(rng: Rng, world: WorldRecipe, diff: number): ChunkSpec[] {
+function placeChunks(rng: Rng, world: WorldRecipe, diff: number): WorldPlan {
+  const frame = makeFrame(world.frame);
   const specs: ChunkSpec[] = [];
+  const softSpots: SoftSpot[] = [];
+  const spine = computeSpine(rng, world, frame);
   const size = (b: BiomeRecipe) =>
     b.sizeVar > 0 ? b.sizeBase + rng() * b.sizeVar : b.sizeBase;
 
@@ -1027,8 +1308,14 @@ function placeChunks(rng: Rng, world: WorldRecipe, diff: number): ChunkSpec[] {
     for (let shrink = 0; shrink < 4; shrink++, s *= 0.9) {
       for (let attempt = 0; attempt < 500; attempt++) {
         randDir(rng, _dir);
-        const rad = pl.rMin + rng() * (pl.rMax - pl.rMin);
-        const p = new THREE.Vector3(_dir.x * rad, _dir.y * rad, _dir.z * rad);
+        let u = rng();
+        if (pl.densityGrade === "outward") u = Math.sqrt(u);
+        else if (pl.densityGrade === "inward") u = 1 - Math.sqrt(1 - u);
+        const rad = pl.rMin + u * (pl.rMax - pl.rMin);
+        const p = frameToWorld(
+          frame,
+          new THREE.Vector3(_dir.x * rad, _dir.y * rad, _dir.z * rad),
+        );
         let ok = true;
         for (const other of specs) {
           const g =
@@ -1093,6 +1380,81 @@ function placeChunks(rng: Rng, world: WorldRecipe, diff: number): ChunkSpec[] {
     }
   };
 
+  // Layer bodies: lattice-aligned tiles over one shared analytic body.
+  // Spacing equals the marched extent, so tiles abut with identical samples.
+  const tileLayer = (biome: BiomeRecipe, body: LayerBody): void => {
+    const s = biome.sizeBase;
+    const res = biome.res;
+    const spacing = (2 * s * (res - 3)) / res;
+    const halfW = s * (1 - 3 / res);
+    const boxOff = s / res;
+    const bound =
+      body.kind === "band"
+        ? body.rMax + body.warpAmp + s
+        : Math.max(body.R, body.halfH) + body.thickness + s;
+    const n = Math.ceil(bound / spacing);
+    // A cell is kept unless its 9-sample probe (marched-box center + corners,
+    // coverage radius = halfW) proves the whole box lies in open water.
+    const isVoid = (bx: number, by: number, bz: number): boolean => {
+      let minD = bodySdfWorld(body, bx, by, bz);
+      if (minD <= halfW + 2) return false;
+      for (let ci = -1; ci <= 1; ci += 2)
+        for (let cj = -1; cj <= 1; cj += 2)
+          for (let ck = -1; ck <= 1; ck += 2) {
+            minD = Math.min(
+              minD,
+              bodySdfWorld(
+                body,
+                bx + ci * halfW,
+                by + cj * halfW,
+                bz + ck * halfW,
+              ),
+            );
+            if (minD <= halfW + 2) return false;
+          }
+      return true;
+    };
+    for (let i = -n; i <= n; i++)
+      for (let j = -n; j <= n; j++)
+        for (let k = -n; k <= n; k++) {
+          const cx = i * spacing,
+            cy = j * spacing,
+            cz = k * spacing;
+          if (isVoid(cx - boxOff, cy - boxOff, cz - boxOff)) continue;
+          specs.push({
+            center: new THREE.Vector3(cx, cy, cz),
+            s,
+            res,
+            label: biome.label,
+            zone: biome.id,
+            part: pickPart(world, biome, rng),
+            body,
+          });
+        }
+  };
+
+  // Bisect along a frame ray to the hull's outer solid surface.
+  const projectToHull = (
+    body: LayerBody,
+    dir: THREE.Vector3,
+  ): THREE.Vector3 => {
+    let lo = body.R * 0.05,
+      hi = body.R * 2;
+    const probe = new THREE.Vector3();
+    const at = (t: number) => {
+      probe.copy(dir).multiplyScalar(t);
+      frameToWorld(body.frame, probe);
+      return hullSolidSdf(body, probe.x, probe.y, probe.z);
+    };
+    for (let it = 0; it < 24; it++) {
+      const mid = (lo + hi) / 2;
+      if (at(mid) > 0) hi = mid;
+      else lo = mid;
+    }
+    probe.copy(dir).multiplyScalar((lo + hi) / 2);
+    return frameToWorld(body.frame, probe);
+  };
+
   for (const biome of world.biomes) {
     const pl = biome.placement;
     if (pl.mode === "center") {
@@ -1106,22 +1468,606 @@ function placeChunks(rng: Rng, world: WorldRecipe, diff: number): ChunkSpec[] {
       });
     } else if (pl.mode === "shell") {
       shell(biome, pl);
-    } else {
+    } else if (pl.mode === "band") {
       for (let i = 0; i < pl.count; i++) tryBand(biome, pl);
+    } else if (pl.mode === "fused") {
+      const body: LayerBody = {
+        kind: "band",
+        frame,
+        nOff: rng() * 100,
+        rMin: pl.rMin,
+        rMax: pl.rMax,
+        warpAmp: pl.warpAmp,
+        warpFreq: pl.warpFreq,
+        surface: "sphere",
+        R: 0,
+        halfH: 0,
+        rim: 0,
+        thickness: 0,
+        ridgeAmp: 0,
+        ridgeFreq: 0,
+        softSpots: [],
+      };
+      tileLayer(biome, body);
+    } else {
+      const squash = frame?.squash ?? 1;
+      const body: LayerBody = {
+        kind: "hull",
+        frame,
+        nOff: rng() * 100,
+        rMin: 0,
+        rMax: pl.radius,
+        warpAmp: 0,
+        warpFreq: 0,
+        surface: pl.surface,
+        R: pl.radius,
+        halfH:
+          pl.surface === "sphere"
+            ? pl.radius
+            : Math.max(pl.radius * squash, pl.rim + pl.thickness + 6),
+        rim: pl.rim,
+        thickness: pl.thickness,
+        ridgeAmp: pl.ridgeAmp,
+        ridgeFreq: pl.ridgeFreq,
+        softSpots: [],
+      };
+      // Soft spot #1 rides the spine; the rest are seeded on the surface.
+      for (let i = 0; i < pl.softSpots; i++) {
+        let near: SpinePoint | null = null;
+        if (i === 0)
+          for (const p of spine)
+            if (
+              !near ||
+              Math.abs(p.r - pl.radius) < Math.abs(near.r - pl.radius)
+            )
+              near = p;
+        if (near && Math.abs(near.r - pl.radius) < 20) {
+          frameDirOf(frame, near.x, near.y, near.z, _dir);
+        } else {
+          randDir(rng, _dir);
+        }
+        const w = projectToHull(body, _dir);
+        const spot = { x: w.x, y: w.y, z: w.z, r: pl.softSpotR };
+        body.softSpots.push(spot);
+        softSpots.push(spot);
+      }
+      tileLayer(biome, body);
     }
   }
 
-  return specs;
+  return { specs, spine, softSpots };
 }
 
 // Layout-only pass for the worldgen bench's map view: the chunk placement a
-// build would use, with no meshing and no module state touched.
+// build would use (plus spine + soft spots), no meshing, no module state.
 export function planWorldLayout(
   seed: number,
   difficulty: number,
   world: WorldRecipe,
-): ChunkSpec[] {
+): WorldPlan {
+  const errors = validateWorld(world);
+  if (errors.length) throw new Error(`worldgen: ${errors.join("; ")}`);
   return placeChunks(mulberry32(seed >>> 0), world, difficulty);
+}
+
+// --- Layer carve networks ---------------------------------------------------------------------
+
+export interface LayerGenOpts {
+  loopFrac: number;
+  sideExits: number;
+  spineIn: SpinePoint | null;
+  spineOut: SpinePoint | null;
+}
+
+// World-space bent tunnel polyline (addTunnel's world-unit twin).
+function addWorldTunnel(
+  rng: Rng,
+  a: Vec3,
+  b: Vec3,
+  r: number,
+  bends: number,
+  sink: Tunnel[],
+): void {
+  if (!bends) {
+    sink.push({ ax: a.x, ay: a.y, az: a.z, bx: b.x, by: b.y, bz: b.z, r });
+    return;
+  }
+  const len = Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z);
+  const pts: Vec3[] = [a];
+  for (let i = 1; i <= bends; i++) {
+    const t = i / (bends + 1);
+    randDir(rng, _dir2);
+    const bend = len * (0.12 + rng() * 0.16);
+    pts.push({
+      x: a.x + (b.x - a.x) * t + _dir2.x * bend,
+      y: a.y + (b.y - a.y) * t + _dir2.y * bend,
+      z: a.z + (b.z - a.z) * t + _dir2.z * bend,
+    });
+  }
+  pts.push(b);
+  for (let i = 0; i < pts.length - 1; i++)
+    sink.push({
+      ax: pts[i].x,
+      ay: pts[i].y,
+      az: pts[i].z,
+      bx: pts[i + 1].x,
+      by: pts[i + 1].y,
+      bz: pts[i + 1].z,
+      r,
+    });
+}
+
+// One layer-body biome → tile chunks. Carves are generated in WORLD units:
+// per-tile eye clusters + trees, an inter-tile spanning tree + loops, side
+// exits, and the spine doors, then distributed into every tile they touch.
+// Exported for the worldgen bench's fused/hull wedge preview.
+export function buildLayerChunks(
+  rng: Rng,
+  specs: ChunkSpec[],
+  ctx: GenCtx,
+  opts: LayerGenOpts,
+): Chunk[] {
+  const body = specs[0].body!;
+  const frame = body.frame;
+  const holesW: SphereCarve[] = [];
+  const tunnelsW: Tunnel[] = [];
+  const tileEyes: SphereCarve[][] = [];
+  const tunnelScale = [1.15, 1.0, 0.85][ctx.difficulty - 1] ?? 1.0;
+  const minR = (spec: ChunkSpec) =>
+    (spec.part.narrow ? 2.2 : 2.6) * ((2 * spec.s) / spec.res);
+  const treeR = (spec: ChunkSpec, base: number) =>
+    Math.max(minR(spec), base * tunnelScale * spec.s);
+
+  const _p = { x: 0, y: 0, z: 0 };
+
+  for (const spec of specs) {
+    const part = spec.part;
+    const s = spec.s;
+    const inner = s * (1 - 6 / spec.res);
+    const eyes: SphereCarve[] = [];
+    const sampleAt = (): void => {
+      _p.x = spec.center.x + (rng() * 2 - 1) * inner;
+      _p.y = spec.center.y + (rng() * 2 - 1) * inner;
+      _p.z = spec.center.z + (rng() * 2 - 1) * inner;
+    };
+
+    const nEyes =
+      part.eyes.min + Math.floor(rng() * (part.eyes.max - part.eyes.min + 1));
+    for (let i = 0; i < nEyes; i++) {
+      const r = (part.eyes.rBase + part.eyes.rVar * rng()) * s;
+      if (r <= 0) continue;
+      for (let attempt = 0; attempt < 10; attempt++) {
+        sampleAt();
+        if (bodySdfWorld(body, _p.x, _p.y, _p.z) < -r * 0.5) {
+          const eye = { x: _p.x, y: _p.y, z: _p.z, r };
+          eyes.push(eye);
+          holesW.push(eye);
+          break;
+        }
+      }
+    }
+    if (part.chambers && rng() < part.chambers.chance) {
+      const r = (part.chambers.rBase + part.chambers.rVar * rng()) * s;
+      for (let attempt = 0; attempt < 10; attempt++) {
+        sampleAt();
+        if (bodySdfWorld(body, _p.x, _p.y, _p.z) < -r * 0.35) {
+          const room = { x: _p.x, y: _p.y, z: _p.z, r };
+          eyes.push(room);
+          holesW.push(room);
+          break;
+        }
+      }
+    }
+    const nPores =
+      part.pores.min +
+      Math.floor(rng() * (part.pores.max - part.pores.min + 1));
+    for (let i = 0; i < nPores; i++) {
+      const r = Math.max(
+        1.6 * ((2 * s) / spec.res),
+        (part.pores.rBase + part.pores.rVar * rng()) * s,
+      );
+      for (let attempt = 0; attempt < 8; attempt++) {
+        sampleAt();
+        if (Math.abs(bodySdfWorld(body, _p.x, _p.y, _p.z)) < r * 0.9) {
+          holesW.push({ x: _p.x, y: _p.y, z: _p.z, r });
+          break;
+        }
+      }
+    }
+
+    const bends = part.tunnels.bends;
+    for (let i = 1; i < eyes.length; i++) {
+      let best = 0,
+        second = 0,
+        bestD = Infinity,
+        secondD = Infinity;
+      for (let j = 0; j < i; j++) {
+        const dx = eyes[i].x - eyes[j].x,
+          dy = eyes[i].y - eyes[j].y,
+          dz = eyes[i].z - eyes[j].z;
+        const dd = dx * dx + dy * dy + dz * dz;
+        if (dd < bestD) {
+          secondD = bestD;
+          second = best;
+          bestD = dd;
+          best = j;
+        } else if (dd < secondD) {
+          secondD = dd;
+          second = j;
+        }
+      }
+      const j = part.tangle
+        ? i > 1 && rng() < 0.5
+          ? Math.floor(rng() * i)
+          : best
+        : i > 2 && rng() < 0.3
+          ? second
+          : best;
+      addWorldTunnel(
+        rng,
+        eyes[i],
+        eyes[j],
+        treeR(spec, part.tunnels.rBase + part.tunnels.rVar * rng()),
+        bends,
+        tunnelsW,
+      );
+    }
+    if (eyes.length >= 2) {
+      const loops = 1 + Math.floor(eyes.length / 6);
+      for (let i = 0; i < loops; i++) {
+        const a = eyes[Math.floor(rng() * eyes.length)];
+        const b = eyes[Math.floor(rng() * eyes.length)];
+        if (a === b) continue;
+        addWorldTunnel(
+          rng,
+          a,
+          b,
+          treeR(spec, part.tunnels.rBase * 0.9 + part.tunnels.rVar * rng()),
+          bends,
+          tunnelsW,
+        );
+      }
+    }
+
+    const nDead = part.deadEnds + (ctx.difficulty - 1);
+    for (let k = 0; k < nDead && eyes.length >= 2; k++) {
+      const start = eyes[Math.floor(rng() * eyes.length)];
+      let target = eyes[Math.floor(rng() * eyes.length)];
+      if (target === start)
+        target = eyes[(eyes.indexOf(target) + 1) % eyes.length];
+      randDir(rng, _dir);
+      const chR = (0.06 + 0.05 * rng()) * s;
+      const wall = (0.045 + 0.02 * rng()) * s;
+      const ch = {
+        x: target.x + _dir.x * (target.r + chR + wall),
+        y: target.y + _dir.y * (target.r + chR + wall),
+        z: target.z + _dir.z * (target.r + chR + wall),
+        r: chR,
+      };
+      if (bodySdfWorld(body, ch.x, ch.y, ch.z) > -chR * 0.8) continue;
+      holesW.push(ch);
+      addWorldTunnel(
+        rng,
+        start,
+        ch,
+        treeR(spec, 0.045 + 0.03 * rng()),
+        bends,
+        tunnelsW,
+      );
+      ctx.blastPoints.push({
+        x: target.x + _dir.x * (target.r + wall / 2),
+        y: target.y + _dir.y * (target.r + wall / 2),
+        z: target.z + _dir.z * (target.r + wall / 2),
+      });
+    }
+    tileEyes.push(eyes);
+  }
+
+  // Nearest eye pair between two tiles → one connecting tunnel.
+  const linkTiles = (i: number, j: number): void => {
+    let ea: SphereCarve | null = null,
+      eb: SphereCarve | null = null,
+      bd = Infinity;
+    for (const a of tileEyes[i])
+      for (const b of tileEyes[j]) {
+        const dx = a.x - b.x,
+          dy = a.y - b.y,
+          dz = a.z - b.z;
+        const dd = dx * dx + dy * dy + dz * dz;
+        if (dd < bd) {
+          bd = dd;
+          ea = a;
+          eb = b;
+        }
+      }
+    if (!ea || !eb) return;
+    const part = specs[i].part;
+    addWorldTunnel(
+      rng,
+      ea,
+      eb,
+      treeR(specs[i], part.tunnels.rBase + part.tunnels.rVar * rng()),
+      Math.min(part.tunnels.bends, 2),
+      tunnelsW,
+    );
+  };
+
+  // Inter-tile spanning tree keeps the whole layer one connected network.
+  for (let i = 1; i < specs.length; i++) {
+    if (!tileEyes[i].length) continue;
+    let best = -1,
+      bestD = Infinity;
+    for (let j = 0; j < i; j++) {
+      if (!tileEyes[j].length) continue;
+      const dd = specs[i].center.distanceToSquared(specs[j].center);
+      if (dd < bestD) {
+        bestD = dd;
+        best = j;
+      }
+    }
+    if (best >= 0) linkTiles(i, best);
+  }
+
+  if (opts.loopFrac > 0 && specs.length > 1) {
+    const spacing = (2 * specs[0].s * (specs[0].res - 3)) / specs[0].res;
+    for (let i = 0; i < specs.length; i++)
+      for (let j = i + 1; j < specs.length; j++) {
+        if (!tileEyes[i].length || !tileEyes[j].length) continue;
+        if (specs[i].center.distanceTo(specs[j].center) > spacing * 1.2)
+          continue;
+        if (rng() < opts.loopFrac) linkTiles(i, j);
+      }
+  }
+
+  // Nearest eye to a world point, across every tile.
+  const nearestEye = (
+    x: number,
+    y: number,
+    z: number,
+  ): { eye: SphereCarve; tile: number } | null => {
+    let eye: SphereCarve | null = null,
+      tile = -1,
+      bd = Infinity;
+    for (let i = 0; i < specs.length; i++)
+      for (const e of tileEyes[i]) {
+        const dx = e.x - x,
+          dy = e.y - y,
+          dz = e.z - z;
+        const dd = dx * dx + dy * dy + dz * dz;
+        if (dd < bd) {
+          bd = dd;
+          eye = e;
+          tile = i;
+        }
+      }
+    return eye ? { eye, tile } : null;
+  };
+
+  // Side exits: bores from the network out to the outer medium.
+  for (let k = 0; k < opts.sideExits; k++) {
+    randDir(rng, _dir);
+    const mouth = frameToWorld(
+      frame,
+      _dir.clone().multiplyScalar(body.rMax + 6),
+    );
+    const found = nearestEye(mouth.x, mouth.y, mouth.z);
+    if (!found) break;
+    const part = specs[found.tile].part;
+    addWorldTunnel(
+      rng,
+      { x: mouth.x, y: mouth.y, z: mouth.z },
+      found.eye,
+      treeR(specs[found.tile], part.tunnels.rBase + part.tunnels.rVar * 0.5),
+      1,
+      tunnelsW,
+    );
+  }
+
+  // Spine doors: thread the layer between its two boundary through-points.
+  const spineLink = (p: SpinePoint | null, outward: boolean): void => {
+    if (!p) return;
+    frameDirOf(frame, p.x, p.y, p.z, _dir);
+    const rTarget = outward ? p.r + 6 : Math.max(p.r - 6, 2);
+    const mouth = frameToWorld(frame, _dir.clone().multiplyScalar(rTarget));
+    const found = nearestEye(p.x, p.y, p.z);
+    if (!found) return;
+    const part = specs[found.tile].part;
+    addWorldTunnel(
+      rng,
+      { x: mouth.x, y: mouth.y, z: mouth.z },
+      found.eye,
+      treeR(specs[found.tile], part.tunnels.rBase + part.tunnels.rVar * 0.5),
+      1,
+      tunnelsW,
+    );
+  };
+  spineLink(opts.spineIn, true);
+  spineLink(opts.spineOut, false);
+
+  // Distribute the world carves into every tile whose marched box they touch.
+  const out: Chunk[] = [];
+  for (let t = 0; t < specs.length; t++) {
+    const spec = specs[t];
+    const s = spec.s;
+    const cellW = (2 * s) / spec.res;
+    const pad = SMOOTH_K * s + 2 * cellW;
+    const lox = spec.center.x - (s - cellW),
+      hix = spec.center.x + (s - 2 * cellW),
+      loy = spec.center.y - (s - cellW),
+      hiy = spec.center.y + (s - 2 * cellW),
+      loz = spec.center.z - (s - cellW),
+      hiz = spec.center.z + (s - 2 * cellW);
+
+    const holes: SphereCarve[] = [];
+    for (const h of holesW) {
+      const p2 = h.r + pad;
+      if (
+        h.x + p2 < lox ||
+        h.x - p2 > hix ||
+        h.y + p2 < loy ||
+        h.y - p2 > hiy ||
+        h.z + p2 < loz ||
+        h.z - p2 > hiz
+      )
+        continue;
+      holes.push({
+        x: (h.x - spec.center.x) / s,
+        y: (h.y - spec.center.y) / s,
+        z: (h.z - spec.center.z) / s,
+        r: h.r / s,
+      });
+    }
+    const tunnels: Tunnel[] = [];
+    for (const tn of tunnelsW) {
+      const p2 = tn.r + pad;
+      if (
+        Math.max(tn.ax, tn.bx) + p2 < lox ||
+        Math.min(tn.ax, tn.bx) - p2 > hix ||
+        Math.max(tn.ay, tn.by) + p2 < loy ||
+        Math.min(tn.ay, tn.by) - p2 > hiy ||
+        Math.max(tn.az, tn.bz) + p2 < loz ||
+        Math.min(tn.az, tn.bz) - p2 > hiz
+      )
+        continue;
+      tunnels.push({
+        ax: (tn.ax - spec.center.x) / s,
+        ay: (tn.ay - spec.center.y) / s,
+        az: (tn.az - spec.center.z) / s,
+        bx: (tn.bx - spec.center.x) / s,
+        by: (tn.by - spec.center.y) / s,
+        bz: (tn.bz - spec.center.z) / s,
+        r: tn.r / s,
+      });
+    }
+
+    const part = spec.part;
+    const c: Chunk = {
+      center: spec.center,
+      s,
+      res: spec.res,
+      ix: 1,
+      iy: 1,
+      iz: 1,
+      minAxis: 1,
+      nOff: body.nOff,
+      amp: part.crust.amp,
+      freq: part.crust.freq,
+      crustDepth: part.crust.depth,
+      planes: [],
+      holes,
+      tunnels,
+      digs: [],
+      field: null,
+      mesh: null,
+      body,
+    };
+    if (part.noCarveWithin != null) c.sealed = true;
+    let biggest: SphereCarve | null = null;
+    for (const e of tileEyes[t]) if (!biggest || e.r > biggest.r) biggest = e;
+    c.biggestEye = biggest
+      ? {
+          x: (biggest.x - spec.center.x) / s,
+          y: (biggest.y - spec.center.y) / s,
+          z: (biggest.z - spec.center.z) / s,
+          r: biggest.r / s,
+        }
+      : null;
+    out.push(c);
+  }
+  return out;
+}
+
+// Carves must compose across interpenetrating meshes: a tunnel that crosses
+// from a layer tile into an ellipsoid chunk (or into the next layer) has to
+// cut both. Sealed tiles (noCarveWithin) never receive foreign carves.
+// Pairs of plain ellipsoid chunks never share — classic-onion compat.
+function shareCarves(list: Chunk[]): void {
+  const addH: SphereCarve[][] = list.map(() => []);
+  const addT: Tunnel[][] = list.map(() => []);
+
+  const collect = (
+    src: Chunk,
+    dst: Chunk,
+    hSink: SphereCarve[],
+    tSink: Tunnel[],
+  ) => {
+    if (dst.sealed) return;
+    const s = dst.s;
+    const cellW = (2 * s) / dst.res;
+    const pad = SMOOTH_K * s + 2 * cellW;
+    const lox = dst.center.x - (s - cellW),
+      hix = dst.center.x + (s - 2 * cellW),
+      loy = dst.center.y - (s - cellW),
+      hiy = dst.center.y + (s - 2 * cellW),
+      loz = dst.center.z - (s - cellW),
+      hiz = dst.center.z + (s - 2 * cellW);
+    for (const h of src.holes) {
+      const wx = src.center.x + h.x * src.s,
+        wy = src.center.y + h.y * src.s,
+        wz = src.center.z + h.z * src.s,
+        wr = h.r * src.s;
+      const p2 = wr + pad;
+      if (
+        wx + p2 < lox ||
+        wx - p2 > hix ||
+        wy + p2 < loy ||
+        wy - p2 > hiy ||
+        wz + p2 < loz ||
+        wz - p2 > hiz
+      )
+        continue;
+      hSink.push({
+        x: (wx - dst.center.x) / s,
+        y: (wy - dst.center.y) / s,
+        z: (wz - dst.center.z) / s,
+        r: wr / s,
+      });
+    }
+    for (const tn of src.tunnels) {
+      const ax = src.center.x + tn.ax * src.s,
+        ay = src.center.y + tn.ay * src.s,
+        az = src.center.z + tn.az * src.s,
+        bx = src.center.x + tn.bx * src.s,
+        by = src.center.y + tn.by * src.s,
+        bz = src.center.z + tn.bz * src.s,
+        wr = tn.r * src.s;
+      const p2 = wr + pad;
+      if (
+        Math.max(ax, bx) + p2 < lox ||
+        Math.min(ax, bx) - p2 > hix ||
+        Math.max(ay, by) + p2 < loy ||
+        Math.min(ay, by) - p2 > hiy ||
+        Math.max(az, bz) + p2 < loz ||
+        Math.min(az, bz) - p2 > hiz
+      )
+        continue;
+      tSink.push({
+        ax: (ax - dst.center.x) / s,
+        ay: (ay - dst.center.y) / s,
+        az: (az - dst.center.z) / s,
+        bx: (bx - dst.center.x) / s,
+        by: (by - dst.center.y) / s,
+        bz: (bz - dst.center.z) / s,
+        r: wr / s,
+      });
+    }
+  };
+
+  for (let a = 0; a < list.length; a++) {
+    const ca = list[a];
+    for (let b = a + 1; b < list.length; b++) {
+      const cb = list[b];
+      if (!ca.body && !cb.body) continue;
+      if (ca.body && ca.body === cb.body) continue;
+      if (ca.center.distanceTo(cb.center) > (ca.s + cb.s) * 1.74) continue;
+      collect(ca, cb, addH[b], addT[b]);
+      collect(cb, ca, addH[a], addT[a]);
+    }
+  }
+  for (let i = 0; i < list.length; i++) {
+    if (addH[i].length) list[i].holes.push(...addH[i]);
+    if (addT[i].length) list[i].tunnels.push(...addT[i]);
+  }
 }
 
 function makeDebrisGeometry(rng: Rng): THREE.IcosahedronGeometry {
@@ -1158,6 +2104,9 @@ export async function buildGoudaWorld(
   // its live-edited WorldRecipe here to preview a layout for real.
   const world = opts.world ?? DEFAULT_WORLD;
 
+  const errors = validateWorld(world);
+  if (errors.length) throw new Error(`worldgen: ${errors.join("; ")}`);
+
   const t0 = performance.now();
   const rng = mulberry32(worldSeed);
   const materials = createZoneMaterials(world);
@@ -1165,28 +2114,73 @@ export async function buildGoudaWorld(
   worldGroup = group;
   extrasGroup = new THREE.Group();
 
-  const specs = placeChunks(rng, world, difficulty);
+  const plan = placeChunks(rng, world, difficulty);
+  const specs = plan.specs;
+  worldFrame = makeFrame(world.frame);
+  worldSpine = plan.spine;
+  worldSoftSpots = plan.softSpots;
   const total = specs.length + 1;
   const ctx: GenCtx = { difficulty, blastPoints };
   let triangles = 0;
 
-  for (let i = 0; i < specs.length; i++) {
+  // Phase 1 — chunk data. Layer-body biomes generate as whole layers (their
+  // tiles are contiguous in spec order); everything else is per-chunk.
+  const pending: Chunk[] = [];
+  for (let i = 0; i < specs.length;) {
     const spec = specs[i];
-    const chunk = makeChunkData(
-      rng,
-      spec.center,
-      spec.s,
-      spec.res,
-      spec.part,
-      ctx,
-      spec.axis ?? null,
-    );
-    chunk.zone = spec.zone;
+    if (spec.body) {
+      let j = i;
+      while (j < specs.length && specs[j].body === spec.body) j++;
+      const biome = world.biomes.find((b) => b.id === spec.zone)!;
+      const pl = biome.placement;
+      const near = (r: number): SpinePoint | null => {
+        let best: SpinePoint | null = null;
+        for (const p of plan.spine)
+          if (!best || Math.abs(p.r - r) < Math.abs(best.r - r)) best = p;
+        return best && Math.abs(best.r - r) < 15 ? best : null;
+      };
+      const opts: LayerGenOpts =
+        pl.mode === "fused"
+          ? {
+              loopFrac: pl.loopFrac,
+              sideExits: pl.sideExits,
+              spineIn: near(pl.rMax),
+              spineOut: near(pl.rMin),
+            }
+          : { loopFrac: 0, sideExits: 0, spineIn: null, spineOut: null };
+      for (const c of buildLayerChunks(rng, specs.slice(i, j), ctx, opts)) {
+        c.zone = spec.zone;
+        pending.push(c);
+      }
+      i = j;
+    } else {
+      const chunk = makeChunkData(
+        rng,
+        spec.center,
+        spec.s,
+        spec.res,
+        spec.part,
+        ctx,
+        spec.axis ?? null,
+      );
+      chunk.zone = spec.zone;
+      pending.push(chunk);
+      i++;
+    }
+  }
+
+  // Phase 2 — compose carves across interpenetrating meshes.
+  shareCarves(pending);
+
+  // Phase 3 — mesh.
+  for (let i = 0; i < pending.length; i++) {
+    const chunk = pending[i];
     chunks.push(chunk);
-    const mesh = meshChunk(chunk, spec.res, materials[spec.zone]!);
+    const mesh = meshChunk(chunk, chunk.res, materials[chunk.zone!]!);
+    mesh.userData.reach = chunk.body ? chunk.s * 1.75 : chunk.s * 1.4;
     triangles += mesh.geometry.attributes.position.count / 3;
     group.add(mesh);
-    onProgress(i + 1, total, spec.label);
+    onProgress(i + 1, total, specs[i].label);
     await nextTick();
   }
   // NOTE: the MC scratch instances are deliberately KEPT — digging reuses
@@ -1197,7 +2191,8 @@ export async function buildGoudaWorld(
     makeDebrisGeometry(rng),
     makeDebrisGeometry(rng),
   ];
-  const crumbMaterial = materials.scree ?? materials[world.biomes[0].id]!;
+  const crumbMaterial =
+    materials.scree ?? materials.drift ?? materials[world.biomes[0].id]!;
   for (let i = 0; i < world.debrisCount; i++) {
     for (let attempt = 0; attempt < 60; attempt++) {
       const host = chunks[Math.floor(rng() * chunks.length)];
@@ -1230,7 +2225,7 @@ export async function buildGoudaWorld(
 
   // Hide gold in random mid-radius wheel cavern (seeded, off-compass).
   const candidates = chunks.filter((c) => {
-    const r = c.center.length();
+    const r = frameRadius(worldFrame, c.center.x, c.center.y, c.center.z);
     return (
       c.biggestEye &&
       r >= world.goldBand.min &&
@@ -1290,6 +2285,9 @@ export function disposeWorld(scene: THREE.Scene): void {
   debris.length = 0;
   blastPoints.length = 0;
   spawnPoint = null;
+  worldFrame = null;
+  worldSpine = [];
+  worldSoftSpots = [];
 }
 
 // Seeded gold position; read once at world build.
@@ -1305,7 +2303,35 @@ export function getBlastPoints(): Vec3[] {
   return blastPoints;
 }
 
+// Seeded descent route + hull soft spots of the built world (empty for
+// worlds without a spine/hull).
+export function getSpinePoints(): SpinePoint[] {
+  return worldSpine;
+}
+
+export function getSoftSpots(): SoftSpot[] {
+  return worldSoftSpots;
+}
+
 // --- Runtime queries -----------------------------------------------------------------------
+
+// World distance to ONE chunk's solid (world units) — exported for the
+// worldgen bench, whose part/biome previews keep their own chunk lists.
+export function chunkDistance(
+  c: Chunk,
+  x: number,
+  y: number,
+  z: number,
+): number {
+  return (
+    chunkSdf(
+      c,
+      (x - c.center.x) / c.s,
+      (y - c.center.y) / c.s,
+      (z - c.center.z) / c.s,
+    ) * c.s
+  );
+}
 
 export function worldDistance(x: number, y: number, z: number): number {
   let best = 1e9;
@@ -1315,6 +2341,14 @@ export function worldDistance(x: number, y: number, z: number): number {
       dy = y - c.center.y,
       dz = z - c.center.z;
     const dc = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (c.body) {
+      // Tile of a layer body: the tile's box owns its region; the box
+      // distance is a valid lower bound outside it.
+      if (dc - c.s * 1.74 > best) continue;
+      const d = chunkSdf(c, dx / c.s, dy / c.s, dz / c.s) * c.s;
+      if (d < best) best = d;
+      continue;
+    }
     if (dc - c.s > best) continue;
     if (dc > c.s * 1.4) {
       if (dc - c.s * (R0 + 0.25) < best) best = dc - c.s * (R0 + 0.25);

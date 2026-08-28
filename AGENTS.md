@@ -108,31 +108,80 @@ tools/               node-run (node 24 strips types natively)
 World generation is split in two on purpose:
 
 - **`world/recipes.ts` holds every number** — `PartRecipe` (one kind of
-  cheese chunk), `BiomeRecipe` (placement, sizes, weighted part mix, wax
-  material), `WorldRecipe` (the ordered onion + world radii). Pure data, no
-  three.js, checked by `tools/test-recipes.ts`.
+  cheese chunk + the gameplay axes hardness/porosity/odour + mood/desc
+  authoring text), `BiomeRecipe` (placement, sizes, weighted part mix, wax
+  material, budgets, modifiers), `WorldRecipe` (the ordered onion + world
+  radii + optional `frame`/`spine`). Pure data, no three.js, checked by
+  `tools/test-recipes.ts`, and `validateWorld()` holds the seed-time rules
+  (hull lace cap, fused sizeVar 0…) — the generator throws on violations.
 - **`world/gouda.ts` holds every implementation** — the SDF shape families,
-  chunk placement modes (center/band/shell), meshing, digging, queries.
-  `buildGoudaWorld()` takes an optional `world: WorldRecipe` override; the
-  game itself always plays `DEFAULT_WORLD`.
+  chunk placement modes, meshing, digging, queries. `buildGoudaWorld()`
+  takes an optional `world: WorldRecipe` override; the game itself always
+  plays `DEFAULT_WORLD`.
+
+**Two shipped worlds** live in `recipes.ts` (`WORLDS`): `DEFAULT_WORLD`
+(the classic onion the game plays) and `WHEEL_WORLD` (the cheese-parts.md
+MVP map — six parts, one seal, five stops). Swapping the game onto the
+wheel map is a one-line change once it's tuned.
+
+**Placement modes come in two families:**
+
+- *Per-chunk bodies* — `center | band | shell`: every chunk is its own
+  closed ellipsoid SDF. `band` supports `densityGrade` (outward/inward).
+- *Layer bodies* — `fused | hull`: ONE analytic body per biome (a radial
+  band of solid cheese, or the Great Wheel's rounded-cylinder husk with
+  soft-spot bulges), meshed by lattice-aligned cube tiles. Tile spacing is
+  `2s(res-3)/res` — exactly the marched extent of three's MarchingCubes —
+  so adjacent tiles sample identical world points and abut seam-free. Tile
+  scale/res come from `sizeBase`/`res` (`sizeVar` must be 0). Carves are
+  generated in WORLD space per layer (per-tile eye clusters, an inter-tile
+  spanning tree + loops, side exits, the spine doors) and distributed into
+  every tile they touch; `shareCarves()` then composes carves across
+  interpenetrating meshes (a heart exit cuts the galleries tiles it passes
+  through) — except into `sealed` tiles (`noCarveWithin`).
+
+**The frame and the spine** (`WorldRecipe.frame`/`spine`): layer radii are
+measured in an optionally squashed + tilted frame, which is how the whole
+onion lies flat inside a squat wheel; the spine is the seeded descent route
+— one through-point per layer boundary, stepping 40–80° and drifting down —
+and the hull's first soft spot rides it. `getSpinePoints()`/
+`getSoftSpots()` expose them after a build.
 
 **Tune numbers in the worldgen bench, not by hand-editing tables blind.**
-`/worldgen.html` (`npm run dev`) edits a live copy of the tables — a part
-view with every recipe field on a slider (plus clip plane, biome skins), a
-biome wedge view for density/material, and a map view (proxy layout or the
-real full build). Edits autosave to localStorage; the **copy buttons dump
-JSON to paste into `recipes.ts`**, which is the only way a tuning ships.
-Deep links: `worldgen.html?part=<id>`, `?biome=<id>`, `?map=1`, `&seed=`.
+`/worldgen.html` (`npm run dev`) edits live copies of BOTH worlds (table
+picker at the top). The panel is categorized (no giant scroll): a generate
+block, a subject picker with the part/biome's mood line, then per-category
+tabs (shape/carve/tunnels/look/info, place/mix/wax/game/info,
+world/layers/build). Three views: part (one part, every field a slider,
+live r×res + rat/cargo clearance verdicts in the HUD), biome (a wedge at
+true density; fused/hull biomes render real lattice tiles WITH their
+inter-tile carve network), map (proxies incl. hull silhouette, spine and
+soft spots — or the real build). **Walk mode (F)** pointer-locks into a
+player-speed swim (10 u/s, collision at the player's 0.6 u radius) so you
+can navigate anything you generate exactly like the game; the clip plane
+cuts along X/Y/Z through everything. Edits autosave to localStorage; the
+**copy buttons dump JSON to paste into `recipes.ts`**, which is the only
+way a tuning ships. Deep links: `?world=<key>`, `?part=<id>`,
+`?biome=<id>`, `?map=1`, `&build=1` (real build), `&seed=`.
 
 Adding a new cheese part type or biome = a new table entry in `recipes.ts`
 (author it in the bench, copy it out), NOT new generator code. New *shape
-grammar* (a new `PartKind`, a new placement mode) is a `gouda.ts` change.
+grammar* (a new `PartKind`, a new placement mode, a new hull surface) is a
+`gouda.ts` change.
 
 ⚠ The seeded rng stream is a pure function of the tables: biomes with
 `sizeVar: 0` and single-entry part lists consume no rng, which is what keeps
-the default tables reproducing the pre-recipe worlds byte-for-byte. Editing
-a table changes every seed's world — that's expected; just don't reorder the
-`biomes` array casually, since generation order is part of the contract.
+the default tables reproducing the pre-recipe worlds byte-for-byte (verified
+old-vs-new by fingerprinting chunk layouts, vertex counts, gold and spawn
+across 4 seeds × 3 difficulties). Editing a table changes every seed's world
+— that's expected; just don't reorder the `biomes` array casually, since
+generation order is part of the contract.
+
+⚠ Wheel-world build cost: the fused layers are honest solid volumes — ~900
+chunks, ~7.5M tris, ~80 s at full res in node. That is an authoring-time
+reality, not a shipping target: iterate at half res (the bench default),
+and expect an M2.7 perf pass (worker meshing, per-distance res) before the
+wheel map becomes the game's default.
 
 ## Model bench — standing rule
 

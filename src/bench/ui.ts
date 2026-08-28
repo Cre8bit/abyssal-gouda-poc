@@ -112,3 +112,61 @@ export function markOn(
   for (const [k, b] of Object.entries(btns))
     b.classList.toggle("on", k === active);
 }
+
+// Dropdown bound to a string value (for pickers that would drown in buttons).
+export function selectRow(
+  parent: HTMLElement,
+  name: string,
+  options: { value: string; label: string }[],
+  value: string,
+  onChange: (v: string) => void,
+): {
+  set(v: string): void;
+  refresh(opts: { value: string; label: string }[]): void;
+} {
+  const row = document.createElement("div");
+  row.className = "slider-row";
+  row.innerHTML = `<span class="name">${name}</span><select class="sel"></select>`;
+  const sel = row.querySelector("select")!;
+  const fill = (opts: { value: string; label: string }[]) => {
+    sel.innerHTML = "";
+    for (const o of opts) {
+      const el = document.createElement("option");
+      el.value = o.value;
+      el.textContent = o.label;
+      sel.appendChild(el);
+    }
+  };
+  fill(options);
+  sel.value = value;
+  sel.addEventListener("change", () => onChange(sel.value));
+  parent.appendChild(row);
+  return {
+    set: (v) => (sel.value = v),
+    refresh: (opts) => {
+      const old = sel.value;
+      fill(opts);
+      sel.value = opts.some((o) => o.value === old)
+        ? old
+        : (opts[0]?.value ?? "");
+    },
+  };
+}
+
+// Multi-line text bound to a string (mood/description authoring).
+export function textRow(
+  parent: HTMLElement,
+  name: string,
+  value: string,
+  onChange: (v: string) => void,
+  rows = 3,
+): { set(v: string): void } {
+  const box = document.createElement("div");
+  box.className = "text-row";
+  box.innerHTML = `<div class="name">${name}</div><textarea rows="${rows}"></textarea>`;
+  const area = box.querySelector("textarea")!;
+  area.value = value;
+  area.addEventListener("input", () => onChange(area.value));
+  parent.appendChild(box);
+  return { set: (v) => (area.value = v) };
+}

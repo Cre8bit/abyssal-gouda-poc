@@ -34,14 +34,21 @@
         position: fixed;
         top: 12px;
         left: 12px;
-        width: 288px;
+        width: 302px;
         max-height: calc(100vh - 24px);
-        overflow-y: auto;
-        background: rgba(3, 16, 24, 0.82);
+        display: flex;
+        flex-direction: column;
+        background: rgba(3, 16, 24, 0.84);
         border: 1px solid #1d4457;
         border-radius: 8px;
-        padding: 12px;
         backdrop-filter: blur(6px);
+      }
+      #panel-head {
+        padding: 12px 12px 0 12px;
+      }
+      #panel-body {
+        padding: 0 12px 12px 12px;
+        overflow-y: auto;
       }
       #panel h1 {
         font-size: 13px;
@@ -107,6 +114,39 @@
         border-color: #4fb3e0;
         color: #e8f8ff;
       }
+      button.walk-btn.on {
+        background: #14532d;
+        border-color: #4ade80;
+      }
+
+      /* category chips */
+      .cats {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 3px;
+        margin-top: 12px;
+        padding-bottom: 6px;
+        border-bottom: 1px solid #123243;
+      }
+      .cats button {
+        padding: 3px 8px;
+        font-size: 11px;
+        border-radius: 10px;
+      }
+      .cats button.on {
+        background: #155a78;
+        border-color: #4fb3e0;
+      }
+
+      .mood {
+        margin-top: 8px;
+        padding: 6px 8px;
+        border-left: 2px solid #2a7da5;
+        color: #8fc6da;
+        font-style: italic;
+        line-height: 1.4;
+      }
+
       .slider-row {
         display: flex;
         align-items: center;
@@ -149,17 +189,48 @@
         border-radius: 4px;
         padding: 1px 2px;
       }
+      .slider-row select {
+        flex: 1;
+        min-width: 0;
+        font: inherit;
+        color: #d6f1ff;
+        background: #0a2635;
+        border: 1px solid #1d4457;
+        border-radius: 4px;
+        padding: 3px 4px;
+      }
+      .text-row {
+        margin-top: 6px;
+      }
+      .text-row .name {
+        font-size: 10px;
+        letter-spacing: 1px;
+        color: #4f7f95;
+        text-transform: uppercase;
+        margin-bottom: 3px;
+      }
+      .text-row textarea {
+        width: 100%;
+        resize: vertical;
+        font: inherit;
+        font-size: 11px;
+        line-height: 1.4;
+        color: #bfe0ee;
+        background: #0a2635;
+        border: 1px solid #1d4457;
+        border-radius: 4px;
+        padding: 4px 6px;
+      }
       .hint {
         margin-top: 10px;
         color: #3e6a7e;
         line-height: 1.5;
       }
-
       #hud {
         position: fixed;
         right: 12px;
         bottom: 12px;
-        width: 236px;
+        width: 250px;
         background: rgba(3, 16, 24, 0.82);
         border: 1px solid #1d4457;
         border-radius: 8px;
@@ -177,12 +248,48 @@
         display: flex;
         justify-content: space-between;
         margin-top: 2px;
+        gap: 8px;
       }
       .hud-line .k {
         color: #6fa3b8;
+        white-space: nowrap;
       }
       .hud-line .v {
         color: #d6f1ff;
+        text-align: right;
+      }
+      .hud-line .v.ok {
+        color: #6ee7a0;
+      }
+      .hud-line .v.bad {
+        color: #f87171;
+      }
+
+      #walk-hud {
+        position: fixed;
+        left: 50%;
+        bottom: 18px;
+        transform: translateX(-50%);
+        display: none;
+        background: rgba(3, 16, 24, 0.8);
+        border: 1px solid #2a5a72;
+        border-radius: 6px;
+        padding: 6px 14px;
+        color: #9fd8ef;
+        letter-spacing: 1px;
+        pointer-events: none;
+      }
+      #crosshair {
+        position: fixed;
+        left: 50%;
+        top: 50%;
+        width: 4px;
+        height: 4px;
+        margin: -2px;
+        border-radius: 50%;
+        background: #9fd8ef;
+        display: none;
+        pointer-events: none;
       }
 
       #loading {
@@ -202,29 +309,33 @@
     <div id="stage"></div>
 
     <div id="panel">
-      <div class="nav">
-        <a href="./preview.html">models</a>
-        <a class="on" href="./worldgen.html">world gen</a>
-      </div>
-      <h1>ABYSSAL · WORLD GEN</h1>
-      <div class="section">
-        <div class="label">Mode</div>
+      <div id="panel-head">
+        <div class="nav">
+          <a href="./preview.html">models</a>
+          <a class="on" href="./worldgen.html">world gen</a>
+        </div>
+        <h1>ABYSSAL · WORLD GEN</h1>
         <div class="row" id="modes"></div>
+        <div id="generate"></div>
+        <div id="subject"></div>
+        <div class="cats" id="cats"></div>
       </div>
-      <div id="tool-ui"></div>
-      <div class="section">
-        <div class="label">View</div>
-        <div class="row" id="view-toggles"></div>
-        <div id="view-sliders"></div>
-      </div>
-      <div class="section">
-        <div class="label">Config</div>
-        <div class="row" id="config-actions"></div>
-      </div>
-      <div class="hint" id="page-hint">
-        drag to orbit · wheel to zoom (into tunnels)<br />
-        space = reroll seed · R = reset cam<br />
-        edits autosave locally — "copy" dumps a recipes.ts entry
+      <div id="panel-body">
+        <div id="cat-body"></div>
+        <div class="section">
+          <div class="label">View</div>
+          <div class="row" id="view-toggles"></div>
+          <div id="view-sliders"></div>
+        </div>
+        <div class="section">
+          <div class="label">Config</div>
+          <div class="row" id="config-actions"></div>
+        </div>
+        <div class="hint" id="page-hint">
+          drag orbit · wheel zoom · space reroll seed<br />
+          F or ▶ walk = swim it like the player (esc exits)<br />
+          edits autosave — "copy" dumps a recipes.ts entry
+        </div>
       </div>
     </div>
 
@@ -232,6 +343,11 @@
       <div class="title" id="hud-title">—</div>
       <div id="hud-body"></div>
     </div>
+
+    <div id="walk-hud">
+      WASD swim · mouse look · space ↑ · C ↓ · shift boost · esc exit
+    </div>
+    <div id="crosshair"></div>
 
     <div id="loading">carving…</div>
 
