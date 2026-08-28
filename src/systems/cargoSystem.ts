@@ -1,26 +1,7 @@
-// systems/cargoSystem.ts — the haul (docs/plan-mvp.md M1).
-//
-// The Golden Gouda is an ITEM (game/items.ts kind "gouda"), seeded at
-// getGoldPos() so it costs zero network to place, and from then on it is the
-// one object in the world whose ownership is contested. Everything about who
-// has it lives here; what that costs you to carry lives in game/cargo.ts;
-// what it looks like lives in entities/goldenGouda.ts.
-//
-// AUTHORITY (M1.2's AC — two clients agree on the holder 100% of the time,
-// including simultaneous grabs). Every change of hands is a REQUEST to the
-// host, answered by an authoritative one-row "item*" that everyone applies:
-//
-//   joiner ──"pick"/"give"/"drop"──▶ host ──"item*"──▶ everyone
-//   solo play: no mesh, so we are trivially our own host.
-//
-// The loser of a simultaneous grab is corrected by the same message that
-// tells the winner they got it, so there is no window where the two clients
-// disagree. Requests are sent to the host ALONE (sendEventTo), so a peer
-// never acts on another peer's request.
-//
-// NOTE: no host migration for cargo yet. If the host drops mid-run the wheel
-// keeps its current holder and nobody can hand it over until they reconnect —
-// that's D15/M7.4 territory, deliberately out of M1.
+// systems/cargoSystem.ts — Golden Gouda ownership arbitration and handoff.
+// Carrier-side logic: pickup, drop, hand-over requests sent to host for
+// authority. Local reaction to sync messages: torch, status, falling state.
+// Loose wheel physics: catch window, sink, synchronization.
 import {
   registerItemKind,
   spawnItem,
@@ -57,13 +38,7 @@ import type { GameSystem } from "./types.ts";
 // One wheel per world, and every client seeds it under the same name — the
 // id never has to be minted, agreed on, or replicated.
 const GOUDA_ID = "gouda";
-// How often the authority re-broadcasts a FALLING wheel. Every client
-// simulates the same fall so the tumble is smooth, but each one starts its
-// clock when the drop message reaches it — so without this they drift apart
-// by roughly a latency's worth of fall. At 0.4 s the two views ended up 1.3 u
-// apart, which is a lot when the whole verb is "catch it"; 0.12 s (the same
-// cadence the fish authority uses) keeps them inside a few centimetres, and
-// it only runs while the thing is actually in the air.
+// Prevents drift in falling wheel state; syncs every 0.12 s while falling.
 const LOOSE_SYNC_S = 0.12;
 
 export interface CargoSystemDeps {
@@ -166,9 +141,7 @@ export function createCargoSystem({
     }
   }
 
-  // Is the requester actually next to the wheel? We only know a peer's pose
-  // to within the interpolation delay, so the check is deliberately loose —
-  // it rejects a grab from across the map, not a grab from 3.4 m.
+  // Loose check: allows ~2x range to account for interpolation delay.
   function withinReach(peerId: string, item: ItemInstance): boolean {
     if (isSelf(peerId)) {
       return distance(game.localPosition, item) <= CARGO.PICKUP_RANGE;
@@ -187,11 +160,7 @@ export function createCargoSystem({
     syncItem(GOUDA_ID);
   }
 
-  // Is the wheel in the air? This is REPLICATED, and it has to be: if each
-  // client decided on its own when the tumble ended, they would each stop it
-  // wherever their own copy happened to touch down — and since the authority
-  // stops broadcasting once its copy lands, that gap never closes. (Measured
-  // at 1.4 u between two clients before this was authoritative.)
+  // Replicated state; ensures all clients agree when fall ends.
   function isFalling(item: ItemInstance): boolean {
     return item.data.falling === true;
   }
@@ -202,9 +171,7 @@ export function createCargoSystem({
   }
 
   // --- Local reaction to a change of hands ----------------------------------
-  // Called on every path a holder can change by: our own authoritative
-  // decision, an "item*" from the host, and a carrier disconnecting. It is
-  // the ONLY place STATUS.CARRYING and the torch override are touched.
+  // Handles all holder changes: status, torch, falling state.
   function reconcile(item: ItemInstance): void {
     const holder = holderOf(item);
     if (holder === lastHolder) return;
@@ -267,9 +234,7 @@ export function createCargoSystem({
     return true;
   }
 
-  // Let go, wherever we are. Carrier-side: we ask, the host publishes. The
-  // position travels with the request so the wheel falls from where the
-  // carrier actually was, not from where the host last saw them.
+  // Carrier-side request; position travels with it.
   function release(reason: string, lockout: boolean): void {
     const item = getItem(GOUDA_ID);
     if (!item || !isSelf(holderOf(item))) return;
@@ -284,9 +249,7 @@ export function createCargoSystem({
   }
 
   // --- Loose-wheel physics --------------------------------------------------
-  // Every client runs the same fall from the same released position, so the
-  // tumble is smooth everywhere; the authority re-publishes the wheel a few
-  // times a second while it moves, which erases any drift.
+  // Synced fall from same position; authority re-publishes periodically.
   function fall(item: ItemInstance, dt: number): void {
     if (!isFalling(item)) return; // resting — in its cavern, or where it fell
     const target = -looseSinkRate(performance.now() - looseSince);
@@ -303,10 +266,7 @@ export function createCargoSystem({
     // Landed on something: it stays put until someone picks it up again.
     if ((hit && hit.y > 0.2) || (bell && bell.y > 0.2)) {
       vy = 0;
-      // Only the authority may call it: it declares the tumble over and
-      // publishes where the wheel came to rest, and everyone else adopts
-      // that. A client whose own copy landed early just holds against the
-      // cheese until that word arrives.
+      // Only authority declares landing and publishes.
       if (isAuthority()) {
         item.data.falling = false;
         syncItem(GOUDA_ID);
@@ -314,11 +274,7 @@ export function createCargoSystem({
     }
   }
 
-  // Draw the wheel. Everyone but the carrier sees it exactly where the item
-  // is; the carrier's own camera gets it pushed out to the first-person
-  // framing offset (game/cargo.ts FP_HOLD_*), because at the true offset a
-  // 1.24 u wheel fills a 72° view. Nothing else moves — the item, the
-  // hand-off checks and every other client are on the real position.
+  // Carrier sees first-person offset (1.24 u wheel in 72° view); others see true position.
   function placeVisual(item: ItemInstance, holder: string | null): void {
     const visual = getMountedGouda();
     if (!visual) return;

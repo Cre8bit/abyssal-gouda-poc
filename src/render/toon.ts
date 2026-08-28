@@ -17,11 +17,9 @@
 //     toonMaterial(params, { shader }), where `shader` is the model's custom
 //     injection. The ink rides on top of it, always, at the same stage.
 //
-// So: never `new THREE.MeshToonMaterial` outside this file. A material built
-// by hand silently gets three's built-in 2-band fallback ramp and no rim,
-// which is exactly the drift this module exists to prevent. The ramp and the
-// ink are deliberately NOT exported — toonMaterial() and toonify() are the
-// whole surface, so there is no way to get one without the other.
+// Never instantiate THREE.MeshToonMaterial outside this file — hand-built
+// materials silently use the fallback ramp (no rim). toonMaterial() and
+// toonify() are the only interface to prevent drift.
 //
 // Deliberately NOT toon (they are light sources or volumes, not surfaces):
 // lamp bulbs and halos (MeshBasicMaterial/sprites), the particle and beam
@@ -46,13 +44,8 @@ interface LitMaterial extends THREE.Material {
 const TOON_INK = 0.7; // rim strength: 1 = grazing angles go black
 const TOON_FLOOR = 40; // darkest band, of 255 — see getToonGradient
 
-// 4 hard light bands. NearestFilter is what makes them BANDS.
-//
-// `floor` is the darkest band: at the default 40/255 an "unlit" face still
-// takes 16% of a light, which is the bounce that keeps the cheese world from
-// going pitch black. Anything lit from INSIDE its own body must ask for 0
-// instead — 16% of a lamp 0.6 u away clips to white and blooms over the
-// screen (see entities/goldenGouda.ts).
+// 4 hard light bands (NearestFilter quantizes them). `floor` (default 40/255)
+// keeps unlit faces at 16% brightness; objects lit from inside use floor: 0.
 const gradients = new Map<number, THREE.DataTexture>();
 function getToonGradient(floor: number = TOON_FLOOR): THREE.DataTexture {
   let gradient = gradients.get(floor);
@@ -70,13 +63,8 @@ function getToonGradient(floor: number = TOON_FLOOR): THREE.DataTexture {
   return gradient;
 }
 
-// Splice the ink rim into a compiling toon shader. Call from onBeforeCompile.
-//
-// The seam is `opaque_fragment`, i.e. the very end of the fragment shader:
-// the rim multiplies `outgoingLight`, so it darkens the lighting AND anything
-// the material added after it (emissive, veins, caustics, wet sheen). That is
-// what makes an outline an outline — injected any earlier and a material's own
-// glow terms paint straight back over the rim it just drew.
+// Inject ink rim at opaque_fragment (end of fragment shader) so it darkens
+// all output including emissive. Earlier injection = glow overwrites rim.
 function applyInk(
   shader: THREE.WebGLProgramParametersWithUniforms,
   ink: number = TOON_INK,
@@ -98,15 +86,12 @@ function applyInk(
 export interface ToonOptions {
   ink?: number; // rim strength (default TOON_INK); 0 disables the rim
   floor?: number; // darkest light band, of 255 (default TOON_FLOOR)
-  // Custom GLSL injection, run BEFORE the ink is spliced in. Bake constants
-  // into the source freely — `key` is what keeps three's shader cache from
-  // merging two materials that differ only in baked values.
+  // Custom GLSL injection (runs before ink). Use `key` to prevent cache merges.
   shader?: (shader: THREE.WebGLProgramParametersWithUniforms) => void;
   key?: string; // program cache salt; required whenever `shader` bakes constants
 }
 
-// THE toon material constructor. `gradientMap` is not yours to set — pass
-// `floor` instead, so every ramp in the game comes out of one cache.
+// Toon material constructor. Pass `floor`, not `gradientMap`, for cache reuse.
 export function toonMaterial(
   params: Omit<THREE.MeshToonMaterialParameters, "gradientMap"> = {},
   { ink = TOON_INK, floor = TOON_FLOOR, shader, key = "" }: ToonOptions = {},
@@ -126,14 +111,9 @@ export function toonMaterial(
   return material;
 }
 
-// Convert every lit material under `root` to a toon material that keeps its
-// maps/colors. ShaderMaterials, sprites, and already-toon materials are left
-// alone, so this is idempotent — the bench re-prepares the same GLTF.
-//
-// Call this from the model's own template prep (entities/*.ts, world/*.ts) —
-// never from the code that mounts the model. A model has several mount sites
-// (game, bench, remote clones) and only one prep, so prep is the only place
-// the cel pass cannot be forgotten.
+// Convert all lit materials to toon (preserving maps/colors). Idempotent:
+// ShaderMaterials and already-toon materials are skipped.
+// Call from model template prep (entities/*.ts, world/*.ts), never mount code.
 export function toonify(root: THREE.Object3D, options: ToonOptions = {}): void {
   root.traverse((o) => {
     if (!(o as THREE.Mesh).isMesh && !(o as THREE.SkinnedMesh).isSkinnedMesh)

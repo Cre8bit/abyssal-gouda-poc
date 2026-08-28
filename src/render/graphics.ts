@@ -40,8 +40,7 @@ import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
 import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
 import type { Vec3 } from "../state.ts";
 
-// Shapes inferred from diverRig.ts / gouda.ts (typed in parallel) — derive
-// them so this file tracks those modules' own annotations automatically.
+// Shape types tracking diverRig/gouda modules automatically
 type DiverTemplate = ReturnType<typeof prepareDiverTemplate>;
 type DiverRig = ReturnType<typeof createDiverRig>;
 type WorldProgress = (done: number, total: number, label: string) => void;
@@ -193,26 +192,19 @@ const beamMaterials: THREE.ShaderMaterial[] = []; // all volumetric beam materia
 const _v1 = new THREE.Vector3();
 const _v2 = new THREE.Vector3();
 
-// The GLB is fetched, parsed, and prepped exactly ONCE — the prepared
-// template (rest pose, per-bone axes, head fix) is shared by the local
-// first-person body and every remote diver clone.
 let diverTemplatePromise: Promise<DiverTemplate | null> | null = null;
 function loadDiverTemplate(): Promise<DiverTemplate | null> {
   diverTemplatePromise ??= new GLTFLoader()
     .loadAsync(DIVER_MODEL_URL)
     .then((gltf) => prepareDiverTemplate(gltf)) // cel pass runs inside prep
     .catch((err) => {
-      // Degrade loudly, not silently: remote divers keep their placeholder
-      // capsule, the local FP gloves just never appear.
       console.warn("diver model failed to load — using placeholders", err);
       return null;
     });
   return diverTemplatePromise;
 }
 
-// --- Local first-person body: just your two gloves, visible looking down. ---
-// Pure POV: no body is rendered at all. The gloves ride the (invisible) arm
-// bones and enter the frame only on a steep look down.
+// Local first-person body: FP arms only, gloves visible on look-down
 let localBody: {
   group: THREE.Group;
   pivot: THREE.Group;
@@ -229,13 +221,7 @@ const localState = {
   carrying: false,
 };
 
-// Your own suit, as only you see it. The FP arms carry TWO materials (the
-// suit, and the flat lining of the shoulder cut — see diverRig's
-// capOpenLoops), so this maps over the array rather than assuming one.
-//  - Double-sided: a hard bank can swing a sleeve's cut end past the lens,
-//    and a culled backface there reads as a hole punched through the arm.
-//  - Darkened below the world's albedo so arms and gloves never blow out
-//    inside the torch's beam core, with enough left to keep definition.
+// FP suit: double-sided, darkened to prevent blown-out arms in torch core
 function dressOwnSuit(
   material: THREE.Material | THREE.Material[],
 ): THREE.Material | THREE.Material[] {
@@ -248,9 +234,7 @@ function dressOwnSuit(
   return Array.isArray(material) ? material.map(dress) : dress(material);
 }
 
-// No clip planes anywhere anymore: the FP rig renders only the two gloves
-// (diverRig.js drops every other triangle at prep time), so nothing can
-// ever be sliced open near the camera.
+// No clip planes: FP rig drops non-glove triangles at prep
 function createLocalBody() {
   loadDiverTemplate().then((template) => {
     if (!template) return;
@@ -271,7 +255,6 @@ function createLocalBody() {
   });
 }
 
-// Called by main.js every frame with the freshest simulation state.
 export function updateLocalPlayer(
   pos: Vec3,
   yaw: number,
@@ -294,12 +277,7 @@ export function updateLocalPlayer(
 function updateLocalBody(delta: number): void {
   if (!localBody || !localState.active) return;
 
-  // The arms are SCREEN-ANCHORED, FPS-style: the invisible body yaws and
-  // pitches WITH the camera (not with the swim direction), rigidly, so the
-  // shoulders keep one fixed spot in camera space — which is what keeps the
-  // FP geometry's only cut permanently behind the lens. The "see more of your
-  // arms when you look down" job is done by the pose instead (diverRig's
-  // ARM_POSE_FP_DOWN), which can do it without moving the shoulder.
+  // Arms are camera-anchored (FPS-style), rigidly following yaw/pitch
   const bodyPitch = fpBodyPitch(localState.pitch);
   localBody.group.position.copy(localState.pos);
   localBody.group.rotation.y = localState.yaw;
@@ -352,9 +330,7 @@ export function initGraphics(container: HTMLElement): HTMLCanvasElement {
 
   setupPostProcessing();
 
-  // Natural deep-water base light: cold blue-teal from far above (the memory
-  // of a surface kilometres up), near-black blue below. Red is long dead at
-  // this depth — only the flashlight brings warmth back.
+  // Deep-water base: cold blue-teal from surface memory
   scene.add(new THREE.HemisphereLight(0x12303e, 0x010407, 0.2));
   const gloom = new THREE.DirectionalLight(0x2c5566, 0.07);
   gloom.position.set(2, 40, 1);
@@ -375,9 +351,7 @@ export function initGraphics(container: HTMLElement): HTMLCanvasElement {
   return renderer.domElement;
 }
 
-// Generates the gouda labyrinth asynchronously (chunk by chunk) so the
-// loading screen can track progress. Call after initGraphics, await before
-// spawning the player. opts: { seed, difficulty }.
+// Builds gouda labyrinth chunk-by-chunk; mount bell at spawn
 export function loadWorld(
   onProgress: WorldProgress,
   opts: WorldOptions,
@@ -389,8 +363,6 @@ export function loadWorld(
   });
 }
 
-// Tears down the current world and builds a new one (e.g. adopting the
-// host's seed after joining).
 export function rebuildWorld(
   onProgress: WorldProgress,
   opts: WorldOptions,
@@ -425,10 +397,7 @@ function updateAtmosphere(delta: number): number {
   const fog = scene.fog as THREE.FogExp2; // set in initGraphics
   fog.density += (target - fog.density) * k;
 
-  // Depth-graded water column: the fog (and the void behind it) is a ghost
-  // of teal when you're high in the water, and crushes toward blue-black as
-  // you sink. This vertical hue gradient is what makes the void read as a
-  // MEDIUM instead of empty space.
+  // Depth-graded hue: teal shallow → blue-black deep
   const y = camera.position.y;
   let t = (y + 120) / 300; // -120 → 0 (deep), +180 → 1 (shallow)
   t = Math.max(0, Math.min(1, t));
@@ -522,9 +491,7 @@ function setupPostProcessing() {
 
 // --- Shared helpers: volumetric beam + scatter halo ---------------------
 
-// Fresnel-soft additive cone with distance falloff and drifting wisps.
-// `falloffPow` shapes how quickly it dims with distance: high (~1.6) for a
-// tight bright core, low (~0.6) for a slow-dimming diffuse haze.
+// Fresnel-soft cone; falloffPow shapes brightness falloff
 function createBeam({
   length,
   endRadius,
@@ -634,11 +601,7 @@ function createHalo(
   return sprite;
 }
 
-// A lamp's full volumetric presence: a tight bright core, a wider soft haze
-// scattering out past it (so the beam has visible bulk, not a hard edge),
-// and camera-facing glow puffs spaced along the axis. The puffs shrink and
-// dim with distance, giving a clear read on how far the light throws and
-// how much it has dispersed even when no floor or wall is in view to catch it.
+// Volumetric presence: tight core + soft haze + dispersal halos
 function createVolumetricLight({
   length,
   endRadius,
@@ -670,21 +633,13 @@ function createVolumetricLight({
 }
 
 // --- World -----------------------------------------------------------------
-// The gouda labyrinth itself lives in gouda.js (buildGoudaWorld).
+// The gouda labyrinth itself lives in gouda.ts (buildGoudaWorld).
 
-// The local torch is HELMET-MOUNTED now (the model carries it on the
-// helmet): parked just above the camera and parented to it, so the light is
-// always exactly aligned with where the camera looks.
-//
-// Unlike remote divers there is NO volumetric beam mesh in your own view —
-// from a lamp on your own forehead it just reads as fog on the screen.
-// Instead: a wide soft-edged hot cone, a broad spill that washes the whole
-// view ("halo where I look"), and a short-range fill so your own hands and
-// the wall in front of your face are never pitch black.
+// Helmet-mounted torch: aligned with camera, no mesh in local view (soft cone + spill instead)
 function createFlashlight(): void {
   const group = new THREE.Group();
 
-  // Hot core: wide and soft-edged, shadow-casting. Warm dive-torch tint.
+  // Hot core: shadow-casting, warm torch tint
   const spot = new THREE.SpotLight(
     0xfff1cd,
     FLASHLIGHT_INTENSITY,
@@ -700,16 +655,11 @@ function createFlashlight(): void {
   spot.shadow.camera.near = 0.3;
   spot.shadow.camera.far = 65;
   spot.shadow.bias = -0.0002;
-  // Organic marching-cubes surfaces self-shadow badly with a pure depth
-  // bias (shimmering acne). normalBias pushes samples along the normal —
-  // the standard fix for curved geometry.
-  spot.shadow.normalBias = 0.08;
+  spot.shadow.normalBias = 0.08; // fix self-shadowing on curved geometry
   group.add(spot);
   group.add(spot.target);
 
-  // Broad soft spill — covers most of the field of view, so wherever you
-  // look gets at least a soft wash of light. Cooler than the hot core:
-  // water scatters the torch's edges toward green-blue.
+  // Broad spill: cooler tone (water scatter), covers FOV
   const spill = new THREE.SpotLight(
     0xc4d8c2,
     SPILL_INTENSITY,
@@ -722,25 +672,19 @@ function createFlashlight(): void {
   spill.target = spot.target;
   group.add(spill);
 
-  // Short-range fill: lights your own hands/arms and the wall right in
-  // front of your visor, independent of the cones. Kept very dim so your
-  // own body barely catches the light and the abyss stays scary.
+  // Fill light: lights hands/visor, very dim
   const fill = new THREE.PointLight(0xf0e0b4, 0.4, 5, 1.8);
   fill.position.set(0, -0.05, -0.3);
   group.add(fill);
 
-  // (No lens halo sprite on your own lamp: from a light on your own
-  // forehead it just reads as a glowing circle stuck to the screen.)
-
-  // Helmet position: slightly above the eyes, nudged forward.
+  // Helmet position: slightly above eyes, nudged forward
   group.position.set(0, 0.2, -0.12);
   camera.add(group);
 
   flashlight = { group, spot, spill, fill, on: true };
 }
 
-// Shot harness (shots.js, ?light=N): flat inspection light so first-person
-// geometry reads clearly in screenshots. Never used in a real session.
+// Shot harness: flat inspection light for screenshots
 export function addShotLight(intensity: number = 1.5): void {
   scene.add(new THREE.HemisphereLight(0xbfd8e0, 0x4a4236, intensity));
 }
@@ -762,7 +706,7 @@ export function setFlashlight(on: boolean): boolean {
 
 // --- Particles ---------------------------------------------------------
 
-// Marine snow, LIT by up to two beam cones (local + remote flashlight).
+// Snow: LIT by beam cones; settles slowly (suspension, not starfield)
 function createSnow(): void {
   const positions = new Float32Array(SNOW_COUNT * 3);
   const scales = new Float32Array(SNOW_COUNT);
@@ -996,10 +940,7 @@ function updateBursts(delta: number): void {
   positions.needsUpdate = true;
 }
 
-// --- Plankton: sparse bioluminescent drifters. Most of the time they're
-// nearly invisible; each one blinks awake on its own slow cycle — tiny cyan
-// lives in the dark. Nothing says "you are in water" like the water being
-// inhabited.
+// Plankton: bioluminescent drifters, slow blink cycle
 function createPlankton(): void {
   const positions = new Float32Array(PLANKTON_COUNT * 3);
   const seeds = new Float32Array(PLANKTON_COUNT);
@@ -1058,9 +999,7 @@ function createPlankton(): void {
   scene.add(plankton);
 }
 
-// --- Breath bubbles: your own exhale. A slot ring of bubbles; emitBreath()
-// (driven by the audio engine's breathing cycle, or a fallback timer)
-// releases a small cluster just behind the visor that wobbles surfaceward.
+// Breath: your own exhale cluster, rises behind visor
 function createBreath(): void {
   const positions = new Float32Array(BREATH_COUNT * 3);
   const geometry = new THREE.BufferGeometry();
@@ -1120,8 +1059,7 @@ function updateBreath(delta: number): void {
   positions.needsUpdate = true;
 }
 
-// Slow-changing current direction (Perlin-driven), with occasional gusts.
-// Returns a reused scratch object — called once per frame from renderLoop.
+// Current drift: Perlin-driven with gusts; returns reused object
 const _drift = { x: 0, z: 0 };
 function currentDrift(): { x: number; z: number } {
   const gust =
@@ -1145,14 +1083,12 @@ function wrapAroundCamera(
     let x = positions.getX(i) + drift.x * delta;
     let y = positions.getY(i) + fall * delta * (0.7 + (i % 5) * 0.12);
     let z = positions.getZ(i) + drift.z * delta;
-
     if (x - c.x > radius) x -= size;
     else if (x - c.x < -radius) x += size;
     if (y - c.y > radius) y -= size;
     else if (y - c.y < -radius) y += size;
     if (z - c.z > radius) z -= size;
     else if (z - c.z < -radius) z += size;
-
     positions.setXYZ(i, x, y, z);
   }
   positions.needsUpdate = true;
@@ -1167,7 +1103,7 @@ export function addPlayer(id: string, color: THREE.ColorRepresentation): void {
   const pivot = new THREE.Group();
   group.add(pivot);
 
-  // Placeholder shown until the GLB loads (visor glow included).
+  // Placeholder: shown until GLB loads
   const placeholder = new THREE.Group();
   const body = new THREE.Mesh(
     new THREE.CapsuleGeometry(0.32, 0.65, 8, 16),
@@ -1184,8 +1120,7 @@ export function addPlayer(id: string, color: THREE.ColorRepresentation): void {
   placeholder.add(visor);
   pivot.add(placeholder);
 
-  // Headlamp rig — initially mounted on the pivot; reparented into the
-  // helmet torch once the model loads.
+  // Headlamp: initially on pivot, reparented to helmet once model loads
   const spot = new THREE.SpotLight(
     0xffeec9,
     REMOTE_LAMP_INTENSITY,
@@ -1203,8 +1138,7 @@ export function addPlayer(id: string, color: THREE.ColorRepresentation): void {
   pivot.add(spot);
   pivot.add(spot.target);
 
-  // Fat, readable cone — a remote beam is mostly seen side-on, where a
-  // narrow cone collapses into a thin ray.
+  // Fat, readable cone: remote beams seen side-on need width
   const beam = createVolumetricLight({
     length: 22,
     endRadius: 4.6,
@@ -1234,14 +1168,12 @@ export function addPlayer(id: string, color: THREE.ColorRepresentation): void {
     rig: null,
     torch: null,
     headGlow: null,
-    // Look (head/torch) vs lazy body orientation, synced from the peer.
     lookYaw: 0,
     lookPitch: 0,
     swimYaw: 0,
     swimPitch: 0,
     bodyPitchSm: 0,
-    // Velocity estimated from interpolated positions — drives the remote
-    // diver's kick effort and direction adaptation with no protocol change.
+    // Velocity: estimated from positions, drives kick effort/direction
     velEst: new THREE.Vector3(),
     lastPos: new THREE.Vector3(),
     hasLast: false,
@@ -1257,10 +1189,7 @@ export function addPlayer(id: string, color: THREE.ColorRepresentation): void {
     player.rig = rig;
     placeholder.visible = false;
 
-    // --- Helmet torch: the model carries it on the helmet; the LIGHT rig
-    // lives at scene level (unit scale, so beam/halo sizes stay world-true)
-    // and is snapped to the head's world pose every frame — always aligned
-    // with wherever the diver's camera looks.
+    // Helmet torch: snapped to head's world pose every frame
     const torch = new THREE.Group();
     torch.add(spot);
     spot.position.set(0, 0, 0);
@@ -1273,7 +1202,7 @@ export function addPlayer(id: string, color: THREE.ColorRepresentation): void {
     scene.add(torch);
     player.torch = torch;
 
-    // --- Colored glow following the diver's helmet (scene level too). ---
+    // Head glow: color + halo following diver's helmet
     const headGlow = new THREE.Group();
     headGlow.add(createHalo(0.9, 0.55, color));
     glow.position.set(0, 0, 0);
@@ -1283,8 +1212,7 @@ export function addPlayer(id: string, color: THREE.ColorRepresentation): void {
   });
 }
 
-// --- Remote diver per-frame update: estimate velocity, run the procedural
-// swim (diverRig.js), then pin the helmet torch + glow to the head.
+// Remote diver: estimate velocity, run swim, pin torch/glow to head
 function updateRemoteDiver(player: RemotePlayer, delta: number): void {
   const rig = player.rig;
   if (!rig) return;
@@ -1300,10 +1228,7 @@ function updateRemoteDiver(player: RemotePlayer, delta: number): void {
   }
   player.lastPos.copy(p);
 
-  // Body follows the peer's lazy swim orientation; the head (and torch)
-  // aims at their true look — so you SEE them turn their head. Like the
-  // local body, the visual pitch stays level at rest and only aligns with
-  // the swim direction as they pick up speed.
+  // Body: lazy swim orientation; head aims at true look; pitch aligns with speed
   const align = Math.min(1, player.velEst.length() / 2.5);
   player.bodyPitchSm +=
     (player.swimPitch * align - player.bodyPitchSm) * Math.min(1, delta * 3);
@@ -1318,8 +1243,7 @@ function updateRemoteDiver(player: RemotePlayer, delta: number): void {
     carrying: player.carrying,
   });
 
-  // Torch beam leaves the helmet along the exact look direction.
-  // (torch/headGlow are created in the same then() that set `rig`.)
+  // Torch: positioned/oriented along look direction
   _v1.copy(TORCH_OFFSET).applyQuaternion(rig.lookQuat);
   player.torch!.position.copy(rig.headPos).add(_v1);
   player.torch!.quaternion.copy(rig.lookQuat);
@@ -1337,16 +1261,13 @@ export function removePlayer(id: string): void {
       child.geometry?.dispose();
       if (child.material?.dispose) {
         child.material.dispose();
-        // The volumetric beam registered its material for the shared uTime
-        // update — unregister, or the render loop feeds disposed materials
-        // forever (and the array grows with every join).
+        // Unregister beam material: prevent render loop feeding disposed materials
         const bi = beamMaterials.indexOf(
           child.material as THREE.ShaderMaterial,
         );
         if (bi !== -1) beamMaterials.splice(bi, 1);
       }
-      // Lights own GPU-side shadow maps (the spot's 512² depth target) that
-      // material/geometry disposal doesn't touch.
+      // Dispose shadow maps: lights own GPU resources material/geometry don't touch
       if ((child as unknown as THREE.Light).isLight)
         (child as unknown as THREE.Light).dispose();
     });
@@ -1367,17 +1288,14 @@ export function updatePlayerPosition(
   const player = players.get(id);
   if (!player) return;
   player.group.position.set(x, y, z);
-  // Look (head + torch) and lazy body orientation are tracked separately;
-  // updateRemoteDiver applies them so the head visibly turns on the body.
+  // Look (head) separate from lazy body orientation; updateRemoteDiver applies
   if (yaw !== null) player.lookYaw = yaw;
   if (pitch !== null) player.lookPitch = pitch;
   player.swimYaw = swimYaw ?? yaw ?? player.swimYaw;
   player.swimPitch = swimPitch ?? pitch ?? player.swimPitch;
 }
 
-// Their replicated STATUS.CARRYING bit, pushed in by main.ts the same way
-// their flashlight is — the rig holds the wheel with both arms while it is
-// set, so the wheel you see in their hands is the one holdPose() put there.
+// Carrying: rig holds wheel with both arms when set
 export function setPlayerCarrying(id: string, carrying: boolean): void {
   const player = players.get(id);
   if (player) player.carrying = carrying;
@@ -1398,9 +1316,7 @@ export function updateCamera(
   speed: number = 0,
   roll: number = 0,
 ): void {
-  // BUOYANCY — a visual-only sway layered on the simulated position. Water
-  // never holds you perfectly still: a slow vertical heave, a hint of side
-  // drift, and a breathing roll. Fades as swim speed takes over.
+  // BUOYANCY: visual-only sway (heave, side drift, breathing roll)
   const idle = 1 - Math.min(1, moveFactor * 2.5);
   const heave =
     Math.sin(elapsed * 0.45) * 0.05 + Math.sin(elapsed * 0.9) * 0.02;
@@ -1417,8 +1333,7 @@ export function updateCamera(
   moveFactor += (speed - moveFactor) * 0.05;
 }
 
-// Helmet-mounted = much steadier than the old hand-held sway: just a faint
-// breathing bob, growing slightly with swim speed.
+// Helmet-mounted: faint breathing bob, grows with swim speed
 function animateFlashlight(): void {
   if (!flashlight) return;
   const t = elapsed;
@@ -1429,7 +1344,7 @@ function animateFlashlight(): void {
   flashlight.group.rotation.x = Math.sin(t * 1.7) * 0.004 * bob;
 }
 
-// Feed the snow shader the two beam poses (local + first remote).
+// Update snow shader: feed beam poses (local + first remote)
 function updateSnowLightUniforms(): void {
   const u = snow.material.uniforms;
 
@@ -1484,20 +1399,15 @@ export function renderLoop(onFrame?: (delta: number) => void): void {
     for (const mat of beamMaterials) mat.uniforms.uTime.value = elapsed;
 
     const drift = currentDrift();
-    // Snow SINKS slowly — suspension, not a starfield falling past a ship.
-    wrapAroundCamera(snow, SNOW_RADIUS, -0.09, delta, drift);
+    wrapAroundCamera(snow, SNOW_RADIUS, -0.09, delta, drift); // snow sinks slowly
     wrapAroundCamera(bubbles, BUBBLE_RADIUS, 0.85, delta, drift);
     wrapAroundCamera(plankton, PLANKTON_RADIUS, -0.015, delta, drift);
     updateBursts(delta);
     updateBreath(delta);
 
     animateFlashlight();
-
     if (onFrame) onFrame(delta);
-
-    // After game logic moved players/camera: layer fog, bioluminescent pulse,
-    // fog-aware culling, rig animation (helmet torch follows the moved head),
-    // then feed the beam poses to the snow shader.
+    // Update atmosphere, world, rig animation, then render
     const visibility = updateAtmosphere(delta);
     updateGouda(elapsed, camera.position, visibility);
     updateBathyscaphe(elapsed);

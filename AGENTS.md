@@ -254,3 +254,15 @@ Both are RIGID IN THE VIEW FRAME — forward and down rotate with the look — s
 the wheel holds one spot relative to its carrier however they tilt. It has to:
 the arms are posed in that same frame, and a world-vertical drop would slide
 the wheel through the hands on every pitch.
+
+## Comment Guidelines
+
+### Allowed: Top-of-File Architecture Headers
+- Multi-paragraph comments are permitted ONLY at the very top of a file (file-header level).
+- File headers MUST focus exclusively on high-level architecture: file responsibility, API contract/exports, skeleton structure, parameter conventions, and frame-of-reference rules.
+- Do NOT include step-by-step design history, trial-and-error logs, or subjective visual flavor text even in file headers.
+
+### Banned: Mid-File & Inline Narrative Comments
+- INSIDE functions or mid-file: keep comments strictly to 1–2 lines max.
+- Zero narrative prose, historical rationale ("the old version did X"), or physical/visual metaphors inside function bodies.
+- Code should explain *what* it is doing, not why alternative values failed.

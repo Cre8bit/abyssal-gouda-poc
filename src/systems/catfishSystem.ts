@@ -29,9 +29,7 @@ const BITE_SHOVE = 9; // impulse away from the snapping jaws (u/s)
 
 export interface CatfishSystemDeps {
   showEvent(text: string, durationMs?: number): void;
-  // A hit landed on the local diver. Damage has one consequence so far —
-  // you may lose your grip on the Golden Gouda (M1.1) — and the fish has no
-  // business knowing that, so it just reports the hit.
+  // Hit callback; fish reports but doesn't know consequences (e.g., loss of grip).
   onDamage?(): void;
 }
 
@@ -48,7 +46,6 @@ export function createCatfishSystem({
   let netTimer = 0;
 
   const onBite = (fishPos: Vec3) => {
-    // Shove the diver away from the snapping jaws.
     const p = game.localPosition;
     const v = game.velocity;
     const dx = p.x - fishPos.x;
@@ -69,17 +66,14 @@ export function createCatfishSystem({
     events: ["fish"],
 
     spawn(difficulty: number) {
-      // Sync the authority flag BEFORE the async template load resolves —
-      // spawnCatfish gates on it, and a joiner's first frame (which also
-      // syncs it) may not have run yet when a seed-rebuild lands here.
+      // Sync authority before async spawn (gates template load).
       setCatfishAuthority(game.fishAuthority);
       despawnCatfish();
       spawnCatfish(Math.min(8, 4 + difficulty), { onBite });
     },
 
     update({ dt, now, game, connected }) {
-      // catfish.js keeps its own authority flag (gates async spawns) — keep
-      // it mirrored on the shared state, wherever the election moved it.
+      // Mirror authority state (catfish.js gates on it).
       setCatfishAuthority(game.fishAuthority);
       updateCatfishSystem(
         dt,
@@ -97,13 +91,11 @@ export function createCatfishSystem({
     },
 
     onEvent(_fromPeerId, _kind, data) {
-      // The authority's fish states: run them as interpolated puppets.
       if (!game.fishAuthority) applyCatfishState(data.f);
     },
 
     onPeerDisconnected(peerId) {
-      // If the fish simulator left, elect a replacement — consistent on
-      // every client without coordination (sorted ids, lowest wins).
+      // Elect new authority (lowest peer id, deterministic).
       if (peerId === (game.fishAuthorityId ?? getHostId())) {
         const candidates = [getMyId(), ...getPeerIds()]
           .filter((id): id is string => Boolean(id))
@@ -111,6 +103,7 @@ export function createCatfishSystem({
         game.fishAuthorityId = candidates[0] ?? getMyId();
         game.fishAuthority = game.fishAuthorityId === getMyId();
       }
+      // Solo: assume authority.
       if (getPeerIds().length === 0) {
         game.fishAuthority = true;
         game.fishAuthorityId = getMyId();

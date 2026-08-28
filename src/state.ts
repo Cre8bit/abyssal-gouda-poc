@@ -1,14 +1,8 @@
-// state.ts — the one place session-mutable game state lives.
-//
-// Before this module, position/velocity/seed/authority were module-level
-// `let`s scattered across main.ts — nothing could reset them, so "replay
-// with a new seed" or a lobby→game→lobby flow would inherit stale state.
-// Now every system reads/writes the shared `game` object, and
-// resetGameState() gives world rebuilds and host migration a clean slate.
-//
-// What does NOT live here: the mesh itself (net/mesh.ts owns peer
-// records — connections outlive a world rebuild), rendering objects
-// (render/graphics.ts), and per-frame scratch (pooled where it's used).
+// state.ts — shared session-mutable game state, central reset point.
+// Before: position/velocity/seed scattered as module-level `let`s → stale state on replay.
+// Now: all systems use the `game` object; resetGameState() clears motion and interpolation.
+// What does NOT live here: mesh/peers (net/mesh.ts), render objects (render/graphics.ts),
+// or per-frame scratch.
 import { SnapshotBuffer } from "./net/interpolation.ts";
 
 export interface Vec3 {
@@ -30,10 +24,7 @@ export interface GameState {
   seed: number;
   difficulty: number; // 1..3
   worldReady: boolean; // false while the labyrinth is carving
-  // Digs received from peers mid-carve. gouda.ts only records a carve on the
-  // chunks that exist when digAt() runs, so a dig applied during a build is
-  // silently missing from every chunk carved after it — the map would diverge
-  // from the sender's for good. Queue them here, replay once the world is up.
+  // Queued digs from peers; replayed once world build completes (prevents map divergence)
   pendingDigs: SphereDig[];
 
   // Local diver.
@@ -70,8 +61,7 @@ export const game: GameState = {
   remotePositions: [],
 };
 
-// Park the diver at a spawn: zero motion, forget remote interpolation history
-// (so nobody sweeps across the map), used by teleports and world builds.
+// Teleport to spawn, zero motion, reset remote interpolation history.
 export function placeAtSpawn(spawn: Vec3): void {
   game.spawnPoint.x = spawn.x;
   game.spawnPoint.y = spawn.y;
@@ -83,20 +73,15 @@ export function placeAtSpawn(spawn: Vec3): void {
   for (const buffer of game.remoteBuffers.values()) buffer.reset();
 }
 
-// Wipe everything a NEW WORLD must not inherit: motion and interpolation
-// history. Peers/mesh survive (the crew stays connected across a rebuild);
-// seed/difficulty change only when the caller passes them. Callers pair this
-// with resetSystems() (systems/registry.ts) so statuses, oxygen and items
-// reset through their own hooks — state.ts stays pure data.
+// Clear motion and interpolation (peers/mesh persist across rebuilds).
+// Seed/difficulty update only if provided. Call with resetSystems() to reset all systems.
 export function resetGameState(
   opts: { seed?: number; difficulty?: number } = {},
 ): void {
   if (opts.seed !== undefined) game.seed = opts.seed >>> 0;
   if (opts.difficulty !== undefined) game.difficulty = opts.difficulty;
   game.worldReady = false;
-  // Carves aimed at the world we are replacing — never replay them into the
-  // new one. Callers reset before awaiting the build, so digs that arrive
-  // during the carve still queue up behind this.
+  // Discard old digs; new ones queue during build and replay after.
   game.pendingDigs.length = 0;
   game.velocity.x = game.velocity.y = game.velocity.z = 0;
   for (const buffer of game.remoteBuffers.values()) buffer.reset();

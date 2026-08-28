@@ -11,10 +11,10 @@ import { STATUS, type StatusMask } from "./effects.ts";
 export const O2_MAX = 100;
 const BASE_DRAIN = O2_MAX / 600; // 10 min of calm swimming
 const SPRINT_MULT = 1.8;
-const CARRY_MULT = 1.15; // the wheel is heavy even when you take it slow
-const CARRY_SPRINT_MULT = 1.8; // …and sprinting with it costs 1.8× again
-const TRAPPED_MULT = 2.0; // panic breathing, pinned to the floor
-const GASSED_MULT = 1.5; // coughing in fermentation gas
+const CARRY_MULT = 1.15; // heavy cargo tax
+const CARRY_SPRINT_MULT = 1.8; // sprint multiplier stacks on carry
+const TRAPPED_MULT = 2.0; // panic breathing
+const GASSED_MULT = 1.5; // gas damage
 const REFILL_RATE = O2_MAX / 5; // full tank in 5 s at the bathyscaphe
 
 const WARN_THRESHOLDS = [50, 25, 10]; // one-shot warnings, re-armed on refill
@@ -59,7 +59,7 @@ export function refillOxygen(): void {
   warned.clear();
 }
 
-// Once per frame. Returns the current O₂ fraction.
+// Per-frame update; returns O₂ fraction
 export function updateOxygen(
   delta: number,
   {
@@ -80,9 +80,7 @@ export function updateOxygen(
 
   let drain = BASE_DRAIN;
   if (sprinting) drain *= SPRINT_MULT;
-  // Hauling the Golden Gouda (M1.1): a steady tax for carrying it at all,
-  // and a punishing one for sprinting with it — the same choice that risks
-  // your grip also eats the clock.
+  // Carrying tax; sprint multiplier stacks
   if (status & STATUS.CARRYING) {
     drain *= CARRY_MULT;
     if (sprinting) drain *= CARRY_SPRINT_MULT;

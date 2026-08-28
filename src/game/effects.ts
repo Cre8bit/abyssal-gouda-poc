@@ -1,13 +1,5 @@
-// effects.ts — player status plumbing (T0.2).
-//
-// Every player carries a 7-bit status mask, shipped in byte 3 of the binary
-// state packet (net/) at 30 Hz — and re-broadcast IMMEDIATELY on any
-// local change, so a flag is visible to peers well under 100 ms.
-//
-// The rule (see docs/plan-game-loop.md §2): effects are applied LOCALLY
-// (inverted controls, screen blur, O₂ drain…); the network only carries the
-// flags, and remote clients merely *render* what a flag implies (bubbles,
-// coughs, the carrier's glow). Replication cost: zero extra bytes.
+// effects.ts — 7-bit status mask (CARRYING, GASSED, POISONED, TRAPPED, SPEAKING).
+// Local state: tracking and expiry. Remote state: per-peer mask storage for rendering.
 
 export const STATUS = {
   CARRYING: 1 << 0, // holding the Golden Gouda (phase 1)
@@ -39,8 +31,7 @@ export function hasLocalStatus(bit: StatusBit): boolean {
   return (localMask & bit) !== 0;
 }
 
-// Set or clear a status bit. `durationMs` auto-clears it (e.g. poison 10 s);
-// setting the bit again refreshes the timer.
+// Set or clear a status bit. `durationMs` auto-clears it (e.g. poison 10 s).
 export function setLocalStatus(
   bit: StatusBit,
   on: boolean,
@@ -67,8 +58,7 @@ export function updateEffects(): void {
   }
 }
 
-// Reset for a fresh session (state.ts resetGameState): clears the local mask
-// WITHOUT firing the change callback — there is nobody left to rebroadcast to.
+// Reset for a fresh session (state.ts resetGameState): clears the local mask.
 export function resetEffects(): void {
   localMask = 0;
   expiries.clear();

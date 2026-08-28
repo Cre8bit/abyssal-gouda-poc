@@ -28,11 +28,8 @@ interface ShotPreset {
   yaw?: number;
   pitch?: number;
   keys?: string[];
-  settle?: number; // frames to render before the capture (see ShotConfig)
-  // Park relative to the Golden Gouda's cavern rather than at a fixed world
-  // point. The wheel's hiding place is seeded, so a hard-coded vantage point
-  // would have to be re-measured every time SHOT_SEED changed; this resolves
-  // against getGoldPos() at capture time instead. Explicit x/y/z still win.
+  settle?: number; // frames to render before capture
+  // Relative to gouda cavern; resolves at capture time if not explicitly set.
   gold?: { dx: number; dy: number; dz: number };
 }
 
@@ -51,11 +48,9 @@ export interface ShotConfig {
   settle: number;
 }
 
-// pitch/yaw in radians. keys = e.code values held for the whole capture.
-// Positions omitted = stay at the world spawn (open water, labyrinth in view).
+// pitch/yaw in radians. keys = e.code values held for capture.
 const SHOTS: Record<string, ShotPreset> = {
-  // First-person body: the whole reason this harness exists — checking the
-  // gloves at every look angle, idle and swimming.
+  // First-person body: gloves at every look angle.
   "fp-forward": { pitch: 0 },
   "fp-down-30": { pitch: -0.6 },
   "fp-down-60": { pitch: -1.1 },
@@ -66,10 +61,7 @@ const SHOTS: Record<string, ShotPreset> = {
   "fp-swim-sprint": { pitch: -0.35, keys: ["KeyW", "ShiftLeft"] },
   // Establishing shot: the glowing gouda system from the drift.
   world: { pitch: 0.05 },
-  // The Golden Gouda in its cavern: the levitating bits, the lamp, and (with
-  // KeyE held at the top of the capture) the wheel in your own two hands.
-  // `settle` is raised well past the default because the bits' orbit and
-  // radial drift are slow by design — 30 frames in, nothing has moved yet.
+  // Gouda in cavern with levitating bits; settle=240 waits for orbit/drift.
   gouda: { gold: { dx: 0, dy: 0.5, dz: 3.2 }, pitch: -0.12, settle: 240 },
   "gouda-carry": {
     gold: { dx: 0, dy: 0.3, dz: 2.4 },
@@ -77,24 +69,12 @@ const SHOTS: Record<string, ShotPreset> = {
     keys: ["KeyE"],
     settle: 240,
   },
-  // The tin bell berthed at the spawn (default spawn ≈ (0, 18, 434); the
-  // spawn sits at hatch eye height INSIDE it — see bathyscaphe.js), seen
-  // from the gouda side so the hatch doorway + entry beacon are in frame.
-  // &bells=N previews the multi-diver berth row.
+  // Tin bell from gouda side; &bells=N previews multi-diver berth.
   bell: { x: 10, y: 20, z: 414, yaw: 2.68, pitch: -0.06 },
 };
 
-// The FP-body tuning knobs, read straight off the URL. Shared with the model
-// bench (bench/preview.ts) so a candidate arm pose can be swept in either
-// place with the same query string: the bench for the geometry (it reads the
-// joint positions back in camera space), the shot runner for the frame.
-//
-// &uy=&ux=&fy=&fx=&fz=&hx=&hy=&hz= is the LEVEL arm pose; the same eight
-// `d`-prefixed are the LOOK-DOWN reveal and `c`-prefixed the CARRY grip.
-// &ox=&oy=&oz= / &coy=&coz= move the body off the eye (idle and carrying),
-// &sc= sets how long the arms are relative to the FOV, and
-// &pb=&pf= are the screen anchor. They override diverRig's constants for this
-// page load only — a candidate pose can be seen before it is baked in.
+// FP-body tuning knobs from URL (shared with bench/preview.ts).
+// Prefixes: d=LOOK-DOWN, c=CARRY, o=body offset, sc=scale, pb/pf=screen anchor.
 const ARM_KEYS = ["uy", "ux", "fy", "fx", "fz", "hx", "hy", "hz"];
 export function applyFpBodyParams(p: URLSearchParams): void {
   const pose: Record<string, number> = {};
@@ -156,14 +136,12 @@ export function applyShot(
 ) {
   document.getElementById("menu")?.classList.add("hidden");
   document.getElementById("hud")?.classList.remove("hidden");
-  // The loader's fade-out transition can straddle the capture — kill it.
+  // Clear loader fade-out transition.
   const loader = document.getElementById("loader");
   if (loader) loader.style.display = "none";
   if (cfg.light) addShotLight(cfg.light);
-  if (cfg.bells) setBellCount(cfg.bells); // preview the multi-diver berth row
-
-  // Gold-relative presets resolve here, once the world exists and the wheel
-  // has been seeded. An explicit x/y/z (from the preset or the URL) wins.
+  if (cfg.bells) setBellCount(cfg.bells);
+  // Gold-relative presets resolve here once world is seeded; explicit x/y/z wins.
   const gold = cfg.gold ? getGoldPos() : null;
   teleport(
     cfg.x ?? (gold ? gold.x + cfg.gold!.dx : position.x),
@@ -171,15 +149,11 @@ export function applyShot(
     cfg.z ?? (gold ? gold.z + cfg.gold!.dz : position.z),
   );
   setLook(cfg.yaw, cfg.pitch);
-
-  // Hold movement keys via real events so input.js (and anything else
-  // listening) sees exactly what a player pressing the key produces.
+  // Dispatch real keyboard events so listeners see actual key presses.
   for (const code of cfg.keys) {
     window.dispatchEvent(new KeyboardEvent("keydown", { code }));
   }
-
-  // Raise the runner's ready flag after `settle` rendered frames, so swim
-  // animation and drift are visibly mid-motion when the frame is captured.
+  // Set ready flag after settle frames so motion is mid-frame.
   let frames = 0;
   const tick = () => {
     if (++frames >= cfg.settle) window.__shotReady = true;

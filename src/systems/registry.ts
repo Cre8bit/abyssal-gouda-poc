@@ -22,9 +22,7 @@ export function updateSystems(ctx: FrameContext): void {
   for (const sys of systems) sys.update(ctx);
 }
 
-// Route a network event to the system that declared its kind. Returns true
-// if some system consumed it (main.ts falls through to its own handling
-// otherwise — world events like dig/tp/seed stay orchestrator business).
+// Route event to system that declared its kind; return true if handled.
 export function dispatchSystemEvent(
   fromPeerId: string,
   kind: string,

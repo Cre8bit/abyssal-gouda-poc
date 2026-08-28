@@ -274,11 +274,7 @@ function segDist(
   return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
-// The UNCARVED chunk body: ellipsoid + crust noise + plane cuts. Besides
-// meshing/collision, this is what tells rind from paste: a surface vertex
-// whose base distance is near zero sits on the outer waxed rind; one that is
-// DEEP INSIDE the base body (a hole, tunnel, cut face or dig) shows the
-// bright interior paste — the cheese signature.
+// Uncarved body SDF: rind (outer) vs. paste (carved interior).
 function baseSdf(c: Chunk, x: number, y: number, z: number): number {
   const ex = x * c.ix,
     ey = y * c.iy,
@@ -307,8 +303,7 @@ function baseSdf(c: Chunk, x: number, y: number, z: number): number {
   return d;
 }
 
-// The full chunk SDF in LOCAL grid space [-1,1]. Meshing, collision AND
-// digging all run through this — keep them in lockstep.
+// Full chunk SDF, local [-1,1]. Used for meshing, collision, digging.
 function chunkSdf(c: Chunk, x: number, y: number, z: number): number {
   let d = baseSdf(c, x, y, z);
 
@@ -439,7 +434,7 @@ function makeChunkData(
     iz: 1 / sz,
     minAxis: Math.min(sx, sy, sz),
     nOff: rng() * 100,
-    // LOW noise: waxy smooth wheels, crisp flat cuts, round readable holes.
+    // Crust noise amplitude (low for readability).
     amp: opts.kind === "block" || opts.kind === "slab" ? 0.04 : 0.08,
     planes: [],
     holes: [],
@@ -491,7 +486,7 @@ function makeChunkData(
     c.holes.push(eye);
   }
 
-  // Round pores. Slabs get many BIG ones — clean through-holes in the plate.
+  // Pores: many for slabs, few otherwise.
   const [pMin, pMax] = opts.pores ?? [10, 18];
   const [prBase, prVar] = opts.poreR ?? [0.055, 0.075];
   const nPores = pMin + Math.floor(rng() * (pMax - pMin + 1));
@@ -507,8 +502,7 @@ function makeChunkData(
     });
   }
 
-  // Spanning tree (+tangle: attach to a random earlier chamber — long
-  // intertwined passages, easy to descend, hard to retrace).
+  // Spanning tree with optional tangle (random earlier chamber).
   for (let i = 1; i < eyes.length; i++) {
     let best = 0,
       second = 0,
@@ -623,7 +617,7 @@ function makeChunkData(
     });
   }
 
-  // Remember the grandest cavern — a candidate hiding spot for the gold.
+  // Track largest cavern (gold spawn candidate).
   let biggest = eyes[0] ?? null;
   for (const e of eyes) if (e.r > (biggest?.r ?? 0)) biggest = e;
   c.biggestEye = biggest;
@@ -633,8 +627,7 @@ function makeChunkData(
 
 // --- Meshing -------------------------------------------------------------------------
 
-// The scratch marching-cubes instances stay alive for the whole session:
-// digging re-uses them to re-mesh single chunks on the fly.
+// MC instances stay live; digging reuses them for chunk re-meshing.
 const mcCache = new Map<number, MarchingCubes>();
 
 function getMC(res: number): MarchingCubes {
@@ -652,11 +645,7 @@ function getMC(res: number): MarchingCubes {
   return mc;
 }
 
-// Turns the MC's current triangulation into a compact static geometry with
-// sanitized normals (zero-length normals ⇒ NaN in GLSL ⇒ black bloom smears)
-// and a per-vertex RIND factor: 1 on the outer waxed crust, 0 on any carved
-// surface (holes, tunnels, cut faces, digs) — which the material renders as
-// bright interior paste. This contrast is what makes it read as CHEESE.
+// Extract compact geometry with sanitized normals; compute rind factor (1=crust, 0=carved).
 function extractGeometry(mc: MarchingCubes, c: Chunk): THREE.BufferGeometry {
   const count = mc.count;
   const positions = mc.geometry.attributes.position.array.slice(0, count * 3);
@@ -677,8 +666,7 @@ function extractGeometry(mc: MarchingCubes, c: Chunk): THREE.BufferGeometry {
       normals[i3 + 1] = 1;
       normals[i3 + 2] = 0;
     }
-    // Rind factor from the UNCARVED body: ~0 at the outer surface ⇒ rind;
-    // clearly negative (deep inside the body) ⇒ carved-open paste.
+    // Rind factor: ~0 (outer/rind) to -0.055 (carved paste).
     const bd = baseSdf(c, positions[i3], positions[i3 + 1], positions[i3 + 2]);
     const t = (bd + 0.055) / 0.04; // -0.055 → 0 (paste), -0.015 → 1 (rind)
     crust[i] = Math.max(0, Math.min(1, t));
@@ -712,8 +700,7 @@ function meshChunk(
       }
     }
   }
-  // Cache the field: digs edit it incrementally instead of re-evaluating
-  // the whole analytic SDF.
+  // Cache field; digs edit incrementally.
   c.field = field.slice();
 
   mc.update();
@@ -745,9 +732,7 @@ function remeshChunk(c: Chunk): void {
 
 // --- DIGGING ---------------------------------------------------------------------------
 
-// Carves a sphere of radius r (world units) at world point (x,y,z) out of
-// every overlapping chunk, updates their cached fields, re-meshes them, and
-// destroys small debris. Returns true if anything changed.
+// Carve sphere through chunks; update fields, re-mesh, destroy small debris.
 export function digAt(x: number, y: number, z: number, r: number): boolean {
   let changed = false;
 
@@ -764,7 +749,7 @@ export function digAt(x: number, y: number, z: number, r: number): boolean {
     const lr = r / c.s;
     c.digs.push({ x: lx, y: ly, z: lz, r: lr });
 
-    // Edit only the voxels the dig can touch.
+    // Edit only voxels the dig can touch.
     const res = c.res;
     const half = res / 2;
     const cell = 1 / half;
@@ -795,7 +780,7 @@ export function digAt(x: number, y: number, z: number, r: number): boolean {
     changed = true;
   }
 
-  // Small crumbs shatter outright.
+  // Destroy debris in dig radius.
   for (let i = debris.length - 1; i >= 0; i--) {
     const b = debris[i];
     const dx = x - b.center.x,
@@ -811,8 +796,7 @@ export function digAt(x: number, y: number, z: number, r: number): boolean {
   return changed;
 }
 
-// Sphere-traces the world SDF along a ray. Returns the hit point (just
-// outside the surface) or null. Used to aim the dig tool.
+// Sphere-trace along ray; return hit point or null.
 export function raycastSolid(
   origin: Vec3,
   dir: Vec3,
@@ -841,12 +825,7 @@ function vec3str(hex: number): string {
   return `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`;
 }
 
-// The cheese material. Two-tone via the aCrust vertex attribute:
-//   paste — bright pale-yellow interior, shown on every carved surface
-//           (holes, tunnels, cut faces, player digs)
-//   rind  — the zone's wax coating on the outer crust
-// Bioluminescent veins live in the PASTE (glowing from within); the rind
-// stays dead and dark. That contrast is the gouda signature.
+// Two-tone cheese material via aCrust: paste (carved), rind (outer crust).
 function createGoudaMaterial({
   paste,
   rind,
@@ -860,11 +839,7 @@ function createGoudaMaterial({
   vein: [number, number, number];
   veinStrength: number;
 }): THREE.MeshToonMaterial {
-  // Cel-shaded cheese: the shared toon ramp quantizes the lighting into hard
-  // bands and toonMaterial() adds the same ink rim every model wears (see
-  // render/toon.ts); the paste/rind/vein injection below is this material's
-  // own layer under it. `rough` is kept for tuning history but toon shading
-  // has no roughness.
+  // Toon-shaded with paste/rind/vein injection; rough unused.
   void rough;
 
   const pasteVec = vec3str(paste);
@@ -938,9 +913,7 @@ function createGoudaMaterial({
         );
   };
 
-  // Zones share the same injection SOURCE but different baked constants, so
-  // the cache key carries them — otherwise three's shader cache merges every
-  // zone into one look.
+  // Cache key includes constants to prevent zone-merge.
   return toonMaterial(
     { color: 0xffffff }, // overridden per-fragment by the paste/rind mix
     {
@@ -951,9 +924,7 @@ function createGoudaMaterial({
 }
 
 function createZoneMaterials(): Record<ZoneName, THREE.MeshToonMaterial> {
-  // Bright pale-yellow paste everywhere (that's the cheese), while each
-  // biome wears its own WAX RIND — like a warehouse of differently-waxed
-  // gouda wheels. Veins glow through the paste only.
+  // Each biome has its own wax rind; paste and veins are shared.
   const PASTE = 0xecc76a;
   return {
     // bleached natural rind, ghost-pale
@@ -1515,9 +1486,7 @@ export async function buildGoudaWorld(
 
   scene.add(group);
 
-  // HIDE THE GOLD: a random grand cavern inside a mid-radius wheel — never
-  // at the center (the heart is a decoy), never near the borders, and never
-  // on the compass. Seeded, so every peer hides it in the same place.
+  // Hide gold in random mid-radius wheel cavern (seeded, off-compass).
   const candidates = chunks.filter((c) => {
     const r = c.center.length();
     return (
@@ -1536,17 +1505,12 @@ export async function buildGoudaWorld(
     y: host.center.y + eye.y * host.s,
     z: host.center.z + eye.z * host.s,
   };
-  // Nothing is BUILT here any more: the wheel itself is an item seeded at
-  // this position (game/items.ts kind "gouda", systems/cargoSystem.ts), so
-  // it can be picked up, handed over, fumbled down a shaft, and carried home.
-  // The world only decides where it hides.
+  // Wheel is an item (game/items.ts), world only seeds position.
   createBoundarySphere(extrasGroup);
   createBlastMarkers(extrasGroup);
   scene.add(extrasGroup);
 
-  // Spawn at the drift's edge with the whole glowing ball in view. The
-  // bathyscaphe berths here with its hatch facing the cheese (-Z), so keep
-  // the doorway's exit corridor clear too, not just the spawn point.
+  // Spawn at drift edge; keep bathyscaphe exit corridor clear.
   const p = new THREE.Vector3(0, 18, WORLD_R + 14);
   while (
     (worldDistance(p.x, p.y, p.z) < 6 ||
@@ -1586,8 +1550,7 @@ export function disposeWorld(scene: THREE.Scene): void {
   spawnPoint = null;
 }
 
-// Where the Gouda is seeded — read once at world build by cargoSystem, which
-// spawns the item there. NEVER for the HUD (D4: no gold marker, ever).
+// Seeded gold position; read once at world build.
 export function getGoldPos(): Vec3 | null {
   return goldPos;
 }
@@ -1634,8 +1597,7 @@ export function resolveCollision(pos: Vec3, radius: number): Vec3 | null {
   let normal: Vec3 | null = null;
   for (let iter = 0; iter < 2; iter++) {
     const d = worldDistance(pos.x, pos.y, pos.z);
-    // A NaN here (degenerate SDF sample) would silently poison pos and
-    // teleport/trap the player — bail and keep last frame's position.
+    // NaN from degenerate SDF would trap player; bail if non-finite.
     if (!Number.isFinite(d)) break;
     if (d >= radius) break;
     let nx =

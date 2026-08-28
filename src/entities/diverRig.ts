@@ -37,27 +37,17 @@ import type { GLTF } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { toonify, toonMaterial } from "../render/toon.ts";
 
 export const DIVER_SCALE = 1.4; // template ~0.95 tall → ~1.33 world units
-// The FIRST-PERSON body renders smaller than reality: at true scale the
-// arms loom huge and wide across the whole view when looking down (a
-// wide-FOV camera sitting right at the shoulders). A reduced visual scale
-// keeps them readable as "my arms" without dominating the frame.
+// FP body scales down to keep arms readable without dominating frame
+// (true scale = arms loom huge across the view from shoulder-mounted camera).
 let FP_SCALE = 2.24;
 const LEAN = 1.0; // prone swimming lean (rad) — body pitches under the head
-// …but the FIRST-PERSON body barely leans at all. The prone lean is a
-// third-person read (a swimmer seen from outside); applied to the FP body it
-// swings the shoulders up and BEHIND the head, so the arms have to reach up
-// and over to get in frame and the elbows fold backwards. That is the broken
-// shoulder angle you see looking down. Nearly upright, the shoulders sit
-// where a shoulder sits — below the eye and a little behind it — and the arms
-// simply hang forward.
+// FP leans minimally (shoulders stay below eye, arms hang forward).
+// Third-person: shoulder rotation swings under head; FP: shoulders stay upright.
 const FP_LEAN = 0.22;
 const REF_SPEED = 10; // world speed that maps to a full-effort kick
 
-// First-person body cheat: the (invisible) body sits below the true eye
-// anchor and slightly BEHIND it. Behind is the important half — see
-// FP_VIEW: the FP body is rigidly locked to the camera, so a shoulder placed
-// behind the lens is behind it at every look angle, forever, and the one cut
-// in the FP geometry can never be in frame.
+// Body positioned below and behind eye anchor (shoulder cut stays off-screen
+// at all look angles; see FP_VIEW for rigid camera lock).
 const FP_OFFSET = new THREE.Vector3(0, -0.16, 0.1);
 
 // Base arm poses (template-space angles), numerically solved per view.
@@ -81,12 +71,9 @@ const ARM_POSE_THIRD: ArmPose = {
   hy: 0,
   hz: 0,
 };
-// FP pose, LEVEL VIEW: the arms hang forward and down from shoulders that sit
-// just behind the lens, and only the backs of the gloves graze the bottom
-// edge of the frame. Solved numerically (see the bench's `gloves` entry,
-// which reads the hand and shoulder positions back in camera space).
-// (fx/hx sit lower than the old graze so the idle water-sway and the swim
-// drift can never bob a knuckle up into the frame: hidden means hidden.)
+// Level view: arms hang forward/down, glove backs at frame edge.
+// Solved numerically via bench. Values prevent idle sway from bobbing knuckles
+// into frame (hidden means hidden).
 const ARM_POSE_FP: ArmPose = {
   uy: 1.43,
   ux: -1.44,
@@ -97,18 +84,9 @@ const ARM_POSE_FP: ArmPose = {
   hy: 0,
   hz: 0.45,
 };
-// …and LOOKING DOWN. The FP body is rigidly locked to the camera (FP_VIEW),
-// which is what keeps the shoulder cut out of frame at every angle — but it
-// also means that on its own you would see exactly the same sliver of glove
-// however far you looked down. So the REVEAL is done in the pose instead:
-// the arms draw in and up as you tip your head, blended by how far down you
-// are looking, and what comes into frame is forearm and paw — never the whole
-// arm, and never the shoulder. This is also what a swimmer looking at their
-// own chest actually does with their arms.
-// The reveal lands the paws in the lower third, angled IN toward each other
-// (hy) — not parked in the corners. Two hands already turned toward a point
-// between them is the neutral "ready to hold" shape, which is what lets a
-// future held item sit at the natural spot without a new pose per item.
+// Down look: pose-driven reveal (arms draw in/up as you look down).
+// Paws land in lower third angled inward—neutral "ready to hold" shape
+// for future held items. Rigid camera lock keeps shoulder cut off-screen.
 const ARM_POSE_FP_DOWN: ArmPose = {
   uy: 1.43,
   ux: -1.44,
@@ -128,17 +106,9 @@ const FP_LOOK_DOWN = 1.0;
 // deliberate reveal, not standing furniture.
 let FP_REVEAL_START = 0.25;
 
-// CARRYING THE GOLDEN GOUDA. Both views get their own pose, and the rig
-// cross-fades into it over ~0.2 s (rig.carrySm) so a hand-off is a movement,
-// not a cut. The swim stroke is damped away at the same time: a diver with a
-// wheel of cheese in both arms does not also do the breaststroke.
-//
-// The target is the wheel itself — game/cargo.ts's holdPose puts its centre
-// CARGO.HOLD_FORWARD ahead and CARGO.HOLD_DOWN below the eye, with a radius
-// of GOUDA_RADIUS. These poses are solved to put the paws on its FLANKS, not
-// on the face nearest the camera: hands on the near face read as pushing a
-// boulder, hands on the sides read as carrying. Retune them together — move
-// the wheel or resize it and the hands stop touching it.
+// Carry poses crossfade over ~0.2s (carrySm); strokes damped away.
+// Hands on wheel FLANKS (not front face). Solved to match cargo.HOLD_* offsets.
+// Retune poses together—move/resize wheel and hand position must follow.
 const ARM_POSE_CARRY_THIRD: ArmPose = {
   uy: 0.95,
   ux: -0.15,
@@ -162,21 +132,12 @@ const ARM_POSE_CARRY_FP: ArmPose = {
   hy: 0.5,
   hz: -0.02,
 };
-// The FP body is shoved FORWARD and DOWN while carrying, so the shoulders sit
-// inside the wheel's upper crust and the arms come out of its flanks. This is
-// the one moment the cut is in front of the lens — and it is buried in half a
-// metre of cheese, which is exactly why it is allowed to be.
+// FP body slides forward/down during carry (shoulder cut buried in cheese).
 const FP_OFFSET_CARRY = new THREE.Vector3(0, -0.19, -0.21);
 
-// FP hands are SCREEN-ANCHORED, FPS-style, and RIGIDLY so: the invisible body
-// takes the camera's yaw and its pitch, one for one. That is not a stylistic
-// choice, it is the whole safety property — the shoulder (and the only cut in
-// the FP geometry) keeps one fixed spot in camera space, so once it is behind
-// the lens it is behind the lens at every look angle, in every bank, forever.
-// A follow of less than 1 lets the camera swing relative to the body, and the
-// cut sweeps up into frame as a dark wedge on a hard look-down. That was the
-// bug. The "you see more of your arms when you look down" job belongs to the
-// pose (ARM_POSE_FP_DOWN), which can do it without moving the shoulder.
+// FP body RIGIDLY follows camera (yaw + pitch 1:1). Shoulder cut stays fixed
+// in camera space—behind lens at all angles/banks. Reveal job belongs to pose
+// (ARM_POSE_FP_DOWN), not body movement, or cut sweeps up as dark wedge.
 export const FP_VIEW = { base: 0, follow: 1 };
 
 // The FP pivot's pitch. Callers own the pivot, so they need this before
@@ -395,26 +356,9 @@ export function prepareDiverTemplate(gltf: GLTF): DiverTemplate {
   return { scene, data, headFix, headRest, fpGeometry: buildFpGeometry(scene) };
 }
 
-// First-person geometry: the two ARMS survive — shoulder to fingertip —
-// and everything else (torso, head, legs) is deleted at prep time. Rendering
-// a connected body from a camera parked at the head reads as "floating
-// behind a mannequin"; arms riding the bottom of the frame is the classic
-// FPS proprioception cheat, and there is nothing near the lens to clip,
-// slice, or see through.
-//
-// The cut used to be at the ELBOW, and that was the bug: looking down showed
-// two short sleeves ending in mid-water with their hollow interiors facing
-// the camera (the FP material is double-sided). An arm has to come from
-// somewhere. Keeping the upper arm moves the only cut up to the SHOULDER,
-// which the FP body offset parks behind and below the lens — so the arms
-// read as attached to a body you cannot see, and the cut is never in frame.
-//
-// A triangle survives if all three verts are majority-weighted to an arm
-// bone; the shoulder cut is then capped (capOpenLoops) so the sleeve is a
-// closed object from every angle — a glance up the arm while banking hard
-// must not look into a hollow tube. This is also the cheap way to do it: one
-// draw call on a reduced index buffer, so the GPU only skins/shades the
-// verts that are actually visible. Built once, shared by FP rigs.
+// Keep arms (shoulder→fingertip), delete rest. Classic FPS proprioception cheat.
+// Arms at frame edge, nothing near lens to clip/slice. Cut at shoulder (was elbow bug).
+// Capped (capOpenLoops) so sleeve closes from every angle. One draw call, shared by FP rigs.
 const FP_ARM_BONES = /Hand|Forearm|Upperarm/;
 // The cut's own colour: the suit's shadowed lining. Near-black reads as a
 // HOLE punched in the arm wherever the cap does show; a dark suit tone reads
@@ -456,24 +400,10 @@ function buildFpGeometry(scene: THREE.Object3D) {
   return { hands };
 }
 
-// Deleting the torso leaves the arms as OPEN TUBES — and in first person the
-// camera sits just above and behind the shoulder cut, so a hollow ring there
-// reads as a severed sleeve (the FP material is double-sided: you see the
-// inside wall). Cap every boundary loop so the cut is solid shoulder mass.
-//
-// A triangle FAN from one loop vertex is not enough, and this is where the
-// naive version failed: the cut ring is not convex and not planar, so a fan
-// anchored on one of its own vertices throws long blades across the arm. Cap
-// from the loop's CENTROID instead — a new vertex, appended to every
-// attribute — so every triangle stays inside the ring.
-//
-// The ring also has to be found on WELDED positions. The export splits verts
-// along UV seams, so by raw index a single cut ring is several disconnected
-// arcs, each capped separately and none of them closed. Welding by quantized
-// position merges the duplicates (and, as a bonus, makes seam edges count 2
-// so they are correctly not boundary).
-//
-// Winding doesn't matter: the FP material is double-sided.
+// Cap open loops: delete torso → open arm tubes. Camera sees hollow ring
+// (severed sleeve). Fan from ring's CENTROID, not ring vertex (non-planar→long blades).
+// WELD verts by position first (export splits on UV seams), so one ring = one loop.
+// Every attribute grows by centroid count; position gets centroid coords. Double-sided.
 const WELD = 1e4; // position quantum for the weld: 0.1 mm on a 1 u model
 function capOpenLoops(geo: THREE.BufferGeometry): void {
   const index = Array.from(geo.index!.array);
@@ -544,10 +474,8 @@ function capOpenLoops(geo: THREE.BufferGeometry): void {
     return;
   }
 
-  // Append the centroids. Every attribute grows by the same count; the new
-  // vertex inherits its ring's skinning (a cut ring sits inside one bone's
-  // territory by construction — that is how the triangles were selected),
-  // and position is overwritten with the centroid afterwards.
+  // Append centroids to all attributes; inherit skinning from ring's bone,
+  // then overwrite position with centroid coords.
   for (const name of Object.keys(geo.attributes)) {
     const attr = geo.attributes[name] as THREE.BufferAttribute;
     const size = attr.itemSize;
@@ -569,11 +497,8 @@ function capOpenLoops(geo: THREE.BufferGeometry): void {
     geo.setAttribute(name, next);
   }
   geo.setIndex(index);
-  // Two groups, so the cut can carry its own material. The caps are the tail
-  // of the index buffer by construction (they were pushed after the kept
-  // triangles), which is exactly the contiguous range a group needs. Without
-  // this the cut inherits the suit texture through a centroid UV borrowed
-  // from one ring vertex, and smears the atlas into stripes across the hole.
+  // Two groups: cuts (tail of index) carry own material, avoiding atlas smear
+  // through centroid UV (caps were pushed after kept triangles).
   geo.clearGroups();
   geo.addGroup(0, armTris, 0);
   geo.addGroup(armTris, index.length - armTris, 1);
@@ -601,9 +526,8 @@ export function createDiverRig(
   });
 
   if (firstPerson) {
-    // FP renders ONLY the two arms (see buildFpGeometry) — the invisible
-    // torso bones still pose them, so placement is tuned via ARM_POSE_FP and
-    // they keep the subtle swim drift.
+    // FP renders arms only; invisible torso bones pose them. Placement via
+    // ARM_POSE_FP; they keep subtle swim drift.
     let fpMesh: THREE.SkinnedMesh | null = null;
     model.traverse((o) => {
       if ((o as THREE.SkinnedMesh).isSkinnedMesh)
@@ -611,11 +535,8 @@ export function createDiverRig(
     });
     // (skinned mesh always present — same assumption as buildFpGeometry)
     const skin = fpMesh!;
-    // Group 1 is the shoulder cut (capOpenLoops). It gets its own material —
-    // flat, dark, untextured suit lining — because the cap vertices carry a
-    // borrowed UV and would otherwise smear the atlas across the hole. It is
-    // meant to be off screen at every look angle; this is what it looks like
-    // in the frame or two where a hard bank swings it past the lens.
+    // Group 1 = shoulder cut (capOpenLoops): own material to avoid atlas smear
+    // from borrowed UV. Off-screen normally; visible on hard banks.
     const skinMat = skin.material;
     skin.geometry = template.fpGeometry.hands;
     skin.material = [
@@ -677,12 +598,8 @@ export function createDiverRig(
 // swings beneath it). First-person bodies also get the FP_OFFSET cheat.
 function applyRootPose(rig: DiverRig, swayX = 0, swayZ = 0) {
   if (rig.firstPerson) {
-    // Re-read every frame: FP_SCALE is a live tuning knob (configureFpBody),
-    // and the anchor is derived from it — the head has to stay pinned to the
-    // camera whatever the arms are scaled to. The arms are the SAME LENGTH
-    // carrying as not: an arm that grows on pickup pops, and once the body
-    // itself slides forward to meet the load there is nothing left for a
-    // scale change to buy.
+    // Re-read FP_SCALE (live tuning knob). Anchor derives from it; head stays
+    // pinned to camera. Arms don't grow on pickup (body slides forward instead).
     rig.model.scale.setScalar(FP_SCALE);
     rig.anchor.copy(rig.anchorUnit).multiplyScalar(FP_SCALE);
   }
@@ -754,10 +671,8 @@ export function updateDiverRig(
     lookYaw: number;
     lookPitch: number;
     vel: { x: number; y: number; z: number };
-    // Both arms are around the Golden Gouda: hold the carry pose and stop
-    // stroking. True for the local carrier and for every remote diver whose
-    // replicated status carries STATUS.CARRYING, so what you see someone
-    // holding is where the wheel actually is.
+    // Both arms on wheel: hold carry pose, stop stroking. True for local
+    // carrier & remotes with STATUS.CARRYING (replicated state).
     carrying?: boolean;
   },
 ) {
@@ -771,7 +686,10 @@ export function updateDiverRig(
   // is already smoothed), the grip off the carry ease.
   const down = Math.min(
     1,
-    Math.max(0, (-lookPitch - FP_REVEAL_START) / (FP_LOOK_DOWN - FP_REVEAL_START)),
+    Math.max(
+      0,
+      (-lookPitch - FP_REVEAL_START) / (FP_LOOK_DOWN - FP_REVEAL_START),
+    ),
   );
   blendPose(rig.armPose, rig.downPose, down, rig.poseTmp);
   blendPose(rig.poseTmp, rig.carryPose, rig.carrySm, rig.pose);
@@ -816,9 +734,7 @@ export function updateDiverRig(
   const s = Math.sin;
   const kick = 0.15 + 0.75 * effort;
 
-  // Idle water-sway: the body never sits dead still — a slow two-axis
-  // wallow that fades as real swimming takes over. Mostly damped in first
-  // person: it would translate straight into hands bobbing on screen.
+  // Idle sway: slow wallow fading with speed. Damped in FP (prevents hand bob).
   const sway = (1 - 0.6 * effort) * (rig.firstPerson ? 0.12 : 1);
   applyRootPose(
     rig,
@@ -846,16 +762,9 @@ export function updateDiverRig(
     pose(rig, "Spine02", "aX", und * 0.8 * s(c * 0.5 - 1.2));
   }
 
-  // Arms: held forward (this is what the local player sees looking down),
-  // stroking breaststroke-style at half the kick rate. Never fully still:
-  // even at idle they slowly tread the water.
-  // First person keeps the arms NEARLY STATIC — just a faint drift so they
-  // feel alive. They're a stable anchor (think: future tools, a wrist
-  // watch), not an animation showcase; the full strokes are for the
-  // third-person view only.
-  // …and while carrying they barely move at all: a diver hugging a wheel of
-  // cheese is not also swimming with its arms. What is left is a slow settle
-  // against the load, which is what keeps the pose from looking frozen.
+  // Arms: held forward, stroking breaststroke at half kick rate. Always moving (tread).
+  // FP: nearly static (faint drift, stable anchor for future tools).
+  // Carrying: barely move (settle against load keeps pose from freezing).
   const free = 1 - 0.92 * rig.carrySm;
   const arm = (0.25 + 0.85 * effort) * (rig.firstPerson ? 0.06 : 1) * free;
   const sw = s(c * 0.5);
@@ -865,8 +774,6 @@ export function updateDiverRig(
   // pulls itself sideways with its arms (third person only, and not with its
   // hands full).
   const sOff = rig.firstPerson ? 0 : rig.strafeSm * 0.5 * free;
-  // (Signs validated numerically: hands settle below-forward of the eyes,
-  // elbows slightly out — a relaxed prone glide.)
   pose(rig, "L_Upperarm", "aY", -ap.uy + arm * 0.7 * sw + sOff);
   poseAdd(rig, "L_Upperarm", "aX", ap.ux + arm * 0.4 * sw2);
   pose(rig, "R_Upperarm", "aY", ap.uy - arm * 0.7 * sw + sOff);
@@ -888,15 +795,10 @@ export function updateDiverRig(
   poseAdd(rig, "R_Forearm", "aX", ap.fx);
   poseAdd(rig, "R_Forearm", "aZ", ap.fz);
   const handWiggle = (rig.firstPerson ? 0.04 : 0.16) * free;
-  // Three axes, because a hand that is going to CLOSE ON something needs all
-  // three and a hand laid flat needs none of them:
-  //   hx  bends the wrist up/down,
-  //   hy  turns the palms IN toward each other — this is what makes a pair of
-  //       hands read as closed around a load rather than pressed flat on it,
-  //   hz  rolls the palm to face the load, together with the forearm's own
-  //       pronation (fz). Without it the paws meet the wheel BACK-first, with
-  //       the fingers splayed away from the thing they are supposed to hold.
-  // All three are mirrored between the two hands, like uy and fy above.
+  // Three axes (mirrored L/R like uy/fy): hx (wrist bend), hy (palms inward—
+  // read as holding vs. flat), hz (palm roll + forearm pronation). Without hz
+  // paws meet wheel back-first, fingers splayed. Zero for flat hand, all three
+  // for grip.
   pose(rig, "L_Hand", "aX", ap.hx + handWiggle * sw);
   poseAdd(rig, "L_Hand", "aY", -ap.hy);
   poseAdd(rig, "L_Hand", "aZ", -ap.hz);
@@ -909,11 +811,9 @@ export function updateDiverRig(
   if (rig.firstPerson) return;
 
   // --- Head look: EXACT camera sync (the helmet torch mounts here) --------
-  // The body may face somewhere else (lazy swim orientation), so the head
-  // visibly TURNS on the shoulders toward the true look. Relative yaw is
-  // clamped so a big transient look-vs-body gap never owl-cranes the neck;
-  // necks take a soft share of both axes, then the head bone gets solved
-  // exactly so the torch beam leaves along the (clamped) look direction.
+  // Head turns on shoulders toward true look (body may face elsewhere).
+  // Relative yaw clamped to prevent owl-crane. Neck absorbs soft share;
+  // head bone solved exactly so torch beam leaves on clamped look direction.
   let relYaw = Math.atan2(
     Math.sin(lookYaw - bodyYaw),
     Math.cos(lookYaw - bodyYaw),
@@ -932,9 +832,8 @@ export function updateDiverRig(
   rig.headQuat.copy(rig.lookQuat).multiply(rig.headFix);
 
   if (rig.head) {
-    // Accumulate the head's parent world quaternion by hand (unit/uniform
-    // scales throughout, so pure quaternion products are exact) — no
-    // mid-frame matrix updates needed.
+    // Accumulate head's parent world quat via products (no matrix updates,
+    // unit/uniform scales = exact quaternion math).
     _q3.copy(_q1).multiply(rig.root.quaternion).multiply(rig.model.quaternion);
     for (const b of rig.chain) _q3.multiply(b.quaternion);
     rig.head.quaternion.copy(_q3.invert()).multiply(rig.headQuat);

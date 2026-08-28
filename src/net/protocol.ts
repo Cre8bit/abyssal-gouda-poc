@@ -9,8 +9,7 @@
 //   f32  x, y, z
 //   i16  yaw, pitch, swimYaw, swimPitch   (radians wrapped to ±π, ×ANGLE_SCALE)
 
-// What a client BROADCASTS every tick (sy/sp — the lazy swim body — default
-// to yaw/pitch when omitted).
+// State broadcast every tick (sy/sp default to yaw/pitch if omitted).
 export interface PlayerStateOut {
   x: number;
   y: number;
@@ -23,7 +22,7 @@ export interface PlayerStateOut {
   status: number; // 7-bit mask, see effects.ts STATUS
 }
 
-// What decodeState RETURNS — every field present, plus the sequence number.
+// Decoded state with sequence number.
 export interface PlayerStateIn {
   seq: number;
   x: number;
@@ -48,10 +47,7 @@ export function wrapAngle(a: number): number {
   return a;
 }
 
-// `out` (optional): an ArrayBuffer(STATE_PACKET_BYTES) to encode into —
-// callers on a hot path (30 Hz broadcast) pass a scratch buffer to avoid
-// allocating per tick. RTCDataChannel.send copies synchronously, so the
-// scratch can be reused immediately after sending.
+// `out` (optional): scratch buffer (30 Hz hot path; safe to reuse after send).
 export function encodeState(
   s: PlayerStateOut,
   seq: number,

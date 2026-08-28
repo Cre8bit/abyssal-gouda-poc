@@ -1,23 +1,8 @@
-// items.ts — the typed registry for dynamic map objects (light sticks,
-// traps, pickups, the Golden Gouda…). Born in TypeScript on purpose: this is
-// the contract every roadmap feature consumes, so its shapes are enforced,
-// not comment-documented.
-//
-// DESIGN (docs/plan-game-loop.md §2):
-//  - SEEDED items (hazards placed at worldgen) cost zero network — every
-//    client derives them from the seed and spawns with broadcast: false.
-//  - DYNAMIC items (a dropped light stick) replicate as reliable events:
-//    "item+" (spawn), "item-" (remove), "item*" (bulk snapshot for late
-//    joiners). Ids are globally unique without coordination: minted as
-//    "<myPeerId>#<counter>" (or "local#<counter>" before the mesh is up).
-//  - This module owns DATA and dispatch only. Visuals/audio belong to each
-//    kind's handlers (onSpawn/onRemove mount and unmount whatever they
-//    like) — items.ts itself never imports three.js, so the registry stays
-//    portable and worker-safe.
-//
-// The world is a live SDF, so items sitting on cheese can lose their floor
-// to a dig: isSupported() probes the voxel field below an item — kinds that
-// should fall or pop when undermined check it in onUpdate.
+// items.ts — registry for dynamic map objects with per-kind handlers.
+// Seeded items cost zero network (broadcast: false); dynamic items replicate
+// as events (item+, item-, item*). Data and dispatch only; visuals/audio
+// belong to kind handlers. Supports world support checks (isSupported) for
+// items on the live SDF.
 import { worldDistance } from "../world/gouda.ts";
 import { getMyId } from "../net/mesh.ts";
 import { sendEvent, sendEventTo } from "../net/sync.ts";
@@ -30,22 +15,19 @@ export interface ItemInstance {
   x: number;
   y: number;
   z: number;
-  // Kind-specific payload. Replicated verbatim in "item+"/"item*" — keep it
-  // small and JSON-serializable.
+  // Kind-specific payload; keep small and JSON-serializable.
   data: Record<string, unknown>;
 }
 
 export interface ItemKindDef {
   kind: string;
-  // Mount presentation (add meshes/lights to the scene, start sounds).
+  // Mount presentation.
   onSpawn?(item: ItemInstance): void;
-  // Per-frame behavior (burn down a timer, check isSupported, animate).
+  // Per-frame behavior.
   onUpdate?(item: ItemInstance, ctx: FrameContext): void;
-  // An authoritative correction landed for an item we already had: position
-  // and/or payload just changed under us (see applyOne). The Golden Gouda
-  // changing hands is exactly this.
+  // Apply authoritative correction (position/data changed).
   onSync?(item: ItemInstance): void;
-  // Unmount + dispose whatever onSpawn created.
+  // Unmount and dispose.
   onRemove?(item: ItemInstance): void;
 }
 
@@ -65,9 +47,9 @@ function mintId(): string {
 }
 
 export interface SpawnOptions {
-  // Deterministic/replicated spawns pass their own id; local mints one.
+  // Deterministic spawns pass their own id; local mints one.
   id?: string;
-  // false for seeded items (every client derives them) and applied replicas.
+  // false for seeded/replicated items.
   broadcast?: boolean;
 }
 
@@ -95,7 +77,7 @@ export function spawnItem(
   items.set(itemId, item);
   def.onSpawn?.(item);
   if (broadcast) sendEvent({ kind: "item+", it: serialize(item) });
-  return item;
+  return item; // replicated twice → idempotent
 }
 
 export function removeItem(id: string, { broadcast = true } = {}): void {
@@ -114,8 +96,7 @@ export function itemCount(): number {
   return items.size;
 }
 
-// Radius query (e.g. "is a light stick nearby?"). O(n) — fine at POC scale;
-// spatial-index it only when profiling says so.
+// Radius query; O(n) for now.
 export function itemsNear(
   pos: Vec3,
   radius: number,
@@ -133,8 +114,7 @@ export function itemsNear(
   return out;
 }
 
-// Is there solid cheese within `gap` units below the item? The SDF is live —
-// a teammate's dig can carve the floor out from under a placed item.
+// Check if item has floor support (SDF is live).
 export function isSupported(item: ItemInstance, gap = 1.5): boolean {
   return worldDistance(item.x, item.y - gap, item.z) <= 0;
 }
@@ -166,10 +146,7 @@ function applyOne(raw: unknown): void {
   if (!it || typeof it.id !== "string" || typeof it.kind !== "string") return;
   const existing = items.get(it.id);
   if (existing) {
-    // NOT a duplicate to ignore: a row we already hold is an AUTHORITATIVE
-    // CORRECTION. The Gouda is seeded identically on every client (so it
-    // costs zero network) and then MOVES — re-spawning it would tear the
-    // visual down and rebuild it mid-carry, so refresh it in place instead.
+    // Authoritative correction: update in place (e.g., Gouda moved).
     existing.x = it.x;
     existing.y = it.y;
     existing.z = it.z;
@@ -197,25 +174,18 @@ export function applyItemEvent(
   }
 }
 
-// Push ONE item's current truth to every peer. This is the authoritative
-// answer half of the contested-pickup protocol (docs/plan-mvp.md M1.2): the
-// host mutates the item, then calls this, and every client — including the
-// diver whose grab lost the race — converges on the same holder.
+// Broadcast item's state (authoritative answer for contested pickups).
 export function syncItem(id: string): void {
   const item = items.get(id);
   if (item) sendEvent({ kind: "item*", list: [serialize(item)] });
 }
 
-// Ask a peer (in practice: the host) to re-send everything. A joiner that
-// adopts the host's seed REBUILDS its world, and the rebuild clears the item
-// registry — including any snapshot that arrived while it was carving. So
-// once the new world is up, it asks again.
+// Request item snapshot from peer (after world rebuild).
 export function requestItemSnapshotFrom(peerId: string): void {
   sendEventTo(peerId, { kind: "items?" });
 }
 
-// Bring a late joiner up to speed with every live dynamic item (the host
-// calls this from onPeerConnected, right after the seed handshake).
+// Send snapshot of all live items to late joiner.
 export function sendItemSnapshotTo(peerId: string): void {
   if (items.size === 0) return;
   sendEventTo(peerId, {
@@ -224,7 +194,7 @@ export function sendItemSnapshotTo(peerId: string): void {
   });
 }
 
-// Per-frame + reset entry points for the itemsSystem wrapper.
+// System entry points for update and reset.
 export function updateItems(ctx: FrameContext): void {
   for (const item of items.values()) {
     kinds.get(item.kind)?.onUpdate?.(item, ctx);

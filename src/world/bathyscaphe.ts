@@ -30,13 +30,7 @@ const DOOR_EYE = 3.9; // hatch center height above the bell base (group u)
 const BERTH_SPACING = 10; // row of bells along +X, one per diver
 const CABLE_LEN = 320; // fades into the murk above long before it ends
 
-// Fixture anchors, measured off the mesh vertex cloud (group units, AFTER
-// the flip — the hatch faces -Z, model x/z are negated). The chamber
-// interior runs y 2.3 (floor plate) to 5.4 (crown): the cabin lamp hangs
-// just under the crown. The entry beacon sits on the porthole above the
-// doorway (ring center at model (-0.023, 0.716), glass front z 0.321); the
-// sill lamp sits on the big lower porthole under the hatch (ring y
-// 0.085-0.25, glass front z 0.330).
+// Fixture anchor points (measured in group space, post-flip)
 const CABIN_ANCHOR = new THREE.Vector3(0, 5.0, 0);
 const BEACON_ANCHOR = new THREE.Vector3(0.21, 6.44, -2.95);
 const SILL_ANCHOR = new THREE.Vector3(0.03, 1.5, -3.02);
@@ -67,8 +61,7 @@ function glowTexture() {
   return glowMap;
 }
 
-// The shape every consumer of a bell gets back: graphics.js mounts it in
-// game, src/bench/preview.ts drives the same object on the bench.
+// Shared bell visual for game and bench
 export interface BellVisual {
   group: THREE.Group;
   lamp: THREE.PointLight;
@@ -96,10 +89,10 @@ export function createBellVisual(bellScene: THREE.Object3D): BellVisual {
   bellScene.rotation.y = BELL_FLIP;
   group.add(bellScene);
 
-  // Mooring cable, straight up and out of sight.
+  // Mooring cable (same material as bell)
   const cable = new THREE.Mesh(
     new THREE.CylinderGeometry(0.09, 0.09, CABLE_LEN, 6),
-    toonMaterial({ color: 0x2a2f33 }), // same ramp + ink as the bell itself
+    toonMaterial({ color: 0x2a2f33 }),
   );
   cable.position.y = BELL_SCALE + CABLE_LEN / 2;
   group.add(cable);
@@ -121,9 +114,7 @@ export function createBellVisual(bellScene: THREE.Object3D): BellVisual {
   cabinBulb.position.copy(CABIN_ANCHOR).y += 0.15;
   group.add(cabinBulb);
 
-  // Fixture beacons — a bulb the bloom can catch, a halo for the water
-  // scatter, and the light itself: one on the porthole above the hatch, one
-  // on the big lower porthole under the doorstep.
+  // Fixture beacons: light + bulb + halo (porthole top and bottom)
   const makeBeacon = (
     anchor: THREE.Vector3,
     intensity: number,
@@ -164,10 +155,7 @@ export function createBellVisual(bellScene: THREE.Object3D): BellVisual {
     lamp: beacon.light,
     cabin,
     cable,
-    // Frees only what THIS bell created: cable, bulbs, halos, lights. The
-    // GLB clone shares geometry/materials with the loaded template (reused
-    // by the next bell) and the halo map is the shared cached glow texture —
-    // neither is disposed here.
+    // Only dispose bell-specific resources; template and texture are shared
     dispose() {
       cable.geometry.dispose();
       cable.material.dispose();
@@ -226,10 +214,7 @@ function syncBells() {
   berthAll();
 }
 
-// Idempotent: first call loads + mounts, later calls (world rebuilds — the
-// bells survive them, only the spawn moves) just re-berth the row. The
-// divers spawn INSIDE bell 0: its base sinks DOOR_EYE below the spawn so
-// the spawn point sits at hatch eye height.
+// Idempotent loader. Divers spawn at hatch eye height (bell 0 base at spawn - DOOR_EYE)
 export function mountBathyscaphe(scene: THREE.Scene, spawn: Vec3) {
   gameScene = scene;
   berth.set(spawn.x, spawn.y - DOOR_EYE, spawn.z);
@@ -254,27 +239,15 @@ export function updateBathyscaphe(t: number) {
 }
 
 // --- Collision -----------------------------------------------------------
-// The tin is solid to divers: closed below the floor plate and above the
-// crown, an annular wall between — except the hatch doorway. Analytic
-// cylinder maths in bell-local space (the bells sit axis-aligned in the
-// world; the mesh flip is baked into the constants, hatch at local -Z).
-//
-// Dimensions from an axis-out raycast survey of the mesh (NOT the vertex
-// cloud: the tin is double-walled, and the vertex histogram's big shell at
-// r 2.5-3.4 is the OUTER hull + greebles). The chamber the divers see is
-// the inner liner: interior surface r ≈ 1.2-1.5 across the floor-to-crown
-// band, narrowing dome-ward above ~4.6. WALL_RI must match the LINER, or a
-// strafing diver glides through the visible tin and parks inside the wall
-// cavity, stopped only by the hull.
+// Analytic cylinder collision: solid slab (floor + ceil), annular wall
+// (with hatch aperture), bell-local space. WALL_RI must match inner liner
+// or diver clips through visible tin into wall cavity.
 const TIN_TOP = 9; // lid height
 const FLOOR_Y = 2.34; // interior floor plate (solid from the base up to it)
-const CEIL_Y = 5.4; // crown slab starts where the dome narrows past the
-// cylinder approximation (interior crown apex is ~5.6 on the axis)
-const WALL_RI = 1.15; // inner liner surface (raycast min 1.19 for y ≤ 4.4)
-const WALL_RO = 3.1; // outer hull + greebles (hull ~2.5, portholes to ~3.3)
-const DOOR_HALF_W = 1.3; // hatch aperture half-width (jamb faces sit at
-// |x| ≈ 1.35-1.4 at eye height, ~1.3 up at the arch — the doorway spans
-// nearly the whole front of the little chamber)
+const CEIL_Y = 5.4; // crown slab (dome narrows above this)
+const WALL_RI = 1.15; // inner liner surface
+const WALL_RO = 3.1; // outer hull + greebles
+const DOOR_HALF_W = 1.3; // hatch aperture half-width
 
 // Sphere vs solid cylinder slab: minimal axis push. Mutates lp, returns the
 // push normal or null.
@@ -299,14 +272,9 @@ function pushSlab(lp: Vec3, pr: number, y0: number, y1: number): Vec3 | null {
   return { x: nx, y: 0, z: nz };
 }
 
-// Sphere vs the chamber wall annulus (hatch aperture open). Mutates lp.
-// The hatch is a true doorway: inside the aperture only the jamb faces are
-// solid, and the sphere keeps its FULL radius of clearance from them. The
-// old funnel parked the center 0.01 from the jamb plane — the camera sank
-// 0.59 u into the door frame and could slip around its outer corner,
-// walking straight through the wall. Deep in the wall beside the door the
-// minimal push can still be sideways into the aperture, which keeps the
-// doorway forgiving to thread with mouse-look.
+// Sphere vs wall annulus with hatch aperture. Jamb faces remain solid;
+// sphere keeps full radius clearance. Sideways push into aperture keeps
+// doorway forgiving to thread.
 function pushWall(lp: Vec3, pr: number): Vec3 | null {
   if (lp.y <= FLOOR_Y - pr || lp.y >= CEIL_Y + pr) return null; // slabs' turf
   const r = Math.hypot(lp.x, lp.z) || 1e-6;

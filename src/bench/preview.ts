@@ -10,19 +10,9 @@
 // jaw slam reads.)
 //
 // ── ADDING A NEW MODEL (standing rule — see AGENTS.md) ─────────────────────
-// Every model/creature that enters the game MUST get an entry in MODELS
-// below, in the same PR that adds it. An entry is:
-//   { id, label, url, cam: { dist, height, gridY }, build(gltf) }
-// `url` is optional: a model built entirely in code (the Golden Gouda) has
-// no GLB to fetch, and build() is handed null instead of a gltf.
-// build() returns an instance the bench drives:
-//   group           — added to the scene while this model is active
-//   update(dt, t)   — dt is already rate-scaled (0 while paused)
-//   ui(panel, api)  — model-specific controls; api = { button, sliderRow }
-//   focus           — Vector3 the orbit camera tracks (optional)
-//   clips           — { mixer, actions } for baked-clip HUD bars (optional)
-//   action()        — spacebar hook (optional)
-//   lines()/bars()  — HUD text rows / progress bars (optional)
+// Entry: { id, label, url, cam: { dist, height, gridY }, build(gltf) }
+// url optional (code-built models). build() returns:
+//   group, update(dt, t), ui(panel, api), focus, clips, action(), lines(), bars()
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import {
@@ -93,9 +83,7 @@ export interface BenchCamSpec {
 const $ = (id: string) => document.getElementById(id) as HTMLElement;
 const BASE = import.meta.env.BASE_URL;
 
-// Mirrored game constants (module-private at their source, so re-stated
-// here — keep in sync): catfish.js SCALE / lantern moods, graphics.js
-// TORCH_OFFSET / REMOTE_LAMP_INTENSITY.
+// Mirrored game constants — keep in sync with source modules
 const CATFISH_SCALE = 4;
 const LANTERN_BASE: Record<string, number> = {
   lurk: 55,
@@ -105,7 +93,6 @@ const LANTERN_BASE: Record<string, number> = {
 const TORCH_OFFSET = new THREE.Vector3(0, 0.35, -0.14);
 const TORCH_INTENSITY = 190;
 
-// Bone-local axes for overlays parented to a bone (the gouda's bit arrows).
 const BONE_UP = new THREE.Vector3(0, 1, 0);
 const ORIGIN = new THREE.Vector3();
 
@@ -132,13 +119,10 @@ $("stage").appendChild(renderer.domElement);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true;
 controls.dampingFactor = 0.08;
-// Never leave the camera ON the orbit target (degenerate spherical → NaN
-// view while the first model is still downloading).
+// Avoid degenerate orbit while model loads
 camera.position.set(5, 2, 6);
 
-// Enough light to read silhouette and deformation, and no more: models are
-// meant to be legible here, not atmospheric. (The toon materials still band
-// the response into the same 4 steps as in game.)
+// Silhouette-readable lighting (toon: 4 band steps like in game)
 scene.add(new THREE.HemisphereLight(0x8fd0ff, 0x02121c, 0.9));
 const key = new THREE.DirectionalLight(0xbfe4ff, 1.6);
 key.position.set(1, 1.4, 1.2);
@@ -147,8 +131,7 @@ const rim = new THREE.DirectionalLight(0x4f8fb5, 0.9);
 rim.position.set(-1.3, 0.3, -1);
 scene.add(rim);
 
-// A ground grid purely as a motion reference — a creature swimming against
-// an empty background barely looks like it is moving at all.
+// Motion reference: creature motion barely visible without grid
 const grid = new THREE.GridHelper(80, 40, 0x2a5a72, 0x14313f);
 grid.material.transparent = true;
 grid.material.opacity = 0.35;
@@ -209,7 +192,6 @@ function section(parent: HTMLElement, label: string) {
 
 const api = { button, sliderRow, section };
 
-// Radio behavior across a set of buttons.
 function markOn(btns: Record<string, HTMLButtonElement>, active: string) {
   for (const [k, b] of Object.entries(btns))
     b.classList.toggle("on", k === active);
@@ -222,14 +204,13 @@ function loadGltf(url: string) {
   return gltfCache.get(url)!;
 }
 
-// One prepared diver template shared by the third-person and FP entries.
 let diverTemplate: ReturnType<typeof prepareDiverTemplate> | null = null;
 function diverTemplateFrom(gltf: GLTF) {
   diverTemplate ??= prepareDiverTemplate(gltf); // cel pass runs inside prep
   return diverTemplate;
 }
 
-// Soft round glow sprite (same canvas halo the catfish lantern uses in game).
+// Canvas radial gradient sprite for lantern glow
 function glowTexture() {
   const c = document.createElement("canvas");
   c.width = c.height = 64;
@@ -248,15 +229,14 @@ function buildDiver(gltf: GLTF): BenchInstance {
   const template = diverTemplateFrom(gltf);
 
   const group = new THREE.Group();
-  const swim = new THREE.Group(); // travels the path, carries yaw
-  const pivot = new THREE.Group(); // body pitch (graphics.js structure)
+  const swim = new THREE.Group(); // path + yaw
+  const pivot = new THREE.Group(); // pitch
   swim.add(pivot);
   group.add(swim);
   const rig = createDiverRig(template);
   pivot.add(rig.root);
 
-  // Helmet torch, mounted exactly like graphics.js: the light rig lives at
-  // scene level and is pinned to the head's world pose every frame.
+  // Helmet torch: scene-level light pinned to head each frame
   const torch = new THREE.Group();
   const spot = new THREE.SpotLight(
     0xffeec9,
@@ -286,8 +266,7 @@ function buildDiver(gltf: GLTF): BenchInstance {
   const focus = new THREE.Vector3();
   const _v = new THREE.Vector3();
   const _hold = { x: 0, y: 0, z: 0 };
-  // Stand-in for the cargo, at exactly the offset game/cargo.ts hands it —
-  // the point of "carrying" is whether the arms land ON the load.
+  // Cargo at game/cargo.ts offset — tests arm contact
   const cargo = new THREE.Mesh(
     new THREE.SphereGeometry(GOUDA_RADIUS, 16, 12),
     toonMaterial({ color: 0xffc23d, transparent: true, opacity: 0.55 }),
@@ -327,12 +306,11 @@ function buildDiver(gltf: GLTF): BenchInstance {
           Math.cos(t * 0.35) * 0.49 * bob,
           Math.cos(st.angle) * speed,
         );
-        // Game forward is -Z: face the direction of travel.
+        // Face direction of travel (game forward is -Z)
         if (speed > 0.1) st.yaw = Math.atan2(-vel.x, -vel.z);
       }
 
-      // Visual pitch stays level at rest and aligns with travel as speed
-      // picks up — same easing as updateRemoteDiver in graphics.js.
+      // Pitch aligns with travel speed (same easing as graphics.js)
       const vlen = vel.length();
       const swimPitch = vlen > 0.3 ? Math.asin(vel.y / vlen) : 0;
       const align = Math.min(1, vlen / 2.5);
@@ -352,13 +330,12 @@ function buildDiver(gltf: GLTF): BenchInstance {
         vel,
         carrying: st.carrying,
       });
-      // The cargo rides where game/cargo.ts puts it, so the third-person
-      // carry pose can be judged against the real load rather than by eye.
+      // Cargo at game/cargo.ts position — test carry pose
       cargo.visible = st.carrying;
       holdPose(ORIGIN, st.yaw, lookPitch, _hold);
       cargo.position.set(_hold.x, _hold.y, _hold.z).add(swim.position);
 
-      // Torch beam leaves the helmet along the exact look direction.
+      // Torch along look direction
       _v.copy(TORCH_OFFSET).applyQuaternion(rig.lookQuat);
       torch.position.copy(rig.headPos).add(_v);
       torch.quaternion.copy(rig.lookQuat);
@@ -386,7 +363,7 @@ function buildDiver(gltf: GLTF): BenchInstance {
         b.classList.toggle("on", st.carrying);
       });
 
-      // Touching a slider is a request to stop and look → manual mode.
+      // Slider touch → manual mode (stop and look)
       const hold = section(panel, "Hold (manual)").parentElement!;
       sliderRow(hold, "effort", 0, 10, 0.1, 0, (v) => {
         st.speed = v;
@@ -405,11 +382,11 @@ function buildDiver(gltf: GLTF): BenchInstance {
       const note = document.createElement("div");
       note.className = "hint";
       note.textContent =
-        "swim is fully procedural (diverRig.js) — the GLB's baked NlaTrack clip is deliberately unused in game";
+        "Swim is procedural (diverRig.ts); GLB's baked NlaTrack clip unused in game";
       panel.appendChild(note);
     },
     action() {
-      // Space cycles the swim gears.
+      // Space: cycle swim gears (idle → cruise → sprint → idle)
       setMode(
         st.mode === "idle"
           ? "cruise"
@@ -431,9 +408,7 @@ function buildDiver(gltf: GLTF): BenchInstance {
 }
 
 // --- Model: first-person gloves ---------------------------------------------
-// The local player's own body: only the gloves + forearms survive prep
-// (diverRig.js buildFpGeometry). Use "eye cam" to judge their placement at
-// the real in-game FOV.
+// Local player body: gloves + forearms (prep: diverRig.ts buildFpGeometry)
 const AXIS_X = new THREE.Vector3(1, 0, 0);
 const FOV_TAN = Math.tan((72 / 2) * (Math.PI / 180)); // camera vertical FOV
 const ASPECT = 16 / 9; // …the shape the game is actually played at
@@ -449,26 +424,19 @@ function cutVerdict(p: THREE.Vector3): string {
 
 function buildGloves(gltf: GLTF): BenchInstance {
   const template = diverTemplateFrom(gltf);
-  // Same URL knobs as the shot harness (bench/shots.ts): ?m=gloves&uy=…&cfz=…
-  // previews a candidate arm pose here, where the joint readout below can say
-  // in numbers what the screenshot only shows in pixels.
+  // URL params like ?m=gloves&uy=… or console: fpBody({ uy: 0.4, fy: 1.1 })
   applyFpBodyParams(new URLSearchParams(location.search));
-  // …and the same knobs live from the console (or a headless driver), so a
-  // pose can be SOLVED against the readout instead of reloaded one guess at a
-  // time: fpBody({ uy: 0.4, fy: 1.1 }). Bench page only.
   window.fpBody = configureFpBody;
 
   const group = new THREE.Group();
   const pivot = new THREE.Group();
   group.add(pivot);
   const rig = createDiverRig(template, { firstPerson: true });
-  // Same material treatment as the game's local body (createLocalBody):
-  // double-sided sleeves, suit darkened below world albedo.
+  // Same material as game local body: double-sided, darkened suit
   rig.root.traverse((o) => {
     if (!(o as THREE.Mesh).isMesh) return;
     const mesh = o as THREE.Mesh;
-    // The arms carry two materials (suit + the shoulder cut's lining), so
-    // map over whatever is there rather than assuming a single material.
+    // Arms may have 2 materials (suit + cut lining) — iterate all
     const dress = (m: THREE.Material) => {
       const c = m.clone() as THREE.Material & { color?: THREE.Color };
       c.side = THREE.DoubleSide;
@@ -484,10 +452,7 @@ function buildGloves(gltf: GLTF): BenchInstance {
   const st = { pitch: 0, speed: 0, eyeCam: false, carrying: false };
   const vel = new THREE.Vector3();
   const focus = new THREE.Vector3(0, -0.3, -0.6);
-  // The cargo, at the FIRST-PERSON framing offset (game/cargo.ts FP_HOLD_*,
-  // which is where the carrier's own camera draws it). It hangs off the
-  // same pivot as the body because while carrying the FP anchor tracks the
-  // look exactly (fpBodyPitch) — which is the only reason the grip can hold.
+  // Cargo at FP_HOLD offset; pivot-locked for carry pose (fpBodyPitch)
   const cargo = new THREE.Mesh(
     new THREE.SphereGeometry(GOUDA_RADIUS, 16, 12),
     toonMaterial({ color: 0xffc23d }),
@@ -496,15 +461,11 @@ function buildGloves(gltf: GLTF): BenchInstance {
   cargo.visible = false;
   pivot.add(cargo);
 
-  // The three joints whose position in CAMERA space is the whole argument
-  // (see the readout below): the shoulder carries the FP geometry's only cut,
-  // the wrist is what the player is meant to see at the bottom of the frame.
+  // Joint camera-space positions: shoulder (cut), wrist (frame edge)
   const shoulder = rig.bones.get("R_Upperarm");
   const elbow = rig.bones.get("R_Forearm");
   const wrist = rig.bones.get("R_Hand");
-  // Bench `group` sits at the origin unrotated, so world space IS the eye's
-  // parent space; undoing the look pitch gives camera space. (Each caller
-  // gets its own vector — the readout holds two of them at once.)
+  // Camera space: undo look pitch from world position
   const camSpace = (o: THREE.Object3D | undefined, out: THREE.Vector3) => {
     if (!o) return null;
     o.getWorldPosition(out);
@@ -513,12 +474,7 @@ function buildGloves(gltf: GLTF): BenchInstance {
   const _shoulderPos = new THREE.Vector3();
   const _elbowPos = new THREE.Vector3();
   const _wristPos = new THREE.Vector3();
-  // Which way the FINGERS point. The rig has no finger bones (the paw is one
-  // bone with the digits modelled in), so take the rest pose's forearm→paw
-  // direction into the wrist's own frame once, and it can be read back at any
-  // pose. A pair of hands that are in the right PLACE with the wrong AIM is
-  // the whole difference between holding a wheel of cheese and surrendering
-  // to it, and it is not something a joint position can tell you.
+  // Paw aim: rest-pose forearm→hand direction, transformed to wrist frame
   const _pawAxis = new THREE.Vector3(0, 0, -1);
   const _q = new THREE.Quaternion();
   if (elbow && wrist) {
@@ -534,10 +490,9 @@ function buildGloves(gltf: GLTF): BenchInstance {
   const inst: BenchInstance = {
     group,
     focus,
-    camLocked: false, // eye cam: stop the orbit auto-spin fighting the view
+    camLocked: false,
     update(dt: number) {
-      // Screen-anchored FPS-style: the invisible body pitches with the
-      // camera via FP_VIEW — identical math to updateLocalBody.
+      // FPS body pitch synchronized with camera look
       const bodyPitch = fpBodyPitch(st.pitch);
       pivot.rotation.x = bodyPitch;
       vel.set(0, 0, -st.speed);
@@ -550,7 +505,7 @@ function buildGloves(gltf: GLTF): BenchInstance {
         carrying: st.carrying,
       });
       cargo.visible = st.carrying;
-      // In eye cam the follow-lerp must chase the look target, not the rig.
+      // Eye cam: follow-lerp chases look target, not rig
       if (st.eyeCam) focus.set(0, Math.tan(-st.pitch) * 4, -4);
       else focus.set(0, -0.3, -0.6);
     },
@@ -563,8 +518,7 @@ function buildGloves(gltf: GLTF): BenchInstance {
         camera.fov = st.eyeCam ? 72 : 52;
         camera.updateProjectionMatrix();
         if (st.eyeCam) {
-          // Park the orbit rig at the player's eyes, looking level -Z: what
-          // the frame bottom shows here is what the player sees in game.
+          // Orbit camera at eye level, -Z view matches in-game
           camera.position.set(0, 0, 0.02);
           controls.target.set(0, Math.tan(-st.pitch) * 4, -4);
         } else {
@@ -584,10 +538,8 @@ function buildGloves(gltf: GLTF): BenchInstance {
       const note = document.createElement("div");
       note.className = "hint";
       note.textContent =
-        "placement is tuned via configureFpBody() URL params in the shot " +
-        'harness (bench/shots.ts). "carrying" shows the Golden Gouda where ' +
-        "game/cargo.ts rides it, plus the carry pose the arms blend into — " +
-        "the arms have to land ON the wheel at every look pitch";
+        "Pose tuned via configureFpBody() URL params (bench/shots.ts). Carrying " +
+        "shows cargo at game/cargo.ts offset + carry pose blend—arms must contact wheel at every pitch";
       panel.appendChild(note);
     },
     lines: () => {
@@ -601,25 +553,19 @@ function buildGloves(gltf: GLTF): BenchInstance {
             .applyAxisAngle(AXIS_X, -st.pitch)
         : null;
       const wr = camSpace(wrist, _wristPos);
-      // Half-height of the frame at the wrist's depth, for a 72° vertical
-      // FOV: |y| past this and the paw is off the bottom of the screen.
-      const edge = wr ? Math.abs(wr.z) * Math.tan((72 / 2) * (Math.PI / 180)) : 0;
+      // Frame edge at wrist depth (72° FOV)
+      const edge = wr
+        ? Math.abs(wr.z) * Math.tan((72 / 2) * (Math.PI / 180))
+        : 0;
       return [
-        // POSITIVE = behind the lens, which is the only safe place for it:
-        // the shoulder carries the FP geometry's cut and the body is rigidly
-        // camera-locked, so this number is the same at every look angle.
+        // Position in camera space (positive = behind lens)
         [
           "shoulder (cam)",
           sh ? `${sh.x.toFixed(2)} ${sh.y.toFixed(2)} ${shZ.toFixed(2)}` : "—",
         ],
-        // The verdict that matters: the cut must be UNSEEABLE. Behind the
-        // lens is the strong version (true at every look angle, because the
-        // FP body is rigidly camera-locked) — but off the bottom or the side
-        // of the frustum counts too, and that is how the carry pose gets away
-        // with shoulders shoved forward into the load.
+        // Cut must be unseeable (behind lens or off frustum)
         ["cut vs frame", sh ? cutVerdict(sh) : "—"],
-        // Where the paw is, in front of the eye, and where the bottom of the
-        // frame is at that same depth. y just under edge = a sliver of glove.
+        // Wrist position and frame edge at that depth
         [
           "wrist (cam)",
           wr ? `${wr.x.toFixed(2)} ${wr.y.toFixed(2)} ${wr.z.toFixed(2)}` : "—",
@@ -648,10 +594,9 @@ function buildGloves(gltf: GLTF): BenchInstance {
 }
 
 // --- Model: lantern-catfish ---------------------------------------------------
-// Baked clips (swim / bite / flicker) exactly as catfish.js plays them, plus
-// the lantern light logic so each mood can be judged with its clip.
+// Baked clips (swim/bite/flicker) + lantern mood logic from catfish.ts
 function buildCatfish(gltf: GLTF): BenchInstance {
-  const root = prepareCatfishTemplate(gltf).scene; // same cel pass as in game
+  const root = prepareCatfishTemplate(gltf).scene;
   root.scale.setScalar(CATFISH_SCALE);
 
   const group = new THREE.Group();
@@ -659,7 +604,7 @@ function buildCatfish(gltf: GLTF): BenchInstance {
   swim.add(root);
   group.add(swim);
 
-  // Lantern: bulb bone + light + halo, same lookup as catfish.js spawnOne.
+  // Lantern: bulb bone + light + halo (same as catfish.ts spawnOne)
   let bulb: THREE.Object3D | null = null;
   root.traverse((o) => {
     const n = (o.name || "").toLowerCase();
@@ -682,7 +627,7 @@ function buildCatfish(gltf: GLTF): BenchInstance {
   light.position.set(0, 0.05, 0);
   glow.position.set(0, 0.05, 0);
 
-  // The three baked clips, wired like catfish.js spawnOne.
+  // Baked animation clips (swim, flicker, bite)
   const mixer = new THREE.AnimationMixer(root);
   const actions = new Map<string, THREE.AnimationAction>();
   for (const c of gltf.animations) actions.set(c.name, mixer.clipAction(c));
@@ -752,12 +697,11 @@ function buildCatfish(gltf: GLTF): BenchInstance {
       if (swimAct) swimAct.timeScale = st.rate;
       mixer.update(dt);
 
-      // Auto-replay so the bench never sits on a finished bite.
+      // Auto-replay bite
       st.biteTimer += dt;
       if (st.biteLoop && st.biteTimer > 2.6) triggerBite();
 
-      // Lantern mood — the exact intensity/jitter recipe from catfish.js,
-      // with a strike flare riding any playing bite.
+      // Lantern mood: intensity/jitter recipe + strike flare
       const striking = bite?.isRunning() ?? false;
       const mood = striking ? "strike" : st.mood;
       const jitter =
@@ -828,11 +772,7 @@ function buildCatfish(gltf: GLTF): BenchInstance {
 }
 
 // --- Model: tin bell (bathyscaphe) --------------------------------------------
-// Static prop: the diving bell berthed at the spawn point (T0.4). No clips —
-// the whole builder (scale, hatch flip, cable, cabin lamp + breathing entry
-// beacon) is the game's real bathyscaphe.js code; the bench just lets you
-// orbit it and toggle the parts. The O₂ recharge zone it marks is main.js
-// logic, not part of the model.
+// Prop: berthed bell + cabin lamps, entry beacon. No animation; uses bathyscaphe.ts builder.
 function buildBell(gltf: GLTF): BenchInstance {
   const bell = createBellVisual(gltf.scene);
 
@@ -858,7 +798,7 @@ function buildBell(gltf: GLTF): BenchInstance {
       panel.appendChild(note);
     },
     action() {
-      // Space toggles the lamp — quickest way to judge the wash on the grid.
+      // Space: toggle lamp (visual feedback on grid)
       bell.setLamp(!bell.isLampOn());
     },
     lines: () => [
@@ -869,31 +809,13 @@ function buildBell(gltf: GLTF): BenchInstance {
 }
 
 // --- Model: the Golden Gouda ---------------------------------------------------
-// This is the ONLY place you can actually look at the wheel without playing a
-// whole run to its cavern. Two things to judge here.
-//
-// The lights: the near lamp has to read as a room light rather than a sun, and
-// the long glow has to still be faintly visible at tunnel-mouth distance (the
-// only hint the map gives).
-//
-// The levitation: golden_gouda.glb ships a real skin — 7 bones weighted one
-// per floating cheese bit, plus Blender's `neutral_bone` holding the wheel
-// itself (see the rig notes in entities/goldenGouda.ts). The bits ARE bones
-// here, so this is where you check the rig survived its last export:
-// prepareGoudaTemplate() measures it and the bit count below is how many bit
-// bones actually own geometry, so a re-export that drops or renames a bone
-// shows up here first. "lift" scrubs the travel live — the bits have to
-// breathe out of their own sockets and back in, and never so far that they
-// read as debris that fell off.
-//
-// The grid doubles as a ruler: PLAYER_RADIUS is 0.6 and a rat diver is about
-// 1.3 u tall, so the wheel should look like an armful, not a boulder.
+// Cargo wheel: cel-shaded body + 7 levitating bit bones. Test lights and levitation.
+// Wheel radius ~1.3m (fits in diver arm reach). Use "bones" to debug bit armature.
 function buildGouda(gltf: GLTF | null): BenchInstance {
   const gouda = createGoudaVisual(gltf ? prepareGoudaTemplate(gltf) : null);
   let held = false;
 
-  // A stand-in diver at the hold offset: the point of "held" mode is whether
-  // the wheel sits in front of a body without the bits clipping through it.
+  // Diver stand-in at cargo hold offset (test carry pose)
   const stand = new THREE.Mesh(
     new THREE.CapsuleGeometry(0.6, 0.7, 6, 12),
     toonMaterial({ color: 0x2b4756, transparent: true, opacity: 0.5 }),
@@ -902,12 +824,7 @@ function buildGouda(gltf: GLTF | null): BenchInstance {
   stand.visible = false;
   gouda.group.add(stand);
 
-  // The rig, drawn: one arrow per bit bone, parented TO the bone and pointing
-  // along its own +Y — the axis that bit rides out on. Parented rather than
-  // placed, so each arrow inherits the bone's real animated transform: the
-  // arrows spin with the wheel, breathe out with their bit, and pick up the
-  // wobble, which is the whole thing you want to look at. Lengths are quoted
-  // in world u and divided into bone units (bones live in model space).
+  // Bone arrows: parented to bit bones, follow animated transform
   let bonesOn = false;
   const markers: THREE.ArrowHelper[] = [];
   const s = gouda.scale;
@@ -1066,7 +983,8 @@ async function activate(def: BenchModelDef) {
       return;
     }
   }
-  // A slow click-race: only mount if we're still the requested model.
+  // Slow click-race: only mount if still requested model
+  if (ACTIVE_DEF !== def) return;
   if (ACTIVE_DEF !== def) return;
 
   const inst = instances.get(def.id)!;
@@ -1098,15 +1016,14 @@ function applyWire() {
   ACTIVE?.group.traverse((o) => {
     const m = o as THREE.Mesh;
     if (!m.isMesh && !(o as THREE.SkinnedMesh).isSkinnedMesh) return;
-    // One mesh can carry several materials (the golden gouda's wheel draws its
-    // cel-shaded body and its unlit bits as two geometry groups), so walk the
-    // array — assigning through it would set a dead property on the Array.
+    // Multi-material meshes (e.g. gouda: body+bits) — wireframe all
     for (const mat of Array.isArray(m.material) ? m.material : [m.material])
       (mat as THREE.MeshStandardMaterial).wireframe = wire;
   });
 }
 
 // --- Global UI ---------------------------------------------------------------
+// Model selector buttons; pause/resume; global animation rate slider; toggles
 const modelBtns: Record<string, HTMLButtonElement> = {};
 for (const def of MODELS) {
   modelBtns[def.id] = button($("models"), def.label, () => activate(def));
@@ -1156,7 +1073,7 @@ toggle(
   (on) => {
     scene.fog = on ? new THREE.FogExp2(WATER, 0.018) : null;
     scene.background = new THREE.Color(on ? WATER : 0x070d12);
-    // Fog is a compile-time define: every cached material needs a rebuild.
+    // Fog is compile-time define; materials cached without it need rebuild
     scene.traverse((o) => {
       const mat = (o as THREE.Mesh).material as THREE.Material | undefined;
       if (mat && "fog" in mat) {
@@ -1184,6 +1101,7 @@ addEventListener("resize", () => {
 });
 
 // --- HUD -----------------------------------------------------------------------
+// Readout: bone count, tri count, model-specific live stats + progress bars
 let hudLines: HTMLElement[] = [];
 let hudBars: HTMLElement[] = [];
 function buildHud(inst: BenchInstance) {
@@ -1192,7 +1110,7 @@ function buildHud(inst: BenchInstance) {
   hudLines = [];
   hudBars = [];
 
-  // Static stats: what is this model made of?
+  // Static: bone/triangle count from the active model
   let bones = 0;
   let tris = 0;
   inst.group.traverse((o) => {
@@ -1234,7 +1152,7 @@ let hudTimer = 0;
 function readout() {
   if (!ACTIVE) return;
   hudTimer += 1;
-  if (hudTimer % 3) return; // 20 Hz is plenty for text
+  if (hudTimer % 3) return; // 20 Hz refresh for text
   ACTIVE.lines?.().forEach(([, v], i) => {
     if (hudLines[i]) hudLines[i].textContent = v;
   });
@@ -1245,11 +1163,11 @@ function readout() {
 }
 
 // --- Loop ------------------------------------------------------------------------
+// Main animation frame loop: update models, sync camera, refresh HUD
 const clock = new THREE.Clock();
 let elapsed = 0;
 
-// Deep link: /preview.html?m=catfish opens straight on that model (also how
-// the screenshot runner captures the bench headlessly).
+// Deep link: ?m=id opens on that model (used by screenshot runner too)
 const startId = new URLSearchParams(location.search).get("m");
 activate(MODELS.find((m) => m.id === startId) ?? MODELS[0]);
 
@@ -1260,7 +1178,7 @@ renderer.setAnimationLoop(() => {
 
   ACTIVE?.update(dt, elapsed);
 
-  // Follow the animal — some of them swim a long way.
+  // Camera follows focus point (lerp; some models swim far)
   if (ACTIVE?.focus) controls.target.lerp(ACTIVE.focus, 1 - Math.exp(-2 * raw));
   controls.autoRotate = spin && !ACTIVE?.camLocked;
   controls.autoRotateSpeed = 0.6;

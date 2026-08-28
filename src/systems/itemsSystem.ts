@@ -18,8 +18,7 @@ export function createItemsSystem(): GameSystem {
       updateItems(ctx);
     },
     onEvent(fromPeerId, kind, data) {
-      // "items?" is the only inbound kind that asks for something back: a
-      // peer rebuilt its world and lost the registry (see items.ts).
+      // "items?" asks for snapshot; peer rebuilt world.
       if (kind === "items?") sendItemSnapshotTo(fromPeerId);
       else applyItemEvent(kind, data);
     },

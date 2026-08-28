@@ -171,16 +171,13 @@ const winOverlay = el("win-overlay");
 const winSub = el("win-sub");
 const carryPrompt = el("carry-prompt");
 
-// Network events arrive as loose GameEvent records — each handled kind
-// trusts its payload shape exactly as the JS did (same-version peers).
-// The carve shape is shared with state.ts — mid-build digs are queued there.
+// Network events trusted as-is (same-version peers). Dig shape shared with state.ts.
 type DigEvent = SphereDig;
 interface SeedEvent {
   seed: number;
   d?: number;
 }
 
-// PeerJS errors carry .type; DOM/JS errors carry .message — show whichever.
 function errMsg(err: unknown): string {
   const e = err as { message?: string; type?: string } | null;
   return e?.message ?? e?.type ?? String(err);
@@ -193,8 +190,7 @@ const canvas = initGraphics(el("scene-container"));
 initInput();
 initMouseLook(canvas);
 
-// Simulation systems, in explicit execution order (see systems/types.ts):
-// the loop runs them in ONE slot — after input smoothing, before physics.
+// Simulation systems in order (see systems/types.ts): one slot after input, before physics.
 registerSystem(createEffectsSystem()); // 10 — expire timed statuses
 registerSystem(createOxygenSystem({ o2Fill, o2Bar })); // 20 — drain + HUD
 const cargoSys = registerSystem(
@@ -222,17 +218,14 @@ const catfishSys = registerSystem(
 ); // 30
 registerSystem(createItemsSystem()); // 40 — dynamic map objects
 
-// Procedural abyss soundscape — must boot inside a user gesture, so hook
-// every plausible first interaction (idempotent).
+// Init procedural soundscape inside user gesture (idempotent).
 for (const evt of ["pointerdown", "keydown"]) {
   window.addEventListener(evt, () => initAbyssAudio(), { passive: true });
 }
-// The regulator's exhale releases a visible bubble cluster at the helmet.
 setExhaleListener(() => emitBreath(4 + ((Math.random() * 3) | 0)));
 
 // --- World generation, with a loading screen ---
-// Every game gets its own seed: from the URL if present (invite links carry
-// it), otherwise random. The host's seed wins — joiners rebuild on mismatch.
+// Seed from URL or random; host's seed is authoritative.
 const bootParams = new URLSearchParams(location.search);
 {
   let seed = Number.parseInt(bootParams.get("seed") ?? "", 10);
@@ -249,8 +242,7 @@ const loaderFill = el("loader-fill");
 const loaderLabel = el("loader-label");
 
 async function buildWorld(rebuild = false) {
-  // Fresh-world slate: motion, interpolation history (state.ts) + every
-  // system's own residue — statuses, oxygen, the old school, items.
+  // Fresh world: clear motion, history, systems' state (statuses, oxygen, items).
   resetGameState();
   resetSystems();
   loaderEl.classList.remove("done");
@@ -260,38 +252,29 @@ async function buildWorld(rebuild = false) {
   };
   const build = rebuild ? rebuildWorld : loadWorld;
   await build(progress, { seed: game.seed, difficulty: game.difficulty });
-  // Spawn at the drift's edge, the whole glowing system in view (-Z).
-  // This is also the O₂ recharge zone — the bathyscaphe berth.
+  // Spawn at drift edge (O₂ recharge zone, bathyscaphe berth).
   placeAtSpawn(getSpawnPoint());
   refillOxygen();
   game.worldReady = true;
-  // Replay carves that landed during the build — geometry only: the burst and
-  // the thump belong to a moment that has already passed (and to a position
-  // the diver was nowhere near, since we were still on the loading screen).
+  // Replay pending digs (geometry only; audio/position already gone).
   for (const d of game.pendingDigs) digAt(d.x, d.y, d.z, d.r ?? DIG_RADIUS);
   game.pendingDigs.length = 0;
   loaderEl.classList.add("done");
 
-  // Release the lantern-catfish (host/solo simulate; joiners get puppets
-  // rebuilt from the authority's first fish-state broadcast).
+  // Spawn catfish (host simulates, joiners get puppets).
   catfishSys.spawn(game.difficulty);
-  // Seed the Golden Gouda into its cavern. Same seed → same hiding place on
-  // every client, so placing it costs nothing on the wire (M1.2).
+  // Spawn Gouda (seeded → same place, free on wire).
   cargoSys.spawn();
-  // …but a REBUILD wiped the registry, so anything that has already moved
-  // (the wheel is in someone's arms, a light stick was dropped) has to come
-  // back from the host.
+  // Rebuild: request live items from host.
   const hostId = getHostId();
   if (hostId) requestItemSnapshotFrom(hostId);
 }
-// Headless screenshot mode (?shot=<name>, see shots.js + tools/runner.mjs):
-// once the world is up, skip the menu and pin the player to the vantage point.
+// Headless screenshot mode (?shot=<name>): skip menu, pin vantage.
 const shotConfig = getShotConfig();
 buildWorld().then(() => {
   if (shotConfig) applyShot(shotConfig, teleportLocal, game.localPosition);
 });
 
-// --- UI handlers ---
 hostBtn.addEventListener("click", async () => {
   showStatus("Creating game…");
   try {
@@ -314,8 +297,7 @@ hostBtn.addEventListener("click", async () => {
   }
 });
 
-// Invite link: open it in another window/device to auto-join this game.
-// Includes the signaling mode so the joiner uses the SAME server as the host.
+// Invite link with signaling mode for server consistency.
 function inviteUrl() {
   return `${location.origin}${location.pathname}?join=${encodeURIComponent(game.hostedId ?? "")}&s=${getSignalingMode()}&seed=${game.seed}&d=${game.difficulty}`;
 }
@@ -332,8 +314,7 @@ copyLinkBtn.addEventListener("click", async () => {
   setTimeout(() => (copyLinkBtn.textContent = "📋 Copy invite link"), 2000);
 });
 
-// Compact stand-in for the copy-link button once the status panel is gone
-// (a diver has joined) — still lets the host share the link for more peers.
+// Compact link button after first peer joins.
 miniCopyLinkBtn.addEventListener("click", async () => {
   try {
     await navigator.clipboard.writeText(inviteUrl());
@@ -363,10 +344,7 @@ async function join(hostId: string, mode: SignalingMode | null = null) {
   }
 }
 
-// initVoice needs the Peer object, which only exists after joinGame() starts
-// creating it — but incoming calls can race us. Poll briefly until it's up,
-// with a cap: if the join failed, the peer never appears and an uncapped
-// poll would spin forever.
+// Poll for Peer with cap (race condition: calls arrive before join finishes).
 function initVoiceEarly() {
   let tries = 0;
   const tryInit = () => {
@@ -413,16 +391,12 @@ window.addEventListener("keydown", (e) => {
   } else if (e.code === "KeyV") {
     toggleMute();
   } else if (e.code === "KeyE") {
-    // One contextual verb: the Gouda first (lift it, or hand it over), the
-    // pickaxe otherwise. They can never both apply — you cannot dig with
-    // both arms full, which is exactly why the wheel gets first refusal.
+    // E key: Gouda first (can't dig with both arms full), then pickaxe.
     if (!cargoSys.use()) tryDig();
   }
 });
 
-// --- Dig tool: carve a sphere out of whatever cheese you're aiming at. ---
-// The world is a live SDF: digAt() edits the chunk's cached voxel field and
-// re-runs marching cubes on just that chunk — collision follows exactly.
+// Dig tool: SDF edits chunk voxels + marching cubes; collision tracks.
 let lastDigAt = 0;
 function tryDig() {
   if (!game.worldReady || isDead()) return;
@@ -456,12 +430,7 @@ function tryDig() {
   }
 }
 
-// --- TEMPORARY playtest aid: jump straight to the Golden Gouda -------------
-// Same spirit as SHOW_GOUDA_BEARING below: it deliberately breaks register D4
-// (the wheel is hidden and found by searching, never handed to you) so a
-// tester can reach the cargo without digging the whole labyrinth first.
-// Remove the button (index.html + style.css) and this handler once testing
-// no longer needs the shortcut.
+// TEMPORARY: Jump to Gouda (playtest aid). Breaks D4 (hidden wheel).
 function teleportToGouda() {
   if (!game.worldReady) return;
   // The live item position once it exists (it moves as soon as anyone
@@ -489,11 +458,7 @@ function teleportLocal(x: number, y: number, z: number) {
   broadcastNow();
 }
 
-// Immediate state broadcast — used on discrete changes (light toggled,
-// status flag flipped, teleport) so peers see them well under 100 ms
-// instead of waiting for the next 30 Hz tick.
-// One reused state object: broadcastState() encodes it synchronously, and
-// this runs 30×/s — no need to allocate a fresh literal every tick.
+// Immediate broadcast for discrete changes. Reused state object (no alloc per tick).
 const netState: PlayerStateOut = {
   x: 0,
   y: 0,
@@ -525,10 +490,7 @@ function broadcastNow() {
 // Any local status change (trapped, poisoned…) ships instantly (T0.2 AC).
 onLocalStatusChange(() => broadcastNow());
 
-// --- Network callbacks ---
-// Mesh: `initiator` is true when WE dialed this peer (we joined after them),
-// in which case we also place the voice call — the other side just answers.
-// Result: every pair gets exactly one data link and one voice call.
+// Initiator: we dialed this peer (one data + voice call per pair).
 onPeerConnected((peerId, { initiator }) => {
   addPlayer(peerId, REMOTE_COLOR);
   game.remoteBuffers.set(peerId, new SnapshotBuffer());
@@ -538,8 +500,6 @@ onPeerConnected((peerId, { initiator }) => {
     if (peer) callPeer(peer, peerId);
   }
   if (game.hostedId) {
-    // The host's map is the authoritative one: tell the newcomer our seed,
-    // then every live dynamic item (light sticks, drops…).
     sendEventTo(peerId, { kind: "seed", seed: game.seed, d: game.difficulty });
     sendItemSnapshotTo(peerId);
   }
@@ -563,30 +523,24 @@ onPeerDisconnected((peerId) => {
   showStatus("Diver disconnected.");
 });
 
-// Buffer remote state for interpolation — never applied directly.
-// (Flashlight + status are applied instantly: flags don't interpolate.)
+// Buffer for interpolation. Flags (light, status) applied instantly.
 onStateReceived((peerId, { x, y, z, yaw, pitch, light, sy, sp, status }) => {
   game.remoteBuffers.get(peerId)?.push({ x, y, z, yaw, pitch, sy, sp });
   setPlayerLight(peerId, light !== false);
   if (status !== undefined) {
     setPeerStatus(peerId, status);
-    // Their rig wraps both arms around the wheel while this bit is set — the
-    // exterior half of the carry animation (the first-person half rides the
-    // local body's own status, in updateLocalPlayer above).
+    // Exterior carry animation (FP half on local body status).
     setPlayerCarrying(peerId, (status & STATUS.CARRYING) !== 0);
   }
 });
 
 onEventReceived((peerId, data) => {
-  // Systems first (fish states, item replication…) — the registry routes by
-  // declared kind. What remains is world/orchestrator business.
+  // Route by kind; world/orchestrator handles remainder.
   if (dispatchSystemEvent(peerId, data.kind, data)) return;
   if (data.kind === "dig") {
-    // Teammate dug somewhere: apply the same carve locally.
     const d = data as unknown as DigEvent;
     if (!game.worldReady) {
-      // Mid-carve: digAt() would only reach the chunks built so far and the
-      // rest would come out of the oven unbroken. Replay it after the build.
+      // Queue mid-build digs; replay after build completes.
       game.pendingDigs.push(d);
       return;
     }
@@ -613,7 +567,6 @@ onEventReceived((peerId, data) => {
   }
 });
 
-// --- Voice status indicator ---
 onVoiceStatus((state) => {
   const labels: Record<string, string> = {
     connecting: "VOICE · connecting…",
@@ -626,11 +579,8 @@ onVoiceStatus((state) => {
   voiceText.textContent = labels[state] ?? "";
 });
 
-// --- Game loop ---
-// Frame order is fixed: input smoothing → systems (effects/oxygen/catfish/
-// items, sorted by their `order`) → physics → camera/body → audio → network
-// broadcast → remote interpolation → HUD.
-// Scratch objects for the per-frame math below — the loop must not allocate.
+// Game loop: order is fixed — input → systems → physics → camera/body → audio → net → interp → HUD.
+// Scratch objects (no allocation per frame).
 const ZERO_MOVE = Object.freeze({ x: 0, y: 0, z: 0 });
 const _fwd = { x: 0, y: 0, z: 0 };
 const _right = { x: 0, z: 0 };
@@ -641,25 +591,20 @@ let networkTimer = 0;
 let hudTimer = 0; // slow HUD refresh (ping, peer statuses)
 let cameraRoll = 0; // eased bank angle while turning
 renderLoop((delta) => {
-  if (!game.worldReady) return; // still carving the labyrinth
+  if (!game.worldReady) return;
   const pos = game.localPosition;
   const vel = game.velocity;
 
-  // 1. Smooth the camera look toward the mouse target.
   updateLook(delta);
   const yaw = getYaw();
   const pitch = getPitch();
 
-  // 2. Simulation systems, in their declared order.
   frameCtx.dt = delta;
   frameCtx.now = performance.now();
   frameCtx.connected = isConnected();
   updateSystems(frameCtx);
 
-  // 3. Desired velocity — along the lazy BODY orientation, not the raw look.
-  // The body trails the head, so glancing around mid-swim doesn't zigzag
-  // your trajectory; hold a direction and the body settles onto it.
-  // A blacked-out diver drifts, limp — no propulsion.
+  // Desired velocity along lazy body orientation (not raw look). Dead divers drift.
   const move = isDead() ? ZERO_MOVE : getMovement();
   const swimYaw = getSwimYaw();
   const swimPitch = getSwimPitch();
@@ -670,10 +615,7 @@ renderLoop((delta) => {
   _right.x = Math.cos(swimYaw);
   _right.z = -Math.sin(swimYaw);
 
-  // Hauling the Golden Gouda: a lower cap and a constant pull downward
-  // (G3). The sink is applied to the TARGET velocity, so swimming up still
-  // works — you just have to keep doing it, and the moment you stop kicking
-  // the abyss starts taking it back down (D3: home is up).
+  // Carry: lower cap, downward pull (sink vs buoyancy).
   const carrying = hasLocalStatus(STATUS.CARRYING);
   const baseCap = carrying ? carrySpeedCap(MAX_SPEED) : MAX_SPEED;
   const speedCap = baseCap * (isSprinting() ? SPRINT_MULT : 1);
@@ -688,10 +630,7 @@ renderLoop((delta) => {
   vel.y += (_target.y - vel.y) * k;
   vel.z += (_target.z - vel.z) * k;
 
-  // Move + collide in substeps of at most ~0.5 u: a stall frame (delta
-  // clamped at 0.1 s) while sprinting covers 1.9 u — farther than the bell
-  // wall is thick — and a single end-of-frame resolve would tunnel straight
-  // through it. At normal framerates this stays a single step.
+  // Substep at ~0.5u to prevent tunnel clipping on sprints.
   const frameDist = Math.hypot(vel.x, vel.y, vel.z) * delta;
   const steps = Math.min(4, Math.max(1, Math.ceil(frameDist / 0.5)));
   const stepDelta = delta / steps;
@@ -700,11 +639,8 @@ renderLoop((delta) => {
     pos.y += vel.y * stepDelta;
     pos.z += vel.z * stepDelta;
 
-    // Cheese collision: the SDF pushes the diver out of the walls, then the
-    // velocity component pointing into the wall is removed so you slide
-    // along tunnel walls instead of bouncing.
+    // Resolve SDF collision; remove velocity component into wall (slide, no bounce).
     const hit = resolveCollision(pos, PLAYER_RADIUS);
-    // The tin bells are solid too (walls + floor + crown, hatch open).
     const bellHit = collideBathyscaphe(pos, PLAYER_RADIUS);
     for (const n of [hit, bellHit]) {
       if (!n) continue;
@@ -717,7 +653,7 @@ renderLoop((delta) => {
     }
   }
 
-  // Soft leash: past the edge of the field, the current pushes you back.
+  // Soft leash: boundary current pulls diver back.
   const distFromCenter = Math.hypot(pos.x, pos.y, pos.z);
   if (distFromCenter > WORLD_LIMIT) {
     const pull = (distFromCenter - WORLD_LIMIT) * 0.8 * delta;
@@ -726,15 +662,13 @@ renderLoop((delta) => {
     pos.z -= (pos.z / distFromCenter) * pull;
   }
 
-  // 4. First-person camera (speed drives the flashlight bob) with a subtle
-  // bank into turns — reads as swimming, not as a tripod spinning.
+  // First-person camera + subtle turn bank (reads as swimming).
   const speed = Math.hypot(vel.x, vel.y, vel.z) / MAX_SPEED;
   const rollTarget = Math.max(-0.09, Math.min(0.09, -getYawVelocity() * 0.03));
   cameraRoll += (rollTarget - cameraRoll) * Math.min(1, delta * 5);
   updateCamera(pos, yaw, pitch, Math.min(speed, 1), cameraRoll);
 
-  // 4b. First-person body: trails the lazy swim orientation while the head
-  // (camera) looks around freely — arms come into view when you look down.
+  // First-person body: trails lazy orientation; arms visible on look-down.
   updateLocalPlayer(
     pos,
     yaw,
@@ -744,11 +678,9 @@ renderLoop((delta) => {
     vel,
     hasLocalStatus(STATUS.CARRYING),
   );
-  // 4c. …and whatever is in those arms rides the body it is strapped to.
   cargoSys.followCarrier();
 
-  // 5. Spatial audio listener follows the camera; the procedural abyss
-  // soundscape follows depth, speed, and effort.
+  // Spatial audio follows camera; soundscape follows depth/speed/effort.
   setListenerPose(pos, yaw, pitch);
   updateAbyssAudio(delta, {
     speed: Math.min(1, speed),
@@ -756,15 +688,14 @@ renderLoop((delta) => {
     sprinting: isSprinting(),
   });
 
-  // 6. Broadcast local state, throttled — a 24-byte binary packet over the
-  // unreliable channel (see network/): losses are replaced, never resent.
+  // Broadcast throttled at NETWORK_RATE (24-byte binary, unreliable).
   networkTimer += delta;
   if (networkTimer >= NETWORK_RATE && frameCtx.connected) {
     networkTimer = 0;
     broadcastState(fillNetState());
   }
 
-  // 7. Smooth remote players from interpolation buffers + move their voices.
+  // Sample remotes from buffers; sync voice positions.
   const remotePositions = game.remotePositions;
   remotePositions.length = 0;
   for (const [peerId, buffer] of game.remoteBuffers) {
@@ -772,7 +703,7 @@ renderLoop((delta) => {
     if (s) {
       updatePlayerPosition(peerId, s.x, s.y, s.z, s.yaw, s.pitch, s.sy, s.sp);
       setVoicePosition(peerId, s.x, s.y, s.z);
-      // Pooled by index — same objects reused every frame, no per-peer churn.
+      // Pooled (reuse, no per-peer alloc).
       let entry = remotePosPool[remotePositions.length];
       if (!entry) {
         entry = { x: 0, y: 0, z: 0 };
@@ -785,13 +716,11 @@ renderLoop((delta) => {
     }
   }
 
-  // 8. HUD. (The gold is hidden by design — search, listen for the glow
-  // leaking out of tunnel mouths. SHOW_GOUDA_BEARING temporarily overrides
-  // that for playtesting; see drawGoudaBearing.)
+  // HUD. Gold hidden by design (seek by sound); SHOW_GOUDA_BEARING overrides.
   drawCompass(yaw);
   depthText.textContent = `▼ ${Math.max(0, Math.round(ABYSS_DEPTH - pos.y))} m`;
 
-  // 8b. Slow HUD refresh: mesh latency + teammate status flags.
+  // Slow HUD: RTT + peer statuses.
   hudTimer += delta;
   if (hudTimer >= 0.5) {
     hudTimer = 0;
@@ -806,7 +735,7 @@ renderLoop((delta) => {
   }
 });
 
-// --- Death & respawn: blackout, then wake at the bathyscaphe berth ---------
+// Death & respawn: blackout, wake at berth.
 initOxygen({
   onWarn: (t) => {
     playClick();
@@ -820,8 +749,7 @@ initOxygen({
   onDeath: () => {
     deathOverlay.classList.add("visible");
     showEvent("💀 Blackout… the abyss takes you.", DEATH_RESPAWN_MS);
-    // Limp hands: whatever you were carrying is left in the water where you
-    // blacked out, not carried home for you.
+    // Carried items dropped on death.
     cargoSys.fumble("🧀 Your grip fails — the Gouda slips away.");
     clearTimeout(respawnTimer);
     respawnTimer = setTimeout(() => {
@@ -835,8 +763,7 @@ initOxygen({
   },
 });
 
-// Dev hook: flip status bits from the console to verify T0.2's AC
-// (e.g. __abyssal.setLocalStatus(__abyssal.STATUS.TRAPPED, true, 5000)).
+// Dev: __abyssal console hook (status testing).
 if (import.meta.env.DEV) {
   (window as unknown as { __abyssal?: unknown }).__abyssal = {
     setLocalStatus,
@@ -848,8 +775,7 @@ if (import.meta.env.DEV) {
     getLocalPos: () => ({ ...game.localPosition }),
     teleport: teleportLocal,
     setLook,
-    // The haul (M1), driveable from the console or a headless harness:
-    // __abyssal.goldPos() → teleport next to it → cargo.use() to lift it.
+    // Haul API: goldPos() → teleport → cargo.use().
     cargo: cargoSys,
     goldPos: getGoldPos,
     gouda: () => getItem("gouda"),
@@ -858,7 +784,7 @@ if (import.meta.env.DEV) {
   };
 }
 
-// --- Compass strip (canvas, like a dive HUD) ---
+// Compass strip.
 const compassCtx = compassCanvas.getContext("2d")!;
 const CARDINALS: Record<number, string> = {
   0: "N",
@@ -875,7 +801,7 @@ function drawCompass(yaw: number) {
   const w = compassCanvas.width;
   const h = compassCanvas.height;
   const ctx = compassCtx;
-  const pxPerDeg = w / 120; // 120° field of view on the strip
+  const pxPerDeg = w / 120;
   const heading = ((((-yaw * 180) / Math.PI) % 360) + 360) % 360;
 
   ctx.clearRect(0, 0, w, h);
@@ -885,10 +811,8 @@ function drawCompass(yaw: number) {
   ctx.textAlign = "center";
   ctx.lineWidth = 1;
 
-  // Iterate fixed absolute headings (heading is a continuous float, so
-  // comparing it against multiples of 15 directly would almost never match).
+  // Iterate cardinal headings (avoid float-equality checks).
   for (let abs = 0; abs < 360; abs += 15) {
-    // Signed shortest distance from the current heading, in (-180, 180].
     const deg = ((((abs - heading + 540) % 360) + 360) % 360) - 180;
     if (deg < -60 || deg > 60) continue;
     const x = w / 2 + deg * pxPerDeg;
@@ -902,19 +826,12 @@ function drawCompass(yaw: number) {
     }
   }
 
-  // Center marker.
   ctx.fillRect(w / 2 - 1, h - 12, 2, 12);
 
   if (SHOW_GOUDA_BEARING) drawGoudaBearing(ctx, w, heading);
 }
 
-// --- TEMPORARY playtest aid: bearing to the Golden Gouda -------------------
-// This deliberately breaks register D4 (the wheel is hidden and never
-// tracked — you find it by searching and by the glow leaking out of tunnel
-// mouths). It exists so a solo tester can reach the cargo without digging the
-// whole labyrinth first. Flip the flag to false (or delete this block and the
-// call above, plus the extra 14px of canvas height in index.html) to get the
-// real HUD back.
+// TEMPORARY: Gouda bearing (playtest aid). Flip to false to disable.
 const SHOW_GOUDA_BEARING = true;
 
 function drawGoudaBearing(

@@ -1,16 +1,12 @@
-// systems/oxygenSystem.ts — per-frame O₂ drain/refill + the tank HUD.
-//
-// The survival math lives in oxygen.ts (pure, unit-testable); this system
-// feeds it the frame conditions (sprinting, status mask, distance to the
-// recharge zone) and mirrors the result into the HUD bar. Death/respawn
-// side-effects (blackout overlay, teleport) stay in main.ts via initOxygen's
-// hooks — they are UI orchestration, not simulation.
+// systems/oxygenSystem.ts — O₂ drain/refill per frame, HUD bar sync.
+// Feeds frame conditions (sprinting, status, refill zone distance) to the
+// survival math in oxygen.ts and syncs result to the HUD bar.
 import { updateOxygen, refillOxygen, isDead } from "../game/oxygen.ts";
 import { getLocalStatus } from "../game/effects.ts";
 import { isSprinting } from "../input/input.ts";
 import type { GameSystem } from "./types.ts";
 
-const RECHARGE_RADIUS = 16; // O₂ refill bubble around the spawn point
+const RECHARGE_RADIUS = 16;
 
 export interface OxygenHudElements {
   o2Fill: HTMLElement;
