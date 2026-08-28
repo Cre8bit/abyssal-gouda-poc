@@ -36,6 +36,7 @@ import {
 } from "../entities/goldenGouda.ts";
 import { CARGO, holdPose } from "../game/cargo.ts";
 import { applyFpBodyParams } from "./shots.ts";
+import { button, markOn, section, sliderRow } from "./ui.ts";
 
 declare global {
   interface Window {
@@ -137,65 +138,8 @@ grid.material.transparent = true;
 grid.material.opacity = 0.35;
 scene.add(grid);
 
-// --- Tiny UI kit -----------------------------------------------------------
-function button(
-  parent: HTMLElement,
-  label: string,
-  onClick: (btn: HTMLButtonElement) => void,
-) {
-  const btn = document.createElement("button");
-  btn.textContent = label;
-  btn.addEventListener("click", () => onClick(btn));
-  parent.appendChild(btn);
-  return btn;
-}
-
-function sliderRow(
-  parent: HTMLElement,
-  name: string,
-  min: number,
-  max: number,
-  step: number,
-  value: number,
-  onInput: (v: number) => void,
-  fmt: (v: number) => string = (v) => v.toFixed(2),
-) {
-  const row = document.createElement("div");
-  row.className = "slider-row";
-  row.innerHTML = `<span class="name">${name}</span><input type="range"><span class="val"></span>`;
-  const input = row.querySelector("input")!;
-  const val = row.querySelector(".val")!;
-  Object.assign(input, { min, max, step, value });
-  const show = () => (val.textContent = fmt(+input.value));
-  input.addEventListener("input", () => {
-    show();
-    onInput(+input.value);
-  });
-  show();
-  parent.appendChild(row);
-  return {
-    row,
-    set(v: number) {
-      input.value = v as unknown as string; // DOM coerces numbers; keep the raw assign
-      show();
-    },
-  };
-}
-
-function section(parent: HTMLElement, label: string) {
-  const s = document.createElement("div");
-  s.className = "section";
-  s.innerHTML = `<div class="label">${label}</div><div class="row"></div>`;
-  parent.appendChild(s);
-  return s.querySelector(".row") as HTMLElement;
-}
-
+// UI kit shared with the worldgen bench — see ui.ts.
 const api = { button, sliderRow, section };
-
-function markOn(btns: Record<string, HTMLButtonElement>, active: string) {
-  for (const [k, b] of Object.entries(btns))
-    b.classList.toggle("on", k === active);
-}
 
 // --- Shared bits -----------------------------------------------------------
 const gltfCache = new Map<string, Promise<GLTF>>(); // url → Promise<gltf>

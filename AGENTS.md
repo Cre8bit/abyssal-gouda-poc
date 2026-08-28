@@ -28,7 +28,10 @@ src/
     types.ts registry.ts effectsSystem.ts oxygenSystem.ts
     catfishSystem.ts cargoSystem.ts itemsSystem.ts
   world/             the map
-    gouda.ts           destructible SDF cheese world (marching cubes)
+    gouda.ts           destructible SDF cheese world (marching cubes) —
+                       the shape-family/placement IMPLEMENTATIONS
+    recipes.ts         the cheese kit's DATA: part/biome/world recipe
+                       tables (pure data, node-testable)
     bathyscaphe.ts     tin diving bells (visual + analytic collision)
   entities/          animated creatures/bodies
     catfish.ts         lantern-catfish AI + model
@@ -39,10 +42,13 @@ src/
     toon.ts            shared cel-shading kit — the ONLY toon-material door
   bench/
     preview.ts         model/animation bench entry (preview.html)
+    worldgen.ts        cheese-kit worldgen bench entry (worldgen.html)
+    ui.ts              tiny DOM control kit shared by both bench pages
     shots.ts           headless screenshot harness (?shot=)
 tools/               node-run (node 24 strips types natively)
   runner.ts            CDP screenshot runner
   test-protocol.ts     protocol unit tests (npm test)
+  test-recipes.ts      worldgen recipe-table sanity checks (npm test)
 ```
 
 ## Conventions
@@ -96,6 +102,37 @@ tools/               node-run (node 24 strips types natively)
   bulbs and halos (`MeshBasicMaterial`/sprites), the particle/beam
   `ShaderMaterial`s, the boundary veil, and the Gouda's levitating bits —
   light sources and volumes, not surfaces.
+
+## The cheese kit (M2) — worldgen is data + a bench
+
+World generation is split in two on purpose:
+
+- **`world/recipes.ts` holds every number** — `PartRecipe` (one kind of
+  cheese chunk), `BiomeRecipe` (placement, sizes, weighted part mix, wax
+  material), `WorldRecipe` (the ordered onion + world radii). Pure data, no
+  three.js, checked by `tools/test-recipes.ts`.
+- **`world/gouda.ts` holds every implementation** — the SDF shape families,
+  chunk placement modes (center/band/shell), meshing, digging, queries.
+  `buildGoudaWorld()` takes an optional `world: WorldRecipe` override; the
+  game itself always plays `DEFAULT_WORLD`.
+
+**Tune numbers in the worldgen bench, not by hand-editing tables blind.**
+`/worldgen.html` (`npm run dev`) edits a live copy of the tables — a part
+view with every recipe field on a slider (plus clip plane, biome skins), a
+biome wedge view for density/material, and a map view (proxy layout or the
+real full build). Edits autosave to localStorage; the **copy buttons dump
+JSON to paste into `recipes.ts`**, which is the only way a tuning ships.
+Deep links: `worldgen.html?part=<id>`, `?biome=<id>`, `?map=1`, `&seed=`.
+
+Adding a new cheese part type or biome = a new table entry in `recipes.ts`
+(author it in the bench, copy it out), NOT new generator code. New *shape
+grammar* (a new `PartKind`, a new placement mode) is a `gouda.ts` change.
+
+⚠ The seeded rng stream is a pure function of the tables: biomes with
+`sizeVar: 0` and single-entry part lists consume no rng, which is what keeps
+the default tables reproducing the pre-recipe worlds byte-for-byte. Editing
+a table changes every seed's world — that's expected; just don't reorder the
+`biomes` array casually, since generation order is part of the contract.
 
 ## Model bench — standing rule
 

@@ -1,4 +1,4 @@
-// gouda.js — the procedural abyssal gouda labyrinth, v3.
+// gouda.js — the procedural abyssal gouda labyrinth, v4 (recipe-driven).
 //
 // SHAPE GRAMMAR — every chunk is an analytic SDF built from:
 //   · a squashed ellipsoid base ("wheel": flattened round; "hunk": rounder)
@@ -8,6 +8,14 @@
 //   · minus perfectly spherical eyes (caverns/chambers) and pores
 //   · minus winding tunnel capsules (bent polylines)
 //   · minus PLAYER DIGS (runtime sphere carves — see digAt)
+//
+// NUMBERS LIVE IN world/recipes.ts (M2) — this file owns the shape-family
+// IMPLEMENTATIONS: makeChunkData() turns a PartRecipe into SDF params,
+// placeChunks() turns BiomeRecipe placements into a chunk layout, and
+// createGoudaMaterial() turns a BiomeMaterial into the two-tone wax shader.
+// buildGoudaWorld() takes an optional WorldRecipe override; the worldgen
+// bench (/worldgen.html) uses that plus the exported generator pieces
+// (makeChunkData/meshChunk/planWorldLayout) to preview edits live.
 //
 // DIGGING — after generation each chunk keeps its voxel field cached. A dig
 // edits only the voxels around the carve sphere and re-runs marching cubes
@@ -38,38 +46,27 @@ import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { MarchingCubes } from "three/examples/jsm/objects/MarchingCubes.js";
 import { toonMaterial } from "../render/toon.ts";
 import type { Vec3 } from "../state.ts";
+import {
+  DEFAULT_WORLD,
+  pickPart,
+  type BiomeMaterial,
+  type BiomePlacement,
+  type BiomeRecipe,
+  type PartRecipe,
+  type WorldRecipe,
+  type ZoneName,
+} from "./recipes.ts";
 
-export const WORLD_R = 420; // outer edge of the drift
-export const BOUNDARY_R = 470; // visible map boundary veil
+// Module-scope radii read the DEFAULT tables — the game always plays the
+// shipped recipes; WorldRecipe overrides exist for the worldgen bench only.
+export const WORLD_R = DEFAULT_WORLD.worldR; // outer edge of the drift
+export const BOUNDARY_R = DEFAULT_WORLD.boundaryR; // visible map boundary veil
 export const HEART_POS = { x: 0, y: 0, z: 0 }; // map center — a DECOY.
 // The Golden Gouda hides in a random cavern inside one of the mid-radius
-// wheels (see GOLD_BAND) and is NOT shown on the compass. Search, listen for
+// wheels (goldBand) and is NOT shown on the compass. Search, listen for
 // its glow leaking out of tunnel mouths, dig. getGoldPos() is only the SEED
 // position — once the run starts the wheel is an item and it moves.
-const GOLD_BAND = [60, 175];
 
-const HEART_S = 56;
-const HEART_RES = 96;
-
-const CRUST_R = 155; // sealed wall #1
-const CRUST_N = 48;
-const BULWARK_R = 80; // sealed wall #2
-const BULWARK_N = 18;
-
-const REEF_COUNT = 18;
-const CHIMNEY_COUNT = 14;
-const SCREE_COUNT = 44;
-const WARREN_COUNT = 10;
-const GALLERY_COUNT = 12;
-const HOLLOW_COUNT = 8;
-const DRIFT_COUNT = 12;
-const DEBRIS_COUNT = 460;
-
-const RES_HEART = HEART_RES;
-const RES_WARREN = 64;
-const RES_WALL = 48;
-const RES_MED = 48;
-const RES_SMALL = 32;
 const MAX_POLYS: Record<number, number> = {
   96: 220000,
   72: 140000,
@@ -80,9 +77,8 @@ const MAX_POLYS: Record<number, number> = {
 };
 
 // Local-space (unit-sphere) shape parameters. Surface ~ |p| = R0, grid [-1,1].
-const R0 = 0.6;
-const NOISE_FREQ = 1.6;
-const SHELL = 0.22;
+// Exported for the worldgen bench (proxy sphere radius ≈ chunk s · R0).
+export const R0 = 0.6;
 const CARVE_SKIP = 0.3;
 const SMOOTH_K = 0.05;
 const PLANE_K = 0.025;
@@ -118,37 +114,14 @@ interface Tunnel {
   r: number;
 }
 
-type ZoneName =
-  | "drift"
-  | "reef"
-  | "chimneys"
-  | "scree"
-  | "warrens"
-  | "crust"
-  | "galleries"
-  | "bulwark"
-  | "hollows"
-  | "heart";
-
-// opts for makeChunkData — documented at its definition site below.
-interface ChunkOpts {
-  kind: "wheel" | "hunk" | "block" | "slab" | "column";
-  eyesMin: number;
-  eyesMax: number;
-  eyeRBase: number;
-  eyeRVar: number;
-  exits: number;
-  coreEye?: number;
-  deadEnds?: number;
-  axis?: Vec3;
-  narrow?: boolean;
-  tangle?: boolean;
-  pores?: [number, number];
-  poreR?: [number, number];
-  tunnelR?: [number, number];
+// Generation context threaded through makeChunkData so the worldgen bench
+// can generate isolated chunks without touching this module's world state.
+export interface GenCtx {
+  difficulty: number; // 1..3 — scales tunnel width down, dead-ends up
+  blastPoints: Vec3[]; // sink for thin-wall marker positions
 }
 
-interface Chunk {
+export interface Chunk {
   center: THREE.Vector3;
   s: number;
   res: number;
@@ -158,6 +131,8 @@ interface Chunk {
   minAxis: number;
   nOff: number;
   amp: number;
+  freq: number;
+  crustDepth: number;
   planes: PlaneCut[];
   holes: SphereCarve[];
   tunnels: Tunnel[];
@@ -168,13 +143,14 @@ interface Chunk {
   zone?: ZoneName; // set by buildGoudaWorld
 }
 
-interface ChunkSpec {
+export interface ChunkSpec {
   center: THREE.Vector3;
   s: number;
   res: number;
   label: string;
   zone: ZoneName;
-  opts: ChunkOpts;
+  part: PartRecipe;
+  axis?: Vec3; // radial through-route direction (shell placements)
 }
 
 interface Debris {
@@ -202,7 +178,7 @@ const uGoudaTime = { value: 0 };
 
 // --- Seeded RNG ------------------------------------------------------------------
 
-function mulberry32(seed: number): Rng {
+export function mulberry32(seed: number): Rng {
   let a = seed >>> 0;
   return function () {
     a |= 0;
@@ -282,14 +258,14 @@ function baseSdf(c: Chunk, x: number, y: number, z: number): number {
   let d = (Math.sqrt(ex * ex + ey * ey + ez * ez) - R0) * c.minAxis;
 
   const ad = Math.abs(d);
-  if (ad < SHELL) {
-    let fade = 1 - ad / SHELL;
+  if (ad < c.crustDepth) {
+    let fade = 1 - ad / c.crustDepth;
     fade = fade * fade * (3 - 2 * fade);
     d +=
       fbm3(
-        x * NOISE_FREQ + c.nOff,
-        y * NOISE_FREQ + c.nOff * 1.7,
-        z * NOISE_FREQ + c.nOff * 0.6,
+        x * c.freq + c.nOff,
+        y * c.freq + c.nOff * 1.7,
+        z * c.freq + c.nOff * 0.6,
       ) *
       c.amp *
       fade;
@@ -388,33 +364,30 @@ function addTunnel(
   }
 }
 
-// opts: kind ("wheel"|"hunk"|"block"|"slab"), eyesMin/Max, eyeRBase/Var,
-// exits, coreEye, deadEnds, axis (radial through-route), narrow, tangle,
-// pores [min,max], poreR [base,var], tunnelR [base,var]
-function makeChunkData(
+// One PartRecipe → one chunk's SDF params. `axis` (from shell placements)
+// forces a radial through-route; `ctx` carries difficulty + blast-marker sink.
+export function makeChunkData(
   rng: Rng,
   center: THREE.Vector3,
   s: number,
   res: number,
-  opts: ChunkOpts,
+  part: PartRecipe,
+  ctx: GenCtx,
+  axis: Vec3 | null = null,
 ): Chunk {
   const cell = 2 / res;
-  const minTunnelR = (opts.narrow ? 2.2 : 2.6) * cell;
-  const tunnelScale = [1.15, 1.0, 0.85][difficulty - 1] ?? 1.0;
+  const minTunnelR = (part.narrow ? 2.2 : 2.6) * cell;
+  const tunnelScale = [1.15, 1.0, 0.85][ctx.difficulty - 1] ?? 1.0;
   const tr = (base: number) => Math.max(minTunnelR, base * tunnelScale);
-  const bends = opts.narrow
-    ? 2
-    : opts.kind === "block" || opts.kind === "slab"
-      ? 0
-      : 1;
-  const [trBase, trVar] = opts.tunnelR ?? [0.055, 0.04];
+  const bends = part.tunnels.bends;
+  const { rBase: trBase, rVar: trVar } = part.tunnels;
 
   let sx, sy, sz;
-  if (opts.kind === "wheel") {
+  if (part.kind === "wheel") {
     sx = 0.95 + rng() * 0.2;
     sy = 0.5 + rng() * 0.2;
     sz = 0.95 + rng() * 0.2;
-  } else if (opts.kind === "column") {
+  } else if (part.kind === "column") {
     // Tall chimney: narrow footprint, full grid height.
     sx = 0.38 + rng() * 0.14;
     sy = 1.1 + rng() * 0.15;
@@ -434,8 +407,9 @@ function makeChunkData(
     iz: 1 / sz,
     minAxis: Math.min(sx, sy, sz),
     nOff: rng() * 100,
-    // Crust noise amplitude (low for readability).
-    amp: opts.kind === "block" || opts.kind === "slab" ? 0.04 : 0.08,
+    amp: part.crust.amp,
+    freq: part.crust.freq,
+    crustDepth: part.crust.depth,
     planes: [],
     holes: [],
     tunnels: [],
@@ -445,13 +419,13 @@ function makeChunkData(
   };
 
   // Plane cuts.
-  if (opts.kind === "block" || opts.kind === "slab") {
+  if (part.kind === "block" || part.kind === "slab") {
     randDir(rng, _dir);
     const half =
-      opts.kind === "slab" ? 0.13 + rng() * 0.07 : 0.22 + rng() * 0.14;
+      part.kind === "slab" ? 0.13 + rng() * 0.07 : 0.22 + rng() * 0.14;
     c.planes.push({ nx: _dir.x, ny: _dir.y, nz: _dir.z, off: half });
     c.planes.push({ nx: -_dir.x, ny: -_dir.y, nz: -_dir.z, off: half });
-    const nCuts = opts.kind === "slab" ? 1 : 1 + Math.floor(rng() * 3);
+    const nCuts = part.kind === "slab" ? 1 : 1 + Math.floor(rng() * 3);
     for (let i = 0; i < nCuts; i++) {
       randDir(rng, _dir);
       c.planes.push({
@@ -465,14 +439,14 @@ function makeChunkData(
 
   const eyes: SphereCarve[] = [];
 
-  if (opts.coreEye) {
-    const core = { x: 0, y: 0, z: 0, r: opts.coreEye };
+  if (part.coreEye > 0) {
+    const core = { x: 0, y: 0, z: 0, r: part.coreEye };
     eyes.push(core);
     c.holes.push(core);
   }
 
   const nEyes =
-    opts.eyesMin + Math.floor(rng() * (opts.eyesMax - opts.eyesMin + 1));
+    part.eyes.min + Math.floor(rng() * (part.eyes.max - part.eyes.min + 1));
   for (let i = 0; i < nEyes; i++) {
     randDir(rng, _dir);
     const t = R0 * (0.12 + 0.58 * rng());
@@ -480,25 +454,24 @@ function makeChunkData(
       y = _dir.y * t * sy,
       z = _dir.z * t * sz;
     const centerBias = 1.25 - (t / R0) * 0.55;
-    const r = (opts.eyeRBase + opts.eyeRVar * rng()) * centerBias;
+    const r = (part.eyes.rBase + part.eyes.rVar * rng()) * centerBias;
     const eye = { x, y, z, r };
     eyes.push(eye);
     c.holes.push(eye);
   }
 
   // Pores: many for slabs, few otherwise.
-  const [pMin, pMax] = opts.pores ?? [10, 18];
-  const [prBase, prVar] = opts.poreR ?? [0.055, 0.075];
-  const nPores = pMin + Math.floor(rng() * (pMax - pMin + 1));
+  const nPores =
+    part.pores.min + Math.floor(rng() * (part.pores.max - part.pores.min + 1));
   for (let i = 0; i < nPores; i++) {
     randDir(rng, _dir);
     const t =
-      R0 * (opts.kind === "slab" ? 0.5 + 0.6 * rng() : 0.85 + 0.3 * rng());
+      R0 * (part.kind === "slab" ? 0.5 + 0.6 * rng() : 0.85 + 0.3 * rng());
     c.holes.push({
       x: _dir.x * t * sx,
       y: _dir.y * t * sy,
       z: _dir.z * t * sz,
-      r: Math.max(1.6 * cell, prBase + prVar * rng()),
+      r: Math.max(1.6 * cell, part.pores.rBase + part.pores.rVar * rng()),
     });
   }
 
@@ -523,7 +496,7 @@ function makeChunkData(
         second = j;
       }
     }
-    const j = opts.tangle
+    const j = part.tangle
       ? i > 1 && rng() < 0.5
         ? Math.floor(rng() * i)
         : best
@@ -545,7 +518,7 @@ function makeChunkData(
     (a, b) =>
       b.x * b.x + b.y * b.y + b.z * b.z - (a.x * a.x + a.y * a.y + a.z * a.z),
   );
-  const nExits = opts.exits + Math.floor(rng() * 2);
+  const nExits = part.exits + Math.floor(rng() * 2);
   for (let i = 0; i < Math.min(nExits, sorted.length); i++) {
     const e = sorted[i];
     const len = Math.sqrt(e.x * e.x + e.y * e.y + e.z * e.z) || 1;
@@ -561,8 +534,8 @@ function makeChunkData(
   }
 
   // Radial through-route for wall chunks.
-  if (opts.axis) {
-    const a = opts.axis;
+  if (axis) {
+    const a = axis;
     for (const sign of [1, -1]) {
       let best = eyes[0],
         bestDot = -Infinity;
@@ -589,7 +562,7 @@ function makeChunkData(
   }
 
   // Dead-end chambers behind thin marked walls (dig/blast through).
-  const nDead = (opts.deadEnds ?? 0) + (difficulty - 1);
+  const nDead = part.deadEnds + (ctx.difficulty - 1);
   for (let k = 0; k < nDead && eyes.length >= 2; k++) {
     const start = eyes[Math.floor(rng() * eyes.length)];
     let target = eyes[Math.floor(rng() * eyes.length)];
@@ -610,7 +583,7 @@ function makeChunkData(
     if (el > R0 - chR * 0.8) continue;
     c.holes.push(ch);
     addTunnel(c, rng, start, ch, tr(0.045 + 0.03 * rng()), bends);
-    blastPoints.push({
+    ctx.blastPoints.push({
       x: center.x + (target.x + _dir.x * (target.r + wall / 2)) * s,
       y: center.y + (target.y + _dir.y * (target.r + wall / 2)) * s,
       z: center.z + (target.z + _dir.z * (target.r + wall / 2)) * s,
@@ -679,7 +652,7 @@ function extractGeometry(mc: MarchingCubes, c: Chunk): THREE.BufferGeometry {
   return geometry;
 }
 
-function meshChunk(
+export function meshChunk(
   c: Chunk,
   res: number,
   material: THREE.Material,
@@ -826,22 +799,13 @@ function vec3str(hex: number): string {
 }
 
 // Two-tone cheese material via aCrust: paste (carved), rind (outer crust).
-function createGoudaMaterial({
+// Exported for the worldgen bench (skin previews from BiomeMaterial edits).
+export function createGoudaMaterial({
   paste,
   rind,
-  rough,
   vein,
   veinStrength,
-}: {
-  paste: number;
-  rind: number;
-  rough: number;
-  vein: [number, number, number];
-  veinStrength: number;
-}): THREE.MeshToonMaterial {
-  // Toon-shaded with paste/rind/vein injection; rough unused.
-  void rough;
-
+}: BiomeMaterial): THREE.MeshToonMaterial {
   const pasteVec = vec3str(paste);
   const rindVec = vec3str(rind);
   const veinVec = `vec3(${vein[0].toFixed(3)}, ${vein[1].toFixed(3)}, ${vein[2].toFixed(3)})`;
@@ -923,96 +887,19 @@ function createGoudaMaterial({
   );
 }
 
-function createZoneMaterials(): Record<ZoneName, THREE.MeshToonMaterial> {
-  // Each biome has its own wax rind; paste and veins are shared.
-  const PASTE = 0xecc76a;
-  return {
-    // bleached natural rind, ghost-pale
-    drift: createGoudaMaterial({
-      paste: 0xe3cc86,
-      rind: 0xb3a06a,
-      rough: 0.6,
-      vein: [0.55, 0.52, 0.2],
-      veinStrength: 0.4,
-    }),
-    // young yellow wax plates
-    reef: createGoudaMaterial({
-      paste: PASTE,
-      rind: 0xc79a2f,
-      rough: 0.5,
-      vein: [0.6, 0.6, 0.18],
-      veinStrength: 0.45,
-    }),
-    // tall smoked-rind chimneys
-    chimneys: createGoudaMaterial({
-      paste: 0xe0b955,
-      rind: 0x6e4f28,
-      rough: 0.52,
-      vein: [0.7, 0.55, 0.15],
-      veinStrength: 0.5,
-    }),
-    // classic yellow gouda blocks
-    scree: createGoudaMaterial({
-      paste: PASTE,
-      rind: 0xbd8f2a,
-      rough: 0.5,
-      vein: [0.6, 0.62, 0.12],
-      veinStrength: 0.5,
-    }),
-    // mouldy green-tinged burrow cheese
-    warrens: createGoudaMaterial({
-      paste: 0xd8c266,
-      rind: 0x77692f,
-      rough: 0.55,
-      vein: [0.5, 0.72, 0.12],
-      veinStrength: 0.55,
-    }),
-    // THE classic: red wax gouda wall
-    crust: createGoudaMaterial({
-      paste: PASTE,
-      rind: 0x8e3c22,
-      rough: 0.42,
-      vein: [0.95, 0.62, 0.12],
-      veinStrength: 0.6,
-    }),
-    // orange wax cathedrals
-    galleries: createGoudaMaterial({
-      paste: 0xeabf58,
-      rind: 0xa85e20,
-      rough: 0.44,
-      vein: [1.0, 0.45, 0.1],
-      veinStrength: 0.6,
-    }),
-    // dark burgundy wax — the inner wall
-    bulwark: createGoudaMaterial({
-      paste: 0xe5b64a,
-      rind: 0x5e2a1c,
-      rough: 0.42,
-      vein: [0.95, 0.35, 0.1],
-      veinStrength: 0.65,
-    }),
-    // black wax, aged — too close to the heart
-    hollows: createGoudaMaterial({
-      paste: 0xdca93e,
-      rind: 0x2c251c,
-      rough: 0.4,
-      vein: [0.95, 0.22, 0.08],
-      veinStrength: 0.7,
-    }),
-    // gold wax decoy centerpiece
-    heart: createGoudaMaterial({
-      paste: 0xf0c85a,
-      rind: 0xa77b22,
-      rough: 0.38,
-      vein: [1.0, 0.8, 0.22],
-      veinStrength: 0.85,
-    }),
-  };
+// One wax material per biome, from the recipe tables.
+function createZoneMaterials(
+  world: WorldRecipe,
+): Partial<Record<ZoneName, THREE.MeshToonMaterial>> {
+  const materials: Partial<Record<ZoneName, THREE.MeshToonMaterial>> = {};
+  for (const biome of world.biomes)
+    materials[biome.id] = createGoudaMaterial(biome.material);
+  return materials;
 }
 
 // --- Boundary veil, blast markers ------------------------------------------------------------
 
-function createBoundarySphere(parent: THREE.Group): void {
+function createBoundarySphere(parent: THREE.Group, radius: number): void {
   const material = new THREE.ShaderMaterial({
     transparent: true,
     depthWrite: false,
@@ -1041,7 +928,7 @@ function createBoundarySphere(parent: THREE.Group): void {
     `,
   });
   const mesh = new THREE.Mesh(
-    new THREE.SphereGeometry(BOUNDARY_R, 48, 32),
+    new THREE.SphereGeometry(radius, 48, 32),
     material,
   );
   mesh.frustumCulled = false;
@@ -1121,53 +1008,49 @@ export function updateGouda(
 
 // --- World assembly -----------------------------------------------------------------------------
 
-function placeChunks(rng: Rng): ChunkSpec[] {
-  const specs: ChunkSpec[] = [
-    {
-      center: new THREE.Vector3(0, 0, 0),
-      s: HEART_S,
-      res: RES_HEART,
-      label: "the heart",
-      zone: "heart",
-      opts: {
-        kind: "hunk",
-        eyesMin: 18,
-        eyesMax: 24,
-        eyeRBase: 0.1,
-        eyeRVar: 0.17,
-        exits: 6,
-        coreEye: 0.34,
-        deadEnds: 4,
-      },
-    },
-  ];
+// BiomeRecipe placements → chunk layout, in table order (inside → out).
+// The rng stream is a pure function of the tables: sizeVar 0 and single-part
+// biomes consume no rng, so the default tables reproduce the v3 worlds.
+function placeChunks(rng: Rng, world: WorldRecipe, diff: number): ChunkSpec[] {
+  const specs: ChunkSpec[] = [];
+  const size = (b: BiomeRecipe) =>
+    b.sizeVar > 0 ? b.sizeBase + rng() * b.sizeVar : b.sizeBase;
 
+  // Scattered band: rejection-sample against same-zone spacing (guard) and
+  // the heart; shrink the chunk when a band is too crowded to fit it.
   const tryBand = (
-    zone: ZoneName,
-    rMin: number,
-    rMax: number,
-    s: number,
-    res: number,
-    label: string,
-    opts: ChunkOpts,
-    guard: number,
+    biome: BiomeRecipe,
+    pl: Extract<BiomePlacement, { mode: "band" }>,
   ) => {
+    let s = size(biome);
+    const part = pickPart(world, biome, rng);
     for (let shrink = 0; shrink < 4; shrink++, s *= 0.9) {
       for (let attempt = 0; attempt < 500; attempt++) {
         randDir(rng, _dir);
-        const rad = rMin + rng() * (rMax - rMin);
+        const rad = pl.rMin + rng() * (pl.rMax - pl.rMin);
         const p = new THREE.Vector3(_dir.x * rad, _dir.y * rad, _dir.z * rad);
         let ok = true;
         for (const other of specs) {
           const g =
-            other.zone === "heart" ? 0.72 : other.zone === zone ? guard : null;
+            other.zone === "heart"
+              ? world.heartGuard
+              : other.zone === biome.id
+                ? pl.guard
+                : null;
           if (g !== null && p.distanceTo(other.center) < (s + other.s) * g) {
             ok = false;
             break;
           }
         }
         if (ok) {
-          specs.push({ center: p, s, res, label, zone, opts });
+          specs.push({
+            center: p,
+            s,
+            res: biome.res,
+            label: biome.label,
+            zone: biome.id,
+            part,
+          });
           return;
         }
       }
@@ -1176,16 +1059,11 @@ function placeChunks(rng: Rng): ChunkSpec[] {
 
   // A fibonacci shell of fused wall chunks with radial through-routes.
   const shell = (
-    zone: ZoneName,
-    label: string,
-    radius: number,
-    n: number,
-    sMin: number,
-    sVar: number,
-    res: number,
-    opts: ChunkOpts,
+    biome: BiomeRecipe,
+    pl: Extract<BiomePlacement, { mode: "shell" }>,
   ) => {
     const GOLDEN = 2.399963229728653;
+    const n = pl.count + (diff - 1) * pl.perDifficulty;
     for (let i = 0; i < n; i++) {
       const y = 1 - (2 * (i + 0.5)) / n;
       const r = Math.sqrt(Math.max(0, 1 - y * y));
@@ -1195,204 +1073,55 @@ function placeChunks(rng: Rng): ChunkSpec[] {
         y + (rng() - 0.5) * 0.08,
         Math.sin(th) * r + (rng() - 0.5) * 0.08,
       ).normalize();
-      const rad = radius + (rng() - 0.5) * 4;
-      const colossal = i % 13 === 0;
+      const rad = pl.radius + (rng() - 0.5) * 4;
+      const colossal = pl.colossalEvery > 0 && i % pl.colossalEvery === 0;
+      const s = colossal
+        ? biome.sizeBase +
+          biome.sizeVar +
+          pl.colossalBonus +
+          rng() * pl.colossalVar
+        : size(biome);
       specs.push({
         center: axis.clone().multiplyScalar(rad),
-        s: colossal ? sMin + sVar + 12 + rng() * 8 : sMin + rng() * sVar,
-        res: colossal ? 64 : res,
-        label: colossal ? `a colossal wheel` : label,
-        zone,
-        opts: { ...opts, axis: { x: axis.x, y: axis.y, z: axis.z } },
+        s,
+        res: colossal ? pl.colossalRes : biome.res,
+        label: colossal ? `a colossal wheel` : biome.label,
+        zone: biome.id,
+        part: pickPart(world, biome, rng),
+        axis: { x: axis.x, y: axis.y, z: axis.z },
       });
     }
   };
 
-  const hollowOpts: ChunkOpts = {
-    kind: "wheel",
-    eyesMin: 8,
-    eyesMax: 12,
-    eyeRBase: 0.1,
-    eyeRVar: 0.12,
-    exits: 4,
-    deadEnds: 1,
-  };
-  const galleryOpts: ChunkOpts = {
-    kind: "wheel",
-    eyesMin: 6,
-    eyesMax: 9,
-    eyeRBase: 0.16,
-    eyeRVar: 0.12,
-    exits: 4,
-    deadEnds: 2,
-    tunnelR: [0.08, 0.04], // wide cathedral corridors
-  };
-  const wallOpts: ChunkOpts = {
-    kind: "hunk",
-    eyesMin: 12,
-    eyesMax: 18,
-    eyeRBase: 0.1,
-    eyeRVar: 0.15,
-    exits: 3,
-    deadEnds: 1,
-  };
-  const warrenOpts: ChunkOpts = {
-    kind: "hunk",
-    eyesMin: 18,
-    eyesMax: 26,
-    eyeRBase: 0.05,
-    eyeRVar: 0.05,
-    exits: 2,
-    deadEnds: 2,
-    narrow: true,
-    tangle: true,
-    tunnelR: [0.038, 0.022],
-  };
-  const blockOpts: ChunkOpts = {
-    kind: "block",
-    eyesMin: 2,
-    eyesMax: 4,
-    eyeRBase: 0.09,
-    eyeRVar: 0.09,
-    exits: 2,
-  };
-  const slabOpts: ChunkOpts = {
-    kind: "slab",
-    eyesMin: 2,
-    eyesMax: 4,
-    eyeRBase: 0.1,
-    eyeRVar: 0.08,
-    exits: 2,
-    pores: [14, 20],
-    poreR: [0.08, 0.09], // big clean through-holes
-  };
-
-  const chimneyOpts: ChunkOpts = {
-    kind: "column",
-    eyesMin: 5,
-    eyesMax: 8,
-    eyeRBase: 0.08,
-    eyeRVar: 0.08,
-    exits: 3,
-    pores: [12, 18],
-  };
-
-  // THE HOLLOWS: cramped approach wheels around the heart.
-  for (let i = 0; i < HOLLOW_COUNT; i++)
-    tryBand(
-      "hollows",
-      38,
-      60,
-      14 + rng() * 7,
-      RES_MED,
-      "the hollows",
-      hollowOpts,
-      0.5,
-    );
-
-  // THE BULWARK: sealed wall #2 — tight shell of fused hunks.
-  shell(
-    "bulwark",
-    "the bulwark",
-    BULWARK_R,
-    BULWARK_N + (difficulty - 1) * 2,
-    44,
-    10,
-    RES_WALL,
-    wallOpts,
-  );
-
-  // THE GALLERIES: cathedral wheels between the walls.
-  for (let i = 0; i < GALLERY_COUNT; i++)
-    tryBand(
-      "galleries",
-      100,
-      140,
-      22 + rng() * 12,
-      RES_MED,
-      "the galleries",
-      galleryOpts,
-      0.5,
-    );
-
-  // THE CRUST: sealed wall #1 — the big outer wall of many giant parts.
-  shell(
-    "crust",
-    "the crust wall",
-    CRUST_R,
-    CRUST_N + (difficulty - 1) * 4,
-    60,
-    12,
-    RES_WALL,
-    wallOpts,
-  );
-
-  // THE WARRENS: speleology chunks against the crust's outer face.
-  for (let i = 0; i < WARREN_COUNT; i++)
-    tryBand(
-      "warrens",
-      185,
-      225,
-      30 + rng() * 8,
-      RES_WARREN,
-      "the warrens",
-      warrenOpts,
-      0.55,
-    );
-
-  // THE SCREE: dense belt of small cut blocks.
-  for (let i = 0; i < SCREE_COUNT; i++)
-    tryBand(
-      "scree",
-      230,
-      285,
-      10 + rng() * 8,
-      RES_SMALL,
-      "the scree",
-      blockOpts,
-      0.65,
-    );
-
-  // THE CHIMNEYS: a forest of tall smoked columns — swim the vertical maze.
-  for (let i = 0; i < CHIMNEY_COUNT; i++)
-    tryBand(
-      "chimneys",
-      285,
-      340,
-      30 + rng() * 12,
-      RES_MED,
-      "the chimneys",
-      chimneyOpts,
-      0.5,
-    );
-
-  // THE REEF: fields of thin plates with big through-holes.
-  for (let i = 0; i < REEF_COUNT; i++)
-    tryBand(
-      "reef",
-      335,
-      385,
-      30 + rng() * 14,
-      RES_MED,
-      "the reef",
-      slabOpts,
-      0.55,
-    );
-
-  // THE DRIFT: sparse pale blocks at the very edge.
-  for (let i = 0; i < DRIFT_COUNT; i++)
-    tryBand(
-      "drift",
-      388,
-      WORLD_R,
-      11 + rng() * 8,
-      RES_SMALL,
-      "the drift",
-      blockOpts,
-      1.2,
-    );
+  for (const biome of world.biomes) {
+    const pl = biome.placement;
+    if (pl.mode === "center") {
+      specs.push({
+        center: new THREE.Vector3(0, 0, 0),
+        s: size(biome),
+        res: biome.res,
+        label: biome.label,
+        zone: biome.id,
+        part: pickPart(world, biome, rng),
+      });
+    } else if (pl.mode === "shell") {
+      shell(biome, pl);
+    } else {
+      for (let i = 0; i < pl.count; i++) tryBand(biome, pl);
+    }
+  }
 
   return specs;
+}
+
+// Layout-only pass for the worldgen bench's map view: the chunk placement a
+// build would use, with no meshing and no module state touched.
+export function planWorldLayout(
+  seed: number,
+  difficulty: number,
+  world: WorldRecipe,
+): ChunkSpec[] {
+  return placeChunks(mulberry32(seed >>> 0), world, difficulty);
 }
 
 function makeDebrisGeometry(rng: Rng): THREE.IcosahedronGeometry {
@@ -1421,28 +1150,40 @@ function nextTick(): Promise<void> {
 export async function buildGoudaWorld(
   scene: THREE.Scene,
   onProgress: (done: number, total: number, label: string) => void = () => {},
-  opts: { seed?: number; difficulty?: number } = {},
+  opts: { seed?: number; difficulty?: number; world?: WorldRecipe } = {},
 ): Promise<THREE.Group> {
   worldSeed = (opts.seed ?? worldSeed) >>> 0;
   difficulty = Math.min(3, Math.max(1, opts.difficulty ?? difficulty));
+  // The game always builds the shipped tables; the worldgen bench passes
+  // its live-edited WorldRecipe here to preview a layout for real.
+  const world = opts.world ?? DEFAULT_WORLD;
 
   const t0 = performance.now();
   const rng = mulberry32(worldSeed);
-  const materials = createZoneMaterials();
+  const materials = createZoneMaterials(world);
   const group = new THREE.Group();
   worldGroup = group;
   extrasGroup = new THREE.Group();
 
-  const specs = placeChunks(rng);
+  const specs = placeChunks(rng, world, difficulty);
   const total = specs.length + 1;
+  const ctx: GenCtx = { difficulty, blastPoints };
   let triangles = 0;
 
   for (let i = 0; i < specs.length; i++) {
     const spec = specs[i];
-    const chunk = makeChunkData(rng, spec.center, spec.s, spec.res, spec.opts);
+    const chunk = makeChunkData(
+      rng,
+      spec.center,
+      spec.s,
+      spec.res,
+      spec.part,
+      ctx,
+      spec.axis ?? null,
+    );
     chunk.zone = spec.zone;
     chunks.push(chunk);
-    const mesh = meshChunk(chunk, spec.res, materials[spec.zone]);
+    const mesh = meshChunk(chunk, spec.res, materials[spec.zone]!);
     triangles += mesh.geometry.attributes.position.count / 3;
     group.add(mesh);
     onProgress(i + 1, total, spec.label);
@@ -1456,7 +1197,8 @@ export async function buildGoudaWorld(
     makeDebrisGeometry(rng),
     makeDebrisGeometry(rng),
   ];
-  for (let i = 0; i < DEBRIS_COUNT; i++) {
+  const crumbMaterial = materials.scree ?? materials[world.biomes[0].id]!;
+  for (let i = 0; i < world.debrisCount; i++) {
     for (let attempt = 0; attempt < 60; attempt++) {
       const host = chunks[Math.floor(rng() * chunks.length)];
       randDir(rng, _dir);
@@ -1468,7 +1210,7 @@ export async function buildGoudaWorld(
       );
       const s = 0.7 + rng() * 2.4;
       if (worldDistance(p.x, p.y, p.z) < s + 1.2) continue;
-      const crumb = new THREE.Mesh(crumbGeos[i % 3], materials.scree);
+      const crumb = new THREE.Mesh(crumbGeos[i % 3], crumbMaterial);
       crumb.position.copy(p);
       crumb.scale.setScalar(s);
       crumb.rotation.set(
@@ -1491,9 +1233,9 @@ export async function buildGoudaWorld(
     const r = c.center.length();
     return (
       c.biggestEye &&
-      r >= GOLD_BAND[0] &&
-      r <= GOLD_BAND[1] &&
-      c.biggestEye.r * c.s > 6
+      r >= world.goldBand.min &&
+      r <= world.goldBand.max &&
+      c.biggestEye.r * c.s > world.goldMinCavernR
     );
   });
   const host = candidates.length
@@ -1506,16 +1248,16 @@ export async function buildGoudaWorld(
     z: host.center.z + eye.z * host.s,
   };
   // Wheel is an item (game/items.ts), world only seeds position.
-  createBoundarySphere(extrasGroup);
+  createBoundarySphere(extrasGroup, world.boundaryR);
   createBlastMarkers(extrasGroup);
   scene.add(extrasGroup);
 
   // Spawn at drift edge; keep bathyscaphe exit corridor clear.
-  const p = new THREE.Vector3(0, 18, WORLD_R + 14);
+  const p = new THREE.Vector3(0, 18, world.worldR + 14);
   while (
     (worldDistance(p.x, p.y, p.z) < 6 ||
       worldDistance(p.x, p.y, p.z - 9) < 4) &&
-    p.z < BOUNDARY_R - 6
+    p.z < world.boundaryR - 6
   )
     p.z += 3;
   spawnPoint = p;

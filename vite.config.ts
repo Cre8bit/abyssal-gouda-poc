@@ -16,6 +16,8 @@ export default defineConfig({
         // Model/animation bench (src/bench/preview.ts) — ships with the
         // build so the deployed site exposes it at /preview.html too.
         preview: fileURLToPath(new URL("./preview.html", import.meta.url)),
+        // Worldgen bench (src/bench/worldgen.ts) — the cheese kit (M2).
+        worldgen: fileURLToPath(new URL("./worldgen.html", import.meta.url)),
       },
     },
   },

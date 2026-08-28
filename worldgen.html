@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Abyssal — Model Bench</title>
+    <title>Abyssal — World Gen Bench</title>
     <style>
       * {
         margin: 0;
@@ -34,7 +34,7 @@
         position: fixed;
         top: 12px;
         left: 12px;
-        width: 252px;
+        width: 288px;
         max-height: calc(100vh - 24px);
         overflow-y: auto;
         background: rgba(3, 16, 24, 0.82);
@@ -114,17 +114,40 @@
         margin-top: 5px;
       }
       .slider-row .name {
-        width: 62px;
+        width: 78px;
         color: #6fa3b8;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
       .slider-row .val {
-        width: 40px;
+        width: 46px;
         text-align: right;
         color: #d6f1ff;
       }
-      .slider-row input {
+      .slider-row input[type="range"] {
         flex: 1;
+        min-width: 0;
         accent-color: #4fb3e0;
+      }
+      .slider-row input.num {
+        flex: 1;
+        min-width: 0;
+        font: inherit;
+        color: #d6f1ff;
+        background: #0a2635;
+        border: 1px solid #1d4457;
+        border-radius: 4px;
+        padding: 2px 6px;
+      }
+      .slider-row input[type="color"] {
+        flex: 1;
+        min-width: 0;
+        height: 22px;
+        background: #0a2635;
+        border: 1px solid #1d4457;
+        border-radius: 4px;
+        padding: 1px 2px;
       }
       .hint {
         margin-top: 10px;
@@ -136,7 +159,7 @@
         position: fixed;
         right: 12px;
         bottom: 12px;
-        width: 224px;
+        width: 236px;
         background: rgba(3, 16, 24, 0.82);
         border: 1px solid #1d4457;
         border-radius: 8px;
@@ -161,35 +184,17 @@
       .hud-line .v {
         color: #d6f1ff;
       }
-      .hud-bar {
-        margin-top: 5px;
-      }
-      .hud-bar .k {
-        color: #6fa3b8;
-        margin-bottom: 2px;
-      }
-      .hud-bar .track {
-        height: 5px;
-        background: #0a2635;
-        border-radius: 3px;
-        overflow: hidden;
-      }
-      .hud-bar .fill {
-        height: 100%;
-        width: 0%;
-        background: linear-gradient(90deg, #2a7da5, #7fd4ff);
-        border-radius: 3px;
-      }
 
       #loading {
         position: fixed;
         inset: 0;
-        display: flex;
+        display: none;
         align-items: center;
         justify-content: center;
         color: #4f9cbf;
         letter-spacing: 3px;
         pointer-events: none;
+        background: rgba(2, 10, 16, 0.35);
       }
     </style>
   </head>
@@ -198,29 +203,28 @@
 
     <div id="panel">
       <div class="nav">
-        <a class="on" href="./preview.html">models</a>
-        <a href="./worldgen.html">world gen</a>
+        <a href="./preview.html">models</a>
+        <a class="on" href="./worldgen.html">world gen</a>
       </div>
-      <h1>ABYSSAL · BENCH</h1>
+      <h1>ABYSSAL · WORLD GEN</h1>
       <div class="section">
-        <div class="label">Model</div>
-        <div class="row" id="models"></div>
+        <div class="label">Mode</div>
+        <div class="row" id="modes"></div>
       </div>
-      <div id="model-ui"></div>
+      <div id="tool-ui"></div>
       <div class="section">
-        <div class="label">Playback</div>
-        <div class="row">
-          <button id="btn-pause">pause</button>
-        </div>
-        <div id="global-sliders"></div>
+        <div class="label">View</div>
+        <div class="row" id="view-toggles"></div>
+        <div id="view-sliders"></div>
       </div>
       <div class="section">
-        <div class="label">Debug</div>
-        <div class="row" id="toggles"></div>
+        <div class="label">Config</div>
+        <div class="row" id="config-actions"></div>
       </div>
-      <div class="hint">
-        drag to orbit · wheel to zoom<br />
-        space = model action · R = reset cam
+      <div class="hint" id="page-hint">
+        drag to orbit · wheel to zoom (into tunnels)<br />
+        space = reroll seed · R = reset cam<br />
+        edits autosave locally — "copy" dumps a recipes.ts entry
       </div>
     </div>
 
@@ -229,8 +233,8 @@
       <div id="hud-body"></div>
     </div>
 
-    <div id="loading">loading model…</div>
+    <div id="loading">carving…</div>
 
-    <script type="module" src="/src/bench/preview.ts"></script>
+    <script type="module" src="/src/bench/worldgen.ts"></script>
   </body>
 </html>
