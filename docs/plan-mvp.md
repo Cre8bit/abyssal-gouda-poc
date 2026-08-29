@@ -40,19 +40,42 @@ array, so shuffling it later is one line and a re-run of the flood fill.
 | 0 | Open water | 420 → 300 | — | — | water | leave, orient |
 | 1 | The drift | 300 → 240 | `scatter` | drift crumb | water | scavenge — the driller wreck |
 | 2 | **The Great Wheel** | 236 → 230 (**6 u**) | `hull` | dark rind | — | **breach** |
-| 3 | The flooded belly | 230 → 150 | `scatter` | drift crumb, graded | water | fall, find the far wall |
-| 4 | **The Dark Veins** | 150 → 90 | `fused` | roquefort | — | navigate by veins |
-| 5 | **The Melt** | 90 → 50 | `fused` | fondue | **air** | cross the hot chambers |
-| 6 | **The Galleries** | 50 → 6 | `fused` | mite bore | — | get lost |
-| 7 | The heart | 6 → 0 | `chunk` | fresh curd | air pocket | take it |
+| 3 | **Dark Veins — drifting** | 230 → 150 | `scatter` | roquefort, graded inward | water | follow the lights |
+| 4 | **Dark Veins — the mass** | 150 → 90 | `fused` | roquefort | flooded | go inside, follow the veins |
+| 5 | **The Melt** | 90 → 45 | `fused` | fondue | flooded, hot | cross the hot caverns |
+| 6 | **The Galleries** | 45 → 6 | `fused` | mite bore | flooded | get lost |
+| 7 | The heart | 6 → 0 | `chunk` | fresh curd | flooded | take it |
+
+**There is no air-filled space anywhere in the game.** Every layer, including
+the melt, is water; "flooded" means the carved voids inside a fused mass are
+full of it, same as everywhere else. Air pockets are localized bubbles seeded
+per layer, not a change of medium — the melt seeds more of them than anywhere
+else, which is what makes it the run's last generous refill without the player
+ever leaving the water.
 
 Descent ≈ 420 u. Target ~12 min in, ~8 min out — the Ascent is shorter because
 the route is already opened and the air pockets are already popped.
 
-The **flooded belly** is not a biome and gets no new part: it is the drift's
-crumb, re-seeded dark and graded thick near the inner wall and thinning inward
-(W17), with a debris floor and the gnawed crown above (W16). Its whole job is to
-be the first genuinely dark place and to make the Wheel feel hollow.
+**The dark veins are one biome in two phases**, and they begin the instant you
+come through the crust. Behind the rind there is **no ambient light, no floor
+and no horizon** — only faint blue vein-glow inside floating chunks of
+roquefort, hanging in the black like lanterns. You swim to one, and from it you
+can just make out the next. The chunks grow larger and closer together inward
+(`sizeGrade` + `densityGrade`), so the trail tightens on its own and funnels the
+crew without a single instruction, until it ends at a mass that fills the fog in
+every direction. **That** is where you go inside, and from there to the heart
+you are within the cheese [D2].
+
+This replaces the old "flooded belly" of drift crumb. A dead grey crossing in
+total darkness gave the player nothing to steer by; a trail of dim blue lights
+gives them the only navigation the map ever offers, and it costs one recipe
+instead of two.
+
+The **melt** is then the release: not a tunnel network but three or four
+**cathedral-scale caverns**, 25–40 u across, lit by their own floors, where you
+can see the far wall and every teammate at once. Open, loud and hot, between two
+biomes that are blind, silent and tight — still fully underwater, just water
+gone hot, bright, and full of molten cheese billowing off the ceiling.
 
 The Wheel is a **classic dark natural rind**, not wax — see `cheese-parts.md`
 §3. That matters here for one reason: a 6 u husk cannot carry surface noise, so
@@ -202,24 +225,28 @@ time — **fail loudly, don't warn**.
       "crust": { "amp": 0.018 }, "sealed": true, "hollow": true,
       "budgets": { "softSpots": 2, "airPockets": 0, "essence": 0 } },
 
-    { "id": "belly", "mode": "scatter", "rOuter": 230, "rInner": 150,
-      "recipe": "drift_crumb", "count": 60, "size": [15, 40],
-      "water": true, "densityGrade": "outward",
-      "fog": { "range": 0.6, "color": "#101418" },
-      "budgets": { "airPockets": 3, "essence": 4 } },
+    { "id": "veins_drift", "mode": "scatter", "rOuter": 230, "rInner": 150,
+      "recipe": "roquefort_float", "count": 70, "size": [10, 45],
+      "water": true, "densityGrade": "inward", "sizeGrade": "inward",
+      "sightline": true,                       // each chunk visible from the last
+      "fog": { "range": 0.55, "color": "#0A0D12" }, "ambient": 0,
+      "budgets": { "airPockets": 3, "essence": 6, "faults": 8 } },
 
-    { "id": "dark_veins", "mode": "fused", "rOuter": 150, "rInner": 90,
+    { "id": "veins_mass", "mode": "fused", "rOuter": 150, "rInner": 90,
       "recipe": "roquefort", "size": 25, "res": 72,
       "fog": { "range": 0.5, "color": "#2b3350" }, "swimSpeedMul": 0.8,
       "budgets": { "airPockets": 2, "essence": 10, "faults": 14 } },
 
-    { "id": "the_melt", "mode": "fused", "rOuter": 90, "rInner": 50,
-      "recipe": "fondue", "size": 22, "res": 72, "airFilled": true,
-      "budgets": { "airPockets": 8, "essence": 8, "faults": 4 },
+    { "id": "the_melt", "mode": "fused", "rOuter": 90, "rInner": 45,
+      "recipe": "fondue", "size": 30, "res": 64, "temperature": 1.0,
+      "overlap": 0.15,                         // low — the caverns stay distinct
+      "budgets": { "airPockets": 8, "essence": 8, "faults": 4 },  // still water — just the biggest air-pocket budget in the map
       "hazards": [{ "type": "melt_fall", "count": 12 },
-                  { "type": "melt_pool", "count": 6 }] },
+                  { "type": "melt_pool", "count": 6 },
+                  { "type": "thermal_vent", "count": 8 },
+                  { "type": "heat_zone", "count": 3 }] },
 
-    { "id": "galleries", "mode": "fused", "rOuter": 50, "rInner": 6,
+    { "id": "galleries", "mode": "fused", "rOuter": 45, "rInner": 6,
       "recipe": "mite_bore", "size": 18, "res": 72,
       "budgets": { "airPockets": 1, "essence": 14, "faults": 0 } },
 
@@ -246,13 +273,26 @@ was a fine idea attached to a layer that no longer exists, and six strong parts
 beat ten with four passengers. They return as data if a later gate wants another
 band.
 
-Two parts carry the milestone's design risk and want the most bench time:
+Roquefort is authored **twice**: `roquefort_float` for the drifting phase
+(surface-visible emissive veins, seen from outside, graded larger inward) and
+`roquefort` for the mass you enter. Same material, two jobs.
+
+Three parts carry the milestone's design risk and want the most bench time:
+- **roquefort_float** — the trail. Its whole job is a sightline: each chunk's
+  glow visible from the previous one [N9]. If that fails, the first ten minutes
+  inside the gate are an unlit void with no information in it. Needs a
+  `sightline` validator at seed time, not eyeballing.
 - **mite bore** — the galleries. Tunnels *and* chambers, alternating without
   warning. Cargo clearance sits at 1.0 u against the Gouda's 1.3 u, deliberately;
   whether the haulable route is authored or carved is a Gate B answer.
 - **dark rind** — smooth by law, so its whole identity is the mould-ridge and
   cloth-weave texture, the near-black crust, and the pale paste showing through
   the crack web.
+
+The melt inverts the generator's usual job: **few eyes, huge `coreEye`, no dead
+ends** — 25–40 u caverns joined by wide throats. It is the one layer where the
+authoring is *volume*, and where the interesting work is the hazards, not the
+geometry (M5).
 
 **M2.6 · Bench support** *(0.5 d)* — the bench renders a **fused sample slab**,
 not one chunk (K4), and shows `r × res` and minimum clearance live beside the
@@ -269,8 +309,9 @@ Measure a bare descent and ascent, no tools, no objective.
 >
 > **Ask five things.** Can you tell which layer you're in, blind to the fog
 > colour, by how you're moving? Does the Wheel read as a *wheel* — an object,
-> not a wall? Is the belly a place or a long dark swim? Are the galleries
-> **lost** or merely **annoying**? Where did the descent sag?
+> not a wall? **With your lamp off, can you see the next roquefort chunk from the
+> one you're on?** Are the galleries **lost** or merely **annoying**? Where did
+> the descent sag?
 >
 > **If a layer doesn't announce itself:** it's decoration — merge it into its
 > neighbour. With five stops there is nowhere for a passenger to hide, which is
@@ -278,8 +319,9 @@ Measure a bare descent and ascent, no tools, no objective.
 > **If the galleries are annoying rather than lost:** the levers are chamber
 > frequency and dead-end ratio, in that order. A maze that only branches is a
 > hedge; a maze that opens into rooms is a place.
-> **If the belly is a long dark swim:** density gradient (W17) first, then the
-> three landmarks (W16) — not shrinking the Wheel.
+> **If the drifting phase is a long dark swim:** the trail is broken. Raise
+> `count`, strengthen the emissive veins, tighten `sizeGrade` — in that order.
+> Never add ambient light: the darkness is what makes the glow mean anything.
 > **If tunnels read as pipes:** check `r × res` before touching anything else.
 >
 > **Unlocks:** everything. Every remaining milestone is stakes, tools and
@@ -314,7 +356,8 @@ instanced additive sprites + a pool of 4 real `PointLight`s.
 against a blank inner wall.
 
 **M3.4 · Breach polish** *(0.5 d)* — the drill audio ramp, the crust giving way,
-the first sightline into the belly. This is a set-piece or it's a chore.
+and the first sightline through the hole — total black, with two or three faint
+blue lights hanging in it. That reveal is the reward for the whole first act.
 
 > ### ⏸ WAIT — Gate C · *Is the breach a set-piece?*
 >
@@ -357,26 +400,35 @@ items (M9.1, pulled forward) before softening the rule itself.*
 
 ## M5 — The melt · 3 days · *the one new system*
 
-The melt is **air-filled**: steam-pocketed chambers, orange light, the only
-place you can hear each other clearly and the **last generous air in the run**.
-It sits directly before the galleries so the crew arrives topped up, talking and
-warm — and then the galleries are dark, silent and drowning.
+The melt is **big, and still entirely underwater** — there is no air-filled
+space anywhere in the game. Three or four cathedral-scale caverns, 25–40 u
+across, lit orange from their own floors, the water itself gone hot and bright
+instead of cold and dark. Its whole reason to exist is contrast. The veins
+before it are blind and tight; the galleries after it are blind and tighter.
+This is the one open, lit, loud room in four hundred units of dark, and
+everything dangerous in it is in plain sight.
 
-**M5.1 · The chambers** *(1 d)* — `airFilled` on a fused layer: no water volume,
-movement swaps from swim to a heavy low-gravity walk and climb, voice occlusion
-drops, oxygen refills freely. The biggest sensory swap in the game, and it is
-mostly the *absence* of the water shader.
+**M5.1 · The caverns** *(1 d)* — `temperature` on a fused layer, plus the
+biggest `budgets.airPockets` in the map. No medium change, no movement-mode
+swap: the player still swims, the water is just visibly hot and self-lit.
+Authoring is **volume**, not detail: few eyes, huge `coreEye`, wide throats, no
+dead ends.
 
-**M5.2 · Falls and pools** *(1 d)* — molten cheese sheets off the ceiling in
-slow telegraphed ropes; pools on the floor **move**. Cooled floes are climbable
-platforms, so the route through a chamber is partly built by what has already
-fallen.
+**M5.2 · The heat hazards** *(1 d)* — `melt_fall` (telegraphed ropes billowing
+off the ceiling into the water — sag, bulge, drip, *then* the fall),
+`melt_pool` (bright, moving, crusting over and re-opening on the floor),
+`thermal_vent` (a rhythmic underwater jet of superheated water that blinds and
+shoves — and rides you up a shaft if you time it), and an ambient `heat_zone`
+near the hottest chambers that slowly burns O₂, so the refill isn't free.
+**Cooled floes** are the counterpart: climbable footing placed by what already
+fell, so the route across a floor is partly built out of the hazard.
 
 **M5.3 · Engulfed** *(1 d)* — **not death**: `coated` — slowed, vision fouled,
-O₂ drain ×2, cleared by a teammate scraping you out or by reaching water.
-Instant death in a hazard biome makes people stop moving. Admitted under the
-standing rule because it also **weaponises**: a fresh fall can be dropped on
-something following you.
+O₂ drain ×2, cleared by a teammate scraping you off, or by swimming through a
+`thermal_vent`'s cold counter-current, which shocks the coating loose. Instant
+death in a hazard biome makes people stop moving. Admitted under the standing
+rule because it also **weaponises**: a fresh fall can be dropped on something
+following you.
 
 > ### ⏸ WAIT — Gate D · *Is the melt a hazard or a refill?*
 >
@@ -403,7 +455,9 @@ consumes the pocket; **popped pockets stay popped and read as visibly deflated**
 (S11), so the way home is drier than the way in through the same rooms. Seeded,
 so peers agree for free.
 
-**M6.2 · The curve** *(1 d)* — surplus in the drift and the belly, **the last
+**M6.2 · The curve** *(1 d)* — surplus in the drift and the drifting veins (the
+pockets are inside the floating chunks, which is also a reason to stop at one),
+thinning through the vein mass, **the last
 big refill in the melt**, deficit from the galleries inward (S10). The heart has
 exactly one pocket and it is the last one in the game. Quiet HUD above ~40%;
 below that escalate hard — breathing, heartbeat, vignette. The materials already
@@ -551,10 +605,10 @@ now that the layers are real.
 - **Fused mass at high res blows the frame budget.** Small chunks at res 72 is
   the expensive corner. Profile in M2.2; the fallback is fewer, larger fused
   chunks and a slightly softer maze.
-- **The melt is a third system in disguise.** Air-filled movement, moving hazard
-  volumes and a status effect in three days is optimistic. If it slips, ship
-  M5.1 alone — a lit air chamber with no falls — and take Gate D on that. The
-  structural work is the air, not the lava.
+- **The melt is a third system in disguise.** Moving hazard volumes underwater
+  plus a status effect in three days is optimistic. If it slips, ship M5.1
+  alone — a lit, hot, open cavern with no falls — and take Gate D on that. The
+  structural work is the light and the volume, not the hazards.
 - **The transport scheme is wrong.** Still the deepest risk, still day one,
   still Gate A — and now it gates a 10-day milestone, which is exactly why it
   stays first.

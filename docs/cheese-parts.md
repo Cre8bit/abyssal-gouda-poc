@@ -188,12 +188,8 @@ tunnels{ rBase 0.06, bends 0 }  exits 2  deadEnds 0
 tags: hand-carve
 ```
 
-**Placement.** Two layers use it. In the **drift** (r 300→240): `count ~140`,
-`water: true`, sparse, one `wreck` prop containing the driller. In the **flooded
-belly** inside the Wheel (r 230→150): the same recipe re-seeded larger
-(`size 15–40`) and darker, `densityGrade: "outward"` so it's thick against the
-inner wall and thins toward the middle — otherwise the 80 u crossing is two
-minutes of nothing.
+**Placement.** One layer only: the **drift** (r 300→240), `count ~140`,
+`water: true`, sparse, one `wreck` prop containing the driller.
 
 **What the player does.** Orients. Finds the driller. Learns that cheese can be
 punched through, before anything punches back.
@@ -263,19 +259,55 @@ seconds. Then loses the door.
 
 ---
 
-### ▸ roquefort — *the dark veins*
+### ▸ roquefort — *the dark veins* · **two phases**
 
-**What it is.** The first biome inside. Fused blue-grey paste that eats light:
-your lamp reaches a third as far, the water is sticky, you move at 80%. The only
-thing visible is the vein network — which is also the only thing you can dig by
-hand. **Follow the veins or drill blind.**
+**What it is.** Everything inside the Wheel, all the way from the breach to the
+melt. You come through the crust into **total darkness** — no ambient light, no
+horizon, no floor — and the only things in the world are faint blue vein-lights
+hanging in the black. The biome is one continuous idea (*the veins are the only
+information*) expressed twice, at two scales.
 
-**Look.** Near-black paste, cold blue-grey where light lands. The veins are the
-one light source: a branching graph of blue-green mould that glows faintly and
-brightens as you approach, with mould spores drifting in the beam. Everything
-else is fog.
+#### Phase 1 — the drifting veins · `scatter`, in water · r 230 → 150
 
-**Numbers.**
+Floating chunks of roquefort, dark and invisible except for the vein networks
+glowing faintly inside them. They read as **lanterns in a void**: you swim to
+one, and from it you can just make out the next. **The trail is the navigation**
+— there is nothing else, not even a wall.
+
+The chunks get **bigger and closer together as you go inward**, so the trail
+tightens on its own and the player is funnelled without ever being told. The
+last few are house-sized, and then the trail ends at a mass that fills the fog
+in every direction.
+
+```
+kind: hunk · size 10 → 45 (graded inward) · res 56
+hardness 0 along veins / 1 across · porosity 0.35 · odour 0.5
+crust  { amp 0.07, freq 1.6, depth 0.22 }
+eyes   { 4–8, rBase 0.08 }   coreEye 0
+tunnels{ rBase 0.06, bends 1 }  exits 2  deadEnds 1
+veins: surface-visible, emissive, always on
+tags: fault, dark, landmark, hand-carve
+```
+
+Placement: `mode: "scatter"`, r 230→150, `water: true`,
+`densityGrade: "inward"`, `sizeGrade: "inward"`, `count ~70`, budgets
+`airPockets 3, essence 6, faults 8`.
+
+**Design rules for the trail.** Each chunk's glow must be visible from the
+previous one [N9] — that sightline *is* the level design, and it's the only
+place in the map where the game quietly leads you. Small pockets of air live
+inside a few of them, so the trail is also a reason to stop. **Two or three
+chunks are dead ends off the main line**, far enough apart to cost a minute, not
+a run.
+
+#### Phase 2 — the vein mass · `fused` · r 150 → 90
+
+The trail ends at one continuous body of roquefort and you go **inside** it. No
+more water between parts [D2]; from here to the heart you are within the cheese.
+Your lamp reaches a third as far, the water is sticky, you move at 80%. The vein
+graph is the route, the light, and the only thing hand-diggable: **follow the
+veins or drill blind.**
+
 ```
 kind: hunk · size 20–30 · res 64
 hardness 0 along veins / 1 across · porosity 0.4 · odour 0.5
@@ -286,61 +318,100 @@ biome:  lightRange ×0.35, fogDensity ×2.5, drag ×1.25, veinStrength 1.0
 tags: fault, dark, hand-carve
 ```
 
-**Placement.** `mode: "fused"`, r 150→90, `swimSpeedMul 0.8`, budgets
+Placement: `mode: "fused"`, r 150→90, `swimSpeedMul 0.8`, budgets
 `airPockets 2, essence 10, faults 14`.
 
-**The generator change this needs.** Veins become a **real connected graph** that
-the tunnel spanning tree follows, instead of a shader effect — "follow the light"
-has to be literally true. Open question Q8: some proportion of veins must
-dead-end, or the biome is a corridor with mood. Brittle vein routes that collapse
-behind you are the cheap version of the same tension; take that if the graph work
-overruns.
+**The entrance matters.** The mass should have a small number of visible mouths
+where veins converge and break the surface — the same read as the Wheel's soft
+spot, at a tenth the scale, and hand-carvable rather than drilled. Finding the
+way *in* is the last beat of phase 1.
 
-**Bench check.** Kill all lights except the veins. Can you still navigate? If
-yes, the vein graph is doing its job. If you're lost without a lamp, the graph
-isn't connected.
+**The generator change both phases need.** Veins become a **real connected
+graph** that the tunnel spanning tree follows, instead of a shader effect —
+"follow the light" has to be literally true, and in phase 1 it has to be visible
+from *outside* the chunk. Open question Q8: some proportion must dead-end, or
+the biome is a corridor with mood. Brittle vein routes that collapse behind you
+are the cheap version of the same tension; take that if the graph work overruns.
+
+**Bench check.** Kill all lights except the veins, in both phases. Can you still
+navigate? In phase 1, can you see the next chunk from the current one — with a
+lamp *off*? If not, the trail isn't a trail and the darkness is just darkness.
 
 ---
 
 ### ▸ fondue — *the melt*
 
-**What it is.** Thermal vents from the heart have cooked this layer soft. The
-melt is **air-filled**: steam-pocketed chambers, orange light, the only place
-you can hear each other clearly and the **last generous air in the run**. It
-sits directly before the galleries so the crew arrives topped up, talking and
-warm — and then the galleries are dark, silent and drowning.
+**What it is.** Thermal vents from the heart have cooked this layer soft. **It
+is still fully submerged** — there is no air-filled space anywhere in the game
+— but the water itself has changed: hot, churning, lit orange from below by
+vents in the floor, streaked with ribbons of molten cheese pouring off the
+ceiling and dispersing into the current like ink. Three or four cavernous voids
+rather than a tunnel network, so it's the one place you can see the far wall,
+the ceiling, and every teammate at once — the release valve between two hours of
+dark, the veins before it blind and tight, the galleries after it blind and
+tighter.
 
-**Look.** Wet, glossy, molten orange-gold sheeting off the ceiling in slow
-ropes; cooled floes on the floor in dull amber, crusted and climbable. Steam
-haze instead of water fog — thinner, brighter, self-lit from below. Everything
-strings and sags. High odour: this is the loudest-smelling place in the map.
+**Space first.** This biome is defined by volume, not by geometry detail. Three
+or four chambers, each **25–40 u across**, connected by short wide throats.
+Everything dangerous here is in plain sight, and that's the deal: **open, lit
+and hazardous** against **tight, blind and empty**.
+
+**Look.** Wet, glossy, molten orange-gold billowing off the ceiling in slow
+ropes that *dissolve into the water* rather than falling through air — think an
+underwater vent plume, not a waterfall. Cooled floes crusted on the floor in
+dull amber. Water fog stays, but thinner and warmer-tinted, and it glows instead
+of muddying. Everything strings and sags; no crisp edges anywhere. High odour:
+the loudest-smelling place in the map.
 
 **Numbers.**
 ```
-kind: hunk · size 20–24 · res 72
-hardness 1 · porosity 0.65 · odour 0.8
-crust  { amp 0.09, freq 1.4, depth 0.3 }      ← sagging, molten, not crisp
-eyes   { 6–10, rBase 0.16, rVar 0.06 }  coreEye 0.25   ← chambers, on purpose
+kind: hunk · size 28–34 · res 64                  ← big chunks, big voids
+hardness 1 · porosity 0.75 · odour 0.8
+crust  { amp 0.09, freq 1.4, depth 0.3 }          ← sagging, molten, not crisp
+eyes   { 3–5, rBase 0.34, rVar 0.08 }  coreEye 0.45   ← caverns, not chambers
 pores  { 4–8, rBase 0.05 }
-tunnels{ rBase 0.075, bends 1 }  exits 3  deadEnds 2
-biome:  airFilled true, lightRange ×1.4, fogDensity ×0.6,
-        soundOcclusion 0.2, temperature 1.0
-tags: air-pocket, hot, hand-carve
+tunnels{ rBase 0.11, bends 0–1 }  exits 3  deadEnds 0   ← wide throats, no maze
+biome:  lightRange ×1.4, fogDensity ×0.6, temperature 1.0
+tags: air-pocket, hot, open, hand-carve
 ```
 
-**Placement.** `mode: "fused"`, r 90→50, `airFilled: true`, budgets
-`airPockets 8, essence 8, faults 4`, hazards `melt_fall ×12`, `melt_pool ×6`.
+Note the inversion against every other part: **high `coreEye`, few eyes, no dead
+ends.** The melt is the one place where the generator should be making *rooms*
+and getting out of the way.
+
+**Placement.** `mode: "fused"`, r 90→45, `overlap` low so the caverns stay
+distinct, budgets `airPockets 8, essence 8, faults 4` — the air pockets sit
+under the ceiling here same as anywhere else (S3/D10), and there are more of
+them than in any other biome: this is still **the last generous refill in the
+run**, it's just an ordinary air pocket doing the work, not a change of medium.
+
+**The heat hazards.** All four are the same rule — visible, telegraphed, and
+usable against something else. All happen *in water*.
+
+| Hazard | Reads as | Does |
+|---|---|---|
+| `melt_fall` ×12 | a sag, a bulge, then a rope of molten cheese billowing off the ceiling into the current | `coated` on contact; can be triggered early and dropped on a pursuer |
+| `melt_pool` ×6 | bright, roiling patch on the floor, crusting over and re-opening | `coated`; the crust supports weight for about a second before giving way |
+| `thermal_vent` ×8 | a plume of superheated water and dissolved cheese jetting from a floor crack, on a rhythm | blinds and shoves; rides you up a shaft if you time it — the underwater equivalent of a geyser |
+| `heat_zone` (ambient) | visible shimmer/distortion where hot and cold water mix | slow O₂ burn near the hottest chambers — the reason it isn't a free rest stop |
+
+**Cooled floes** are the counterpart: dull amber slabs crusted grey on the
+floor, climbable footing in an otherwise open volume, and *placed by what
+already fell*. The route across a cavern floor is partly built out of its own
+hazard.
 
 **What the player does.**
-- **Breathes.** `airFilled` means no water volume: movement swaps from swim to a
-  heavy low-gravity climb, voice occlusion drops, oxygen refills freely. This is
-  the biggest sensory swap in the game and most of it is the *absence* of the
-  water shader.
-- **Reads the ceiling.** Falls are telegraphed — a sag, a drip, then the rope.
+- **Still swims.** No movement-mode change anywhere in this biome — the "biggest
+  sensory swap" is the water itself going hot, bright and orange instead of cold
+  and dark, not a swap out of water. Voice occlusion still applies as normal;
+  this biome doesn't get quieter, it gets *visible*.
+- **Reads the ceiling.** Falls are telegraphed — a sag, a bulge, then the rope
+  billowing into the water.
 - **Gets engulfed, and gets pulled out.** Being caught is **not death**:
-  `coated` — slowed, vision fouled, O₂ drain ×2, cleared by a teammate scraping
-  you out or by reaching water. Instant death in a hazard biome makes people stop
-  moving.
+  `coated` — slowed, vision fouled, O₂ drain ×2. Cleared by a teammate scraping
+  it off, or by swimming through a `thermal_vent`'s cold counter-current (the
+  temperature shock cracks the coating loose). Instant death in a hazard biome
+  makes people stop moving.
 - **Weaponises it.** A fresh fall can be dropped on something following you. That
   offensive use is why this hazard was admitted at all; a hazard that only taxes
   you is friction.
@@ -458,11 +529,18 @@ no geometry crosses the network.
 | 0 | Open water | 420 → 300 | — | — | water |
 | 1 | The drift | 300 → 240 | `scatter` | drift crumb | water |
 | 2 | **The Great Wheel** | 236 → 230 (6 u) | `hull` | dark rind | — |
-| 3 | The flooded belly | 230 → 150 | `scatter` | drift crumb, graded | water |
-| 4 | **The Dark Veins** | 150 → 90 | `fused` | roquefort | — |
-| 5 | **The Melt** | 90 → 50 | `fused` | fondue | **air** |
-| 6 | **The Galleries** | 50 → 6 | `fused` | mite bore | — |
-| 7 | The heart | 6 → 0 | `chunk` | fresh curd | air pocket |
+| 3 | **Dark Veins — drifting** | 230 → 150 | `scatter` | roquefort, graded inward | water |
+| 4 | **Dark Veins — the mass** | 150 → 90 | `fused` | roquefort | flooded |
+| 5 | **The Melt** | 90 → 45 | `fused` | fondue | flooded, hot |
+| 6 | **The Galleries** | 45 → 6 | `fused` | mite bore | flooded |
+| 7 | The heart | 6 → 0 | `chunk` | fresh curd | flooded |
+
+**There is no air-filled space anywhere in the game.** "Flooded" means the
+carved voids inside a fused mass are full of water, same as everywhere else —
+the game never leaves the swim/O₂ system. Air pockets are localized bubbles
+seeded per-layer (`budgets.airPockets`), not a change of medium; the melt just
+seeds more of them than any other layer, which is what makes it the run's last
+generous refill.
 
 **Rules the loader enforces at seed time — fail loudly, don't warn:**
 
@@ -503,10 +581,12 @@ modifiers: {
   fogDensity: number;      // ×, W11
   drag: number;            // ×
   soundOcclusion: number;  // 0–1
-  temperature?: number;    // the melt
+  temperature?: number;    // the melt — water heat, not a medium change
 };
-airFilled?: boolean;       // the melt — no water volume, walk/climb, free O₂
 ```
+
+There is no `airFilled` flag. Every layer is water; the melt is `temperature`
+turned up and a heavier `budgets.airPockets`, nothing else.
 
 ### `BiomePlacement` modes
 
@@ -514,7 +594,9 @@ airFilled?: boolean;       // the melt — no water volume, walk/climb, free O�
 | { mode: "scatter";                 // floating parts in water
     rMin: number; rMax: number;
     count: number;
-    densityGrade?: "outward" | "inward" | "none" }
+    densityGrade?: "outward" | "inward" | "none";
+    sizeGrade?: "outward" | "inward" | "none";   // the drifting veins get bigger inward
+    sightline?: boolean }                        // enforce: each chunk visible from the last
 
 | { mode: "hull";                    // generalises "shell" (K8)
     surface: "sphere" | "wheel";     // wheel = squat cylinder + rounded rim
