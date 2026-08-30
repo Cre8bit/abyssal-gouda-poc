@@ -45,13 +45,12 @@ import {
   getSeededProps,
   getSpawnPoint,
   makeChunkData,
-  makeFrame,
   meshChunk,
   mulberry32,
   nearestSpinePoint,
   planWorldLayout,
-  R0,
   updateGouda,
+  updateGoudaMaterial,
   worldDistance,
   type Chunk,
   type GenCtx,
@@ -60,6 +59,7 @@ import {
   type WorldData,
   type WorldPlan,
 } from "../world/gouda.ts";
+import { makeFrame, R0 } from "../world/sdf.ts";
 import { traceTrail, type VerifyResult } from "../world/verify.ts";
 import type { VerifyReply, VerifyRequest } from "./verifyWorker.ts";
 import {
@@ -1016,26 +1016,18 @@ function skinSource(): BiomeMaterial {
   return (skin ?? world.biomes[0]).material;
 }
 
+// WG-24: skins are uniform-driven — a material edit writes the live
+// uniforms in place, no new material, no recompiled program, no disposal
+// bookkeeping (which WG-17e used to need).
 function refreshSkin(): void {
   if (!content || view.mode === "map") return;
-  const mat = makeSkinMaterial(skinSource());
-  const replaced = new Set<THREE.Material>();
+  const skin = skinSource();
   content.traverse((o) => {
     const m = o as THREE.Mesh;
-    if (m.isMesh && (m.material as THREE.MeshToonMaterial).userData.__toon) {
-      replaced.add(m.material as THREE.Material);
-      m.material = mat;
-    }
+    if (!m.isMesh) return;
+    for (const mat of Array.isArray(m.material) ? m.material : [m.material])
+      updateGoudaMaterial(mat as THREE.Material, skin);
   });
-  // WG-17e: the replaced skins are dead the moment every mesh points at the
-  // new one — dispose NOW, or a color-slider drag piles up one compiled
-  // program per input event until the next rebuild.
-  for (const old of replaced) {
-    if (old === mat) continue;
-    old.dispose();
-    const i = disposables.indexOf(old);
-    if (i >= 0) disposables.splice(i, 1);
-  }
   applyWire();
 }
 
@@ -1131,7 +1123,7 @@ function rebuildPart(): void {
     { difficulty: view.difficulty, blastPoints: blast },
   );
   const tGen = performance.now();
-  const mesh = meshChunk(chunk, view.partRes, makeSkinMaterial(skinSource()));
+  const mesh = meshChunk(chunk, makeSkinMaterial(skinSource()));
   mesh.userData.zone = part.id;
   chunk.field = null; // the bench never digs; drop the cached voxels
   const tMesh = performance.now();
@@ -1217,7 +1209,7 @@ async function rebuildBiome(): Promise<void> {
     if (token !== buildToken) return; // superseded by a newer rebuild
     const c = placed[i];
     const chunk = makeChunkData(rng, c.center, c.s, c.res, c.part, ctx);
-    const mesh = meshChunk(chunk, c.res, mat);
+    const mesh = meshChunk(chunk, mat);
     mesh.userData.zone = biome.id;
     chunk.field = null;
     // Walk collision runs in world coords — bake the wedge recentre in.
@@ -1307,7 +1299,7 @@ async function rebuildLayerWedge(
     await tick();
     if (token !== buildToken) return;
     const chunk = chunks[i];
-    const mesh = meshChunk(chunk, chunk.res, mat);
+    const mesh = meshChunk(chunk, mat);
     mesh.userData.zone = biome.id;
     chunk.field = null;
     chunk.center = chunk.center.clone().add(group.position);

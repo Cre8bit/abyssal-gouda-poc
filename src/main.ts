@@ -255,7 +255,12 @@ async function buildWorld(rebuild = false) {
     loaderLabel.textContent = `seed ${game.seed} · carving ${label} · ${done}/${total}`;
   };
   const build = rebuild ? rebuildWorld : loadWorld;
-  await build(progress, { seed: game.seed, difficulty: game.difficulty });
+  // stream: mesh the spawn's surroundings now, the rest by distance (WG-22).
+  await build(progress, {
+    seed: game.seed,
+    difficulty: game.difficulty,
+    stream: true,
+  });
   // Spawn at drift edge (O₂ recharge zone, bathyscaphe berth).
   placeAtSpawn(getSpawnPoint());
   refillOxygen();
@@ -470,7 +475,15 @@ function tryDig() {
     const local = result.spinLocal;
     sendEvent(
       local
-        ? { kind: "dig", c: local.chunk, x: local.x, y: local.y, z: local.z, r, tool }
+        ? {
+            kind: "dig",
+            c: local.chunk,
+            x: local.x,
+            y: local.y,
+            z: local.z,
+            r,
+            tool,
+          }
         : { kind: "dig", x: hit.x, y: hit.y, z: hit.z, r, tool },
     );
   }

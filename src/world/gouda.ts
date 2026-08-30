@@ -61,10 +61,28 @@
 // the handshake, so peers share the exact same maze.
 
 import * as THREE from "three";
-import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
-import { MarchingCubes } from "three/examples/jsm/objects/MarchingCubes.js";
 import { toonMaterial } from "../render/toon.ts";
 import type { DigTool, Vec3 } from "../state.ts";
+import type { MeshJob, MeshResult } from "./meshWorker.ts";
+import {
+  bodySdfWorld,
+  chunkSdf,
+  fbm3,
+  frameRadius,
+  hullSolidSdf,
+  makeFrame,
+  meshChunkBuffers,
+  R0,
+  SMOOTH_K,
+  smoothCut,
+  type ChunkMeshBuffers,
+  type ChunkShape,
+  type LayerBody,
+  type SoftSpot,
+  type SphereCarve,
+  type Tunnel,
+  type WorldFrame,
+} from "./sdf.ts";
 import {
   WHEEL_WORLD,
   pickPart,
@@ -87,52 +105,9 @@ export const HEART_POS = { x: 0, y: 0, z: 0 }; // map center — a DECOY.
 // its glow leaking out of tunnel mouths, dig. getGoldPos() is only the SEED
 // position — once the run starts the wheel is an item and it moves.
 
-const MAX_POLYS: Record<number, number> = {
-  96: 220000,
-  72: 140000,
-  64: 110000,
-  56: 90000,
-  48: 70000,
-  32: 24000,
-};
-
-// Local-space (unit-sphere) shape parameters. Surface ~ |p| = R0, grid [-1,1].
-// Exported for the worldgen bench (proxy sphere radius ≈ chunk s · R0).
-export const R0 = 0.6;
-const CARVE_SKIP = 0.3;
-const SMOOTH_K = 0.05;
-const PLANE_K = 0.025;
-
-const noise = new ImprovedNoise();
-
 // --- Types (erased at runtime) ---------------------------------------------------
 
 type Rng = () => number;
-
-interface PlaneCut {
-  nx: number;
-  ny: number;
-  nz: number;
-  off: number;
-}
-
-// Eyes (caverns/chambers), pores AND player digs all share this shape.
-interface SphereCarve {
-  x: number;
-  y: number;
-  z: number;
-  r: number;
-}
-
-interface Tunnel {
-  ax: number;
-  ay: number;
-  az: number;
-  bx: number;
-  by: number;
-  bz: number;
-  r: number;
-}
 
 // Generation context threaded through makeChunkData so the worldgen bench
 // can generate isolated chunks without touching this module's world state.
@@ -157,31 +132,17 @@ interface SpinState extends ChunkSpin {
   sin: number;
 }
 
-export interface Chunk {
+// The SDF core (sdf.ts) reads the ChunkShape view; the runtime fields live
+// here: hardness gates digging, field caches the dug voxels, mesh is live.
+export interface Chunk extends ChunkShape {
   center: THREE.Vector3;
-  s: number;
-  res: number;
-  ix: number;
-  iy: number;
-  iz: number;
-  minAxis: number;
-  nOff: number;
-  amp: number;
-  freq: number;
-  crustDepth: number;
-  planes: PlaneCut[];
-  holes: SphereCarve[];
-  tunnels: Tunnel[];
-  digs: SphereCarve[];
   hardness: number; // 0 hands · 1 driller · 2 driller-slow · 3 no-dig
   field: Float32Array | null;
   mesh: THREE.Mesh | null;
   biggestEye?: SphereCarve | null; // set by makeChunkData
   zone?: ZoneName; // set by buildGoudaWorld
-  body?: LayerBody; // layer-body tile: base SDF comes from the layer, not the ellipsoid
   sealed?: boolean; // seal tiles never receive foreign carves (noCarveWithin)
   spin?: SpinState; // rotating scatter chunk (WG-12); queries un-rotate probes
-  veinEdges?: boolean; // bake the aVein edge-glow attribute at extraction (WG-13)
 }
 
 export interface ChunkSpec {
@@ -291,57 +252,6 @@ function randDir(rng: Rng, out: THREE.Vector3): THREE.Vector3 {
   return out;
 }
 
-// --- SDF primitives -----------------------------------------------------------------
-
-function fbm3(x: number, y: number, z: number): number {
-  return (
-    noise.noise(x, y, z) +
-    0.5 * noise.noise(x * 2.13 + 7.7, y * 2.13 + 3.1, z * 2.13 + 11.6)
-  );
-}
-
-function smoothCut(d: number, cut: number, k: number): number {
-  const b = -cut;
-  const h = Math.max(k - Math.abs(d - b), 0) / k;
-  return Math.max(d, b) + h * h * k * 0.25;
-}
-
-function smoothMax(a: number, b: number, k: number): number {
-  const h = Math.max(k - Math.abs(a - b), 0) / k;
-  return Math.max(a, b) + h * h * k * 0.25;
-}
-
-function segDist(
-  px: number,
-  py: number,
-  pz: number,
-  ax: number,
-  ay: number,
-  az: number,
-  bx: number,
-  by: number,
-  bz: number,
-): number {
-  const abx = bx - ax,
-    aby = by - ay,
-    abz = bz - az;
-  const apx = px - ax,
-    apy = py - ay,
-    apz = pz - az;
-  let t =
-    (apx * abx + apy * aby + apz * abz) / (abx * abx + aby * aby + abz * abz);
-  t = Math.max(0, Math.min(1, t));
-  const dx = apx - abx * t,
-    dy = apy - aby * t,
-    dz = apz - abz * t;
-  return Math.sqrt(dx * dx + dy * dy + dz * dz);
-}
-
-function smoothMin(a: number, b: number, k: number): number {
-  const h = Math.max(k - Math.abs(a - b), 0) / k;
-  return Math.min(a, b) - h * h * k * 0.25;
-}
-
 // Rodrigues rotation of a chunk-relative vector about the spin axis. Pass
 // -sp.sin to un-rotate a world probe into the chunk's frame, +sp.sin to push
 // chunk-local data back out to world.
@@ -370,37 +280,6 @@ function spinRotate(
   out.z = z * cos + (kx * y - ky * x) * sin + kz * dot;
 }
 
-// --- World frame (squash + tilt) — layer-body radii are measured here ------------
-
-// Precomputed rotation (tilt about X) + vertical squash. null = identity,
-// and the identity path must not touch the numbers.
-export interface WorldFrame {
-  cos: number;
-  sin: number;
-  squash: number;
-}
-
-export function makeFrame(
-  recipe: { squash: number; tiltDeg: number } | undefined,
-): WorldFrame | null {
-  if (!recipe) return null;
-  const rad = (recipe.tiltDeg * Math.PI) / 180;
-  return { cos: Math.cos(rad), sin: Math.sin(rad), squash: recipe.squash };
-}
-
-// Frame radius of a world point (identity: plain length).
-export function frameRadius(
-  f: WorldFrame | null,
-  x: number,
-  y: number,
-  z: number,
-): number {
-  if (!f) return Math.sqrt(x * x + y * y + z * z);
-  const fy = (f.cos * y - f.sin * z) / f.squash;
-  const fz = f.sin * y + f.cos * z;
-  return Math.sqrt(x * x + fy * fy + fz * fz);
-}
-
 // Frame-space direction+radius → world point.
 function frameToWorld(f: WorldFrame | null, v: THREE.Vector3): THREE.Vector3 {
   if (!f) return v;
@@ -409,203 +288,6 @@ function frameToWorld(f: WorldFrame | null, v: THREE.Vector3): THREE.Vector3 {
   v.y = f.cos * y + f.sin * z;
   v.z = -f.sin * y + f.cos * z;
   return v;
-}
-
-// --- Layer bodies (fused bands, hulls) --------------------------------------------
-
-export interface SoftSpot {
-  x: number;
-  y: number;
-  z: number;
-  r: number;
-}
-
-export interface LayerBody {
-  kind: "band" | "hull";
-  frame: WorldFrame | null;
-  nOff: number; // layer-level crust noise offset (tile continuity)
-  // band
-  rMin: number;
-  rMax: number;
-  warpAmp: number;
-  warpFreq: number;
-  // hull ("wheel" = squat rounded cylinder in the tilted frame; "sphere")
-  surface: "wheel" | "sphere";
-  R: number;
-  halfH: number;
-  rim: number;
-  thickness: number;
-  ridgeAmp: number;
-  ridgeFreq: number;
-  softSpots: SoftSpot[];
-  // Hull hidden entrance (WG-08), world-space carves owned by THIS layer —
-  // sealed tiles refuse foreign carves, but the door belongs to the seal.
-  entranceCarves?: { holes: SphereCarve[]; tunnels: Tunnel[] };
-}
-
-// The hull's FULL solid (wheel/sphere before hollowing) — the husk is
-// max(solid, -solid - thickness), and soft-spot projection bisects this.
-function hullSolidSdf(b: LayerBody, x: number, y: number, z: number): number {
-  // Untilt only (no squash): the wheel has its own height.
-  const f = b.frame;
-  let qy = y,
-    qz = z;
-  if (f) {
-    qy = f.cos * y - f.sin * z;
-    qz = f.sin * y + f.cos * z;
-  }
-  if (b.surface === "sphere") return Math.sqrt(x * x + qy * qy + qz * qz) - b.R;
-  const rxz = Math.sqrt(x * x + qz * qz);
-  const d2 = rxz - (b.R - b.rim);
-  const dy = Math.abs(qy) - (b.halfH - b.rim);
-  const mx = Math.max(d2, 0);
-  const my = Math.max(dy, 0);
-  let solid =
-    Math.min(Math.max(d2, dy), 0) + Math.sqrt(mx * mx + my * my) - b.rim;
-  if (b.ridgeAmp > 0 && dy > d2)
-    solid += b.ridgeAmp * Math.sin(rxz * b.ridgeFreq);
-  return solid;
-}
-
-// World-unit distance to the layer's solid. Approximate SDF (anisotropic
-// squash + warp break exactness) but sign-correct, which is all marching
-// cubes and sphere-tracing with conservative steps need.
-function bodySdfWorld(b: LayerBody, x: number, y: number, z: number): number {
-  const f = b.frame;
-  let d: number;
-  if (b.kind === "band") {
-    let rr = frameRadius(f, x, y, z);
-    if (b.warpAmp > 0)
-      rr +=
-        b.warpAmp *
-        fbm3(
-          x * b.warpFreq + b.nOff,
-          y * b.warpFreq + b.nOff * 1.7,
-          z * b.warpFreq + b.nOff * 0.6,
-        );
-    d = Math.max(rr - b.rMax, b.rMin - rr);
-    if (f) d *= Math.min(1, f.squash);
-  } else {
-    const solid = hullSolidSdf(b, x, y, z);
-    d = Math.max(solid, -solid - b.thickness);
-    for (const s of b.softSpots) {
-      const dx = x - s.x,
-        dyy = y - s.y,
-        dz = z - s.z;
-      d = smoothMin(
-        d,
-        Math.sqrt(dx * dx + dyy * dyy + dz * dz) - s.r,
-        s.r * 0.8,
-      );
-    }
-  }
-  return d;
-}
-
-// Uncarved body SDF: rind (outer) vs. paste (carved interior).
-function baseSdf(c: Chunk, x: number, y: number, z: number): number {
-  if (c.body) {
-    // Layer tile: world-space body + world-continuous crust, back to local.
-    const wx = c.center.x + x * c.s,
-      wy = c.center.y + y * c.s,
-      wz = c.center.z + z * c.s;
-    let dw = bodySdfWorld(c.body, wx, wy, wz);
-    const depthW = c.crustDepth * c.s;
-    const adw = Math.abs(dw);
-    if (adw < depthW && c.amp > 0) {
-      let fade = 1 - adw / depthW;
-      fade = fade * fade * (3 - 2 * fade);
-      const wf = c.freq / c.s;
-      dw +=
-        fbm3(wx * wf + c.nOff, wy * wf + c.nOff * 1.7, wz * wf + c.nOff * 0.6) *
-        c.amp *
-        c.s *
-        fade;
-    }
-    return dw / c.s;
-  }
-
-  const ex = x * c.ix,
-    ey = y * c.iy,
-    ez = z * c.iz;
-  let d = (Math.sqrt(ex * ex + ey * ey + ez * ez) - R0) * c.minAxis;
-
-  const ad = Math.abs(d);
-  if (ad < c.crustDepth) {
-    let fade = 1 - ad / c.crustDepth;
-    fade = fade * fade * (3 - 2 * fade);
-    d +=
-      fbm3(
-        x * c.freq + c.nOff,
-        y * c.freq + c.nOff * 1.7,
-        z * c.freq + c.nOff * 0.6,
-      ) *
-      c.amp *
-      fade;
-  }
-
-  const planes = c.planes;
-  for (let i = 0; i < planes.length; i++) {
-    const pl = planes[i];
-    d = smoothMax(d, x * pl.nx + y * pl.ny + z * pl.nz - pl.off, PLANE_K);
-  }
-  return d;
-}
-
-// Full chunk SDF, local [-1,1]. Used for meshing, collision, digging.
-function chunkSdf(c: Chunk, x: number, y: number, z: number): number {
-  let d = baseSdf(c, x, y, z);
-
-  if (d > CARVE_SKIP) return d;
-
-  // Per-axis carve rejection. A carve is a no-op when its cut distance stays
-  // above d + k; below -0.25 the exact value can be distorted safely — those
-  // samples are never adjacent to a sign change, so the isosurface (and the
-  // extracted mesh) is bit-identical.
-  const holes = c.holes;
-  for (let i = 0; i < holes.length; i++) {
-    const h = holes[i];
-    const lim = d < -0.25 ? h.r + 0.31 : h.r - d + 0.06;
-    const dx = x - h.x;
-    if (dx > lim || dx < -lim) continue;
-    const dy = y - h.y;
-    if (dy > lim || dy < -lim) continue;
-    const dz = z - h.z;
-    if (dz > lim || dz < -lim) continue;
-    d = smoothCut(d, Math.sqrt(dx * dx + dy * dy + dz * dz) - h.r, SMOOTH_K);
-    if (d > 0.45) return d; // deep in a cavern: no surface near, bail out
-  }
-
-  const tunnels = c.tunnels;
-  for (let i = 0; i < tunnels.length; i++) {
-    const t = tunnels[i];
-    const lim = d < -0.25 ? t.r + 0.31 : t.r - d + 0.06;
-    if (x > Math.max(t.ax, t.bx) + lim || x < Math.min(t.ax, t.bx) - lim)
-      continue;
-    if (y > Math.max(t.ay, t.by) + lim || y < Math.min(t.ay, t.by) - lim)
-      continue;
-    if (z > Math.max(t.az, t.bz) + lim || z < Math.min(t.az, t.bz) - lim)
-      continue;
-    d = smoothCut(
-      d,
-      segDist(x, y, z, t.ax, t.ay, t.az, t.bx, t.by, t.bz) - t.r,
-      SMOOTH_K,
-    );
-    if (d > 0.45) return d;
-  }
-
-  // Player digs (runtime carves) — kept in the SDF so collision matches the
-  // re-meshed geometry exactly.
-  const digs = c.digs;
-  for (let i = 0; i < digs.length; i++) {
-    const g = digs[i];
-    const dx = x - g.x,
-      dy = y - g.y,
-      dz = z - g.z;
-    d = smoothCut(d, Math.sqrt(dx * dx + dy * dy + dz * dz) - g.r, SMOOTH_K);
-  }
-
-  return d;
 }
 
 // --- Chunk data generation -------------------------------------------------------------
@@ -893,124 +575,29 @@ export function makeChunkData(
 
 // --- Meshing -------------------------------------------------------------------------
 
-// MC instances stay live; digging reuses them for chunk re-meshing.
-const mcCache = new Map<number, MarchingCubes>();
-
-function getMC(res: number): MarchingCubes {
-  let mc = mcCache.get(res);
-  if (!mc) {
-    mc = new MarchingCubes(
-      res,
-      new THREE.MeshBasicMaterial(),
-      false,
-      false,
-      MAX_POLYS[res] ?? 100000,
-    );
-    mcCache.set(res, mc);
-  }
-  return mc;
-}
-
-// Edge-vein bake thresholds (WG-13): world-space mean-curvature band mapped
-// to aVein 0→1. Smooth hunk faces (ρ ≫ 4 u) stay dark; carve mouths and
-// silhouette rims (fillet ρ ≈ SMOOTH_K·s ≈ 0.5–2 u) light up.
-const VEIN_CURV_LO = 0.25;
-const VEIN_CURV_HI = 1.1;
-
-// Extract compact geometry with sanitized normals; compute rind factor (1=crust, 0=carved).
-function extractGeometry(mc: MarchingCubes, c: Chunk): THREE.BufferGeometry {
-  const count = mc.count;
-  const positions = mc.geometry.attributes.position.array.slice(0, count * 3);
-  const normals = mc.geometry.attributes.normal.array.slice(0, count * 3);
-  const crust = new Float32Array(count);
-  for (let i = 0; i < count; i++) {
-    const i3 = i * 3;
-    const nx = normals[i3],
-      ny = normals[i3 + 1],
-      nz = normals[i3 + 2];
-    const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-    if (len > 1e-6) {
-      normals[i3] = nx / len;
-      normals[i3 + 1] = ny / len;
-      normals[i3 + 2] = nz / len;
-    } else {
-      normals[i3] = 0;
-      normals[i3 + 1] = 1;
-      normals[i3 + 2] = 0;
-    }
-    // Rind factor: ~0 (outer/rind) to -0.055 (carved paste).
-    const bd = baseSdf(c, positions[i3], positions[i3 + 1], positions[i3 + 2]);
-    const t = (bd + 0.055) / 0.04; // -0.055 → 0 (paste), -0.015 → 1 (rind)
-    crust[i] = Math.max(0, Math.min(1, t));
-  }
+// The MC scratch, field fill and buffer extraction live in sdf.ts (WG-19) —
+// shared verbatim by this sync path and the mesh worker. Here the buffers
+// only get wrapped into THREE geometry.
+function buffersToGeometry(
+  b: Omit<ChunkMeshBuffers, "field">,
+): THREE.BufferGeometry {
   const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
-  geometry.setAttribute("aCrust", new THREE.BufferAttribute(crust, 1));
-
-  // WG-13 — bake aVein for edge-vein parts: the SDF Laplacian at the vertex
-  // estimates mean curvature (convex edges > 0, cavity interiors < 0).
-  // chunkSdf includes digs, so remeshing keeps the glow on the new rims;
-  // chunks without the flag skip the buffer (a missing attribute reads 0).
-  if (c.veinEdges) {
-    const vein = new Float32Array(count);
-    const eps = 2.5 / c.res;
-    const inv = 1 / (eps * eps * c.s);
-    for (let i = 0; i < count; i++) {
-      const i3 = i * 3;
-      const x = positions[i3],
-        y = positions[i3 + 1],
-        z = positions[i3 + 2];
-      const lap =
-        chunkSdf(c, x + eps, y, z) +
-        chunkSdf(c, x - eps, y, z) +
-        chunkSdf(c, x, y + eps, z) +
-        chunkSdf(c, x, y - eps, z) +
-        chunkSdf(c, x, y, z + eps) +
-        chunkSdf(c, x, y, z - eps) -
-        6 * chunkSdf(c, x, y, z);
-      const t2 = Math.max(
-        0,
-        Math.min(1, (lap * inv - VEIN_CURV_LO) / (VEIN_CURV_HI - VEIN_CURV_LO)),
-      );
-      vein[i] = t2 * t2 * (3 - 2 * t2);
-    }
-    geometry.setAttribute("aVein", new THREE.BufferAttribute(vein, 1));
-  }
+  geometry.setAttribute("position", new THREE.BufferAttribute(b.positions, 3));
+  geometry.setAttribute("normal", new THREE.BufferAttribute(b.normals, 3));
+  geometry.setAttribute("aCrust", new THREE.BufferAttribute(b.crust, 1));
+  if (b.vein)
+    geometry.setAttribute("aVein", new THREE.BufferAttribute(b.vein, 1));
   geometry.computeBoundingSphere();
   return geometry;
 }
 
-export function meshChunk(
+// Wrap ready buffers into the chunk's live mesh (build + worker upload path).
+function mountChunkMesh(
   c: Chunk,
-  res: number,
+  b: Omit<ChunkMeshBuffers, "field">,
   material: THREE.Material,
 ): THREE.Mesh {
-  const mc = getMC(res);
-  mc.reset();
-  mc.isolation = 0;
-
-  const field = mc.field;
-  const half = res / 2;
-  let idx = 0;
-  for (let zi = 0; zi < res; zi++) {
-    const z = (zi - half) / half;
-    for (let yi = 0; yi < res; yi++) {
-      const y = (yi - half) / half;
-      for (let xi = 0; xi < res; xi++) {
-        field[idx++] = -chunkSdf(c, (xi - half) / half, y, z);
-      }
-    }
-  }
-  // Cache field; digs edit incrementally.
-  c.field = field.slice();
-
-  mc.update();
-  if (mc.count / 3 > (MAX_POLYS[res] ?? 100000)) {
-    console.warn("gouda: chunk exceeded poly budget, geometry truncated");
-  }
-
-  const mesh = new THREE.Mesh(extractGeometry(mc, c), material);
+  const mesh = new THREE.Mesh(buffersToGeometry(b), material);
   mesh.position.copy(c.center);
   mesh.scale.setScalar(c.s);
   mesh.castShadow = true;
@@ -1019,17 +606,215 @@ export function meshChunk(
   return mesh;
 }
 
+export function meshChunk(c: Chunk, material: THREE.Material): THREE.Mesh {
+  const buffers = meshChunkBuffers(c);
+  // Cache field; digs edit incrementally.
+  c.field = buffers.field;
+  return mountChunkMesh(c, buffers, material);
+}
+
 // Re-runs marching cubes for one chunk from its cached (dug) field.
 function remeshChunk(c: Chunk): void {
   if (!c.mesh || !c.field) return; // chunk never finished building
-  const mc = getMC(c.res);
-  mc.reset();
-  mc.isolation = 0;
-  mc.field.set(c.field);
-  mc.update();
-  const geometry = extractGeometry(mc, c);
+  const geometry = buffersToGeometry(meshChunkBuffers(c, c.field));
   c.mesh.geometry.dispose();
   c.mesh.geometry = geometry;
+}
+
+// --- Mesh worker pool (WG-19) ---------------------------------------------------------
+
+// The exact ChunkShape fields, hand-picked: a Chunk also carries a live
+// THREE.Mesh, which structured clone rejects. digs are snapshotted by the
+// clone at dispatch time — the coalescing rule "latest field wins" rides
+// on that (WG-20).
+function serializeChunk(c: Chunk): ChunkShape {
+  return {
+    center: { x: c.center.x, y: c.center.y, z: c.center.z },
+    s: c.s,
+    res: c.res,
+    ix: c.ix,
+    iy: c.iy,
+    iz: c.iz,
+    minAxis: c.minAxis,
+    nOff: c.nOff,
+    amp: c.amp,
+    freq: c.freq,
+    crustDepth: c.crustDepth,
+    planes: c.planes,
+    holes: c.holes,
+    tunnels: c.tunnels,
+    digs: c.digs,
+    body: c.body,
+    veinEdges: c.veinEdges,
+  };
+}
+
+interface PoolJob {
+  chunk: Chunk;
+  field: Float32Array | null; // buffer ownership transfers at dispatch
+  wantField: boolean;
+  onDispatch?: () => void; // fires when the chunk is actually serialized
+  resolve: (r: MeshResult) => void;
+  reject: (err: unknown) => void;
+}
+
+// One job per worker at a time; excess jobs queue. The pool outlives world
+// rebuilds (workers are expensive to spin up, idle ones are free).
+let meshPool: Worker[] | null = null;
+const poolIdle: Worker[] = [];
+const poolQueue: PoolJob[] = [];
+const poolInFlight = new Map<Worker, PoolJob>();
+let jobSeq = 0;
+
+function getMeshPool(): Worker[] | null {
+  if (typeof Worker === "undefined") return null; // node: sync path only
+  if (meshPool) return meshPool;
+  const size = Math.max(
+    1,
+    Math.min((navigator.hardwareConcurrency || 4) - 1, 8),
+  );
+  meshPool = [];
+  for (let i = 0; i < size; i++) {
+    const w = new Worker(new URL("./meshWorker.ts", import.meta.url), {
+      type: "module",
+    });
+    const settle = (finish: (job: PoolJob) => void) => {
+      const job = poolInFlight.get(w);
+      poolInFlight.delete(w);
+      poolIdle.push(w);
+      pumpPool();
+      if (job) finish(job);
+    };
+    w.onmessage = (e: MessageEvent<MeshResult>) =>
+      settle((job) => job.resolve(e.data));
+    w.onerror = (err) => settle((job) => job.reject(err));
+    meshPool.push(w);
+    poolIdle.push(w);
+  }
+  return meshPool;
+}
+
+function pumpPool(): void {
+  while (poolIdle.length && poolQueue.length) {
+    const w = poolIdle.pop()!;
+    const job = poolQueue.shift()!;
+    poolInFlight.set(w, job);
+    job.onDispatch?.();
+    const msg: MeshJob = {
+      id: ++jobSeq,
+      chunk: serializeChunk(job.chunk),
+      field: job.field ?? undefined,
+      wantField: job.wantField,
+    };
+    w.postMessage(msg, job.field ? [job.field.buffer] : []);
+  }
+}
+
+function submitMeshJob(
+  chunk: Chunk,
+  field: Float32Array | null,
+  wantField: boolean,
+  onDispatch?: () => void,
+): Promise<MeshResult> {
+  return new Promise((resolve, reject) => {
+    poolQueue.push({ chunk, field, wantField, onDispatch, resolve, reject });
+    pumpPool();
+  });
+}
+
+// --- Async dig remesh (WG-20) + streamed first meshing (WG-22) --------------------------
+
+// One in-flight remesh per chunk; the latest field wins. Collision is
+// already correct the moment digAt edits the field/dig list (chunkSdf is
+// the collider) — only the visual swap is deferred.
+const remeshInFlight = new Set<Chunk>();
+const remeshDirty = new Set<Chunk>();
+
+function scheduleRemesh(c: Chunk): void {
+  if (!c.mesh || !c.field) return; // never meshed yet: WG-22 bakes on arrival
+  if (!getMeshPool()) {
+    remeshChunk(c);
+    return;
+  }
+  if (remeshInFlight.has(c)) {
+    remeshDirty.add(c);
+    return;
+  }
+  remeshInFlight.add(c);
+  submitMeshJob(c, c.field.slice(), false)
+    .then((r) => {
+      if (!c.mesh) return;
+      c.mesh.geometry.dispose();
+      c.mesh.geometry = buffersToGeometry(r);
+    })
+    .catch((err) => {
+      console.warn("gouda: remesh worker failed, remeshing on main", err);
+      remeshChunk(c);
+    })
+    .finally(() => {
+      remeshInFlight.delete(c);
+      if (remeshDirty.delete(c)) scheduleRemesh(c);
+    });
+}
+
+// WG-22 — lazy meshing: at build time only chunks near the spawn mesh
+// eagerly; the rest stream through the pool nearest-first as players move
+// (distance-SCHEDULING, never distance-resolution — tile seams depend on
+// uniform res). Collision needs no mesh: chunkSdf is the collider, so
+// unmeshed cheese is solid — and diggable — from frame one.
+const MESH_AHEAD = 120;
+let unmeshed: Chunk[] = [];
+let zoneMaterialsLive: Partial<Record<ZoneName, THREE.MeshToonMaterial>> = {};
+let streamBusy = 0;
+
+function chunkReach(c: Chunk): number {
+  return c.body ? c.s * 1.75 : c.s * 1.4;
+}
+
+function streamChunk(c: Chunk): void {
+  const group = worldGroup; // guards against a rebuild landing mid-flight
+  streamBusy++;
+  let digsAtDispatch = 0;
+  submitMeshJob(c, null, true, () => (digsAtDispatch = c.digs.length))
+    .then((r) => {
+      if (worldGroup !== group || !group || c.mesh) return;
+      c.field = r.field;
+      const mesh = mountChunkMesh(c, r, zoneMaterialsLive[c.zone!]!);
+      mesh.userData.reach = chunkReach(c);
+      mesh.userData.zone = c.zone;
+      group.add(mesh);
+      // Digs that landed after dispatch aren't in this field — bake + swap.
+      if (c.digs.length > digsAtDispatch) {
+        for (let i = digsAtDispatch; i < c.digs.length; i++)
+          applyDigToField(c, c.digs[i]);
+        scheduleRemesh(c);
+      }
+    })
+    .catch((err) => console.warn("gouda: streamed meshing failed", err))
+    .finally(() => {
+      streamBusy--;
+    });
+}
+
+// 4 Hz (piggybacks on the cull tick): submit the nearest unmeshed chunks in
+// reach, keeping the pool about twice-covered so results keep landing.
+function pumpStreaming(cameraPos: THREE.Vector3): void {
+  if (!unmeshed.length || !worldGroup) return;
+  const pool = getMeshPool();
+  if (!pool) return;
+  const maxBusy = pool.length * 2;
+  if (streamBusy >= maxBusy) return;
+  unmeshed.sort(
+    (a, b) =>
+      a.center.distanceToSquared(cameraPos) -
+      b.center.distanceToSquared(cameraPos),
+  );
+  while (streamBusy < maxBusy && unmeshed.length) {
+    const c = unmeshed[0];
+    if (c.center.distanceTo(cameraPos) - chunkReach(c) > MESH_AHEAD) break;
+    unmeshed.shift();
+    streamChunk(c);
+  }
 }
 
 // --- DIGGING ---------------------------------------------------------------------------
@@ -1052,6 +837,36 @@ function digHardness(c: Chunk, x: number, y: number, z: number): number {
     }
   }
   return c.hardness;
+}
+
+// Edit only the voxels one (chunk-local) dig can touch.
+function applyDigToField(c: Chunk, g: SphereCarve): void {
+  const field = c.field;
+  if (!field) return;
+  const res = c.res;
+  const half = res / 2;
+  const cell = 1 / half;
+  const reach = g.r + SMOOTH_K + 2 * cell;
+  const min = (v: number) => Math.max(0, Math.floor((v - reach + 1) * half));
+  const max = (v: number) =>
+    Math.min(res - 1, Math.ceil((v + reach + 1) * half));
+  for (let zi = min(g.z); zi <= max(g.z); zi++) {
+    const vz = (zi - half) / half;
+    for (let yi = min(g.y); yi <= max(g.y); yi++) {
+      const vy = (yi - half) / half;
+      const rowBase = zi * res * res + yi * res;
+      for (let xi = min(g.x); xi <= max(g.x); xi++) {
+        const vx = (xi - half) / half;
+        const ddx = vx - g.x,
+          ddy = vy - g.y,
+          ddz = vz - g.z;
+        const dd = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz) - g.r;
+        const idx = rowBase + xi;
+        const d = -field[idx];
+        field[idx] = -smoothCut(d, dd, SMOOTH_K);
+      }
+    }
+  }
 }
 
 export interface DigResult {
@@ -1079,7 +894,13 @@ export function digAt(
   let spinDc = Infinity;
   const maxHardness = TOOL_MAX_HARDNESS[tool];
 
-  for (let ci = 0; ci < chunks.length; ci++) {
+  // The grid cell covers dig spheres up to DIG_PAD (WG-21); anything larger
+  // (a future blast?) falls back to the full sweep.
+  const bucket =
+    chunkGrid && r <= DIG_PAD ? (gridBucketAt(x, y, z) ?? []) : null;
+  const nCandidates = bucket ? bucket.length : chunks.length;
+  for (let k = 0; k < nCandidates; k++) {
+    const ci = bucket ? bucket[k] : k;
     const c = chunks[ci];
     const dx = x - c.center.x,
       dy = y - c.center.y,
@@ -1104,40 +925,35 @@ export function digAt(
       ly = ldy / c.s,
       lz = ldz / c.s;
     const lr = r / c.s;
-    c.digs.push({ x: lx, y: ly, z: lz, r: lr });
+    // WG-23b: a dig fully contained in an existing one is skipped entirely
+    // (no dig entry, no field edit) — re-digging a hole can't grow the list,
+    // and field and dig list stay in step because BOTH skip. Same rule
+    // replays on every peer: same world, same verdict.
+    let contained = false;
+    for (const e of c.digs) {
+      const ex = lx - e.x,
+        ey = ly - e.y,
+        ez = lz - e.z;
+      if (Math.sqrt(ex * ex + ey * ey + ez * ez) + lr <= e.r) {
+        contained = true;
+        break;
+      }
+    }
+    if (contained) continue;
+    const dig = { x: lx, y: ly, z: lz, r: lr };
+    c.digs.push(dig);
     if (c.spin && dc < spinDc) {
       spinDc = dc;
       spinLocal = { chunk: ci, x: lx, y: ly, z: lz };
     }
 
-    // Edit only voxels the dig can touch.
-    const res = c.res;
-    const half = res / 2;
-    const cell = 1 / half;
-    const reach = lr + SMOOTH_K + 2 * cell;
-    const min = (v: number) => Math.max(0, Math.floor((v - reach + 1) * half));
-    const max = (v: number) =>
-      Math.min(res - 1, Math.ceil((v + reach + 1) * half));
-    const field = c.field!;
-    for (let zi = min(lz); zi <= max(lz); zi++) {
-      const vz = (zi - half) / half;
-      for (let yi = min(ly); yi <= max(ly); yi++) {
-        const vy = (yi - half) / half;
-        const rowBase = zi * res * res + yi * res;
-        for (let xi = min(lx); xi <= max(lx); xi++) {
-          const vx = (xi - half) / half;
-          const ddx = vx - lx,
-            ddy = vy - ly,
-            ddz = vz - lz;
-          const dd = Math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz) - lr;
-          const idx = rowBase + xi;
-          const d = -field[idx];
-          field[idx] = -smoothCut(d, dd, SMOOTH_K);
-        }
-      }
+    // Collision is correct from here (chunkSdf includes the dig). A chunk
+    // not yet meshed (WG-22) has no field to edit — its eventual first
+    // meshing includes the dig via chunkSdf.
+    if (c.field) {
+      applyDigToField(c, dig);
+      scheduleRemesh(c);
     }
-
-    remeshChunk(c);
     changed = true;
   }
 
@@ -1213,50 +1029,34 @@ export function raycastSolid(
 
 // --- Biome materials ---------------------------------------------------------------------
 
-function vec3str(hex: number): string {
-  const c = new THREE.Color(hex);
-  return `vec3(${c.r.toFixed(4)}, ${c.g.toFixed(4)}, ${c.b.toFixed(4)})`;
+// The per-material tuning knobs — plain uniforms (WG-24), so every biome
+// shares ONE compiled program and a skin edit is a uniform write.
+interface GoudaUniforms {
+  uPaste: { value: THREE.Color };
+  uRind: { value: THREE.Color };
+  uVein: { value: THREE.Vector3 };
+  uVeinStrength: { value: number };
+  uEdgeVeins: { value: number };
 }
 
 // Two-tone cheese material via aCrust: paste (carved), rind (outer crust).
 // Exported for the worldgen bench (skin previews from BiomeMaterial edits).
-export function createGoudaMaterial({
-  paste,
-  rind,
-  vein,
-  veinStrength,
-  edgeVeins,
-}: BiomeMaterial): THREE.MeshToonMaterial {
-  const pasteVec = vec3str(paste);
-  const rindVec = vec3str(rind);
-  const veinVec = `vec3(${vein[0].toFixed(3)}, ${vein[1].toFixed(3)}, ${vein[2].toFixed(3)})`;
-  const vs = veinStrength.toFixed(3);
-
-  // Interior noise-patch glow (the default), or the baked edge glow (WG-13):
-  // aVein marks convex rims/carve mouths, filaments break the rim light into
-  // strands, and it never pulses — occlusion (rotation) is what makes the
-  // trail light vanish and return. Interior faces carry no aVein: near-black.
-  const emissiveGlow = edgeVeins
-    ? `
-          float fil = sin(gp.x * 5.3 + 1.7) * sin(gp.y * 4.7 + 0.6) * sin(gp.z * 5.9 + 3.9);
-          fil = 0.35 + 0.65 * smoothstep(0.15, 0.85, fil * 0.5 + 0.5);
-          float inPaste = 1.0 - vCrust * 0.85;
-          totalEmissiveRadiance += ${pasteVec} * inPaste * 0.015;
-          totalEmissiveRadiance += ${veinVec} * vVein * fil * ${vs};`
-    : `
-          float patches = smoothstep(0.12, 0.72, g1 * 0.5 + 0.5)
-                        * smoothstep(0.25, 0.9, g2 * 0.5 + 0.5);
-          float pulse = 0.5 + 0.5 * sin(uGoudaTime * 0.55 + g2 * 6.0);
-          pulse *= 0.7 + 0.3 * sin(uGoudaTime * 0.173 + gp.y * 0.05);
-          float inPaste = 1.0 - vCrust * 0.85; // the glow lives in the paste
-          // Faint constant self-glow so the paste reads yellow even unlit.
-          totalEmissiveRadiance += ${pasteVec} * inPaste * 0.04;
-          totalEmissiveRadiance += ${veinVec} * patches * (0.25 + 0.75 * pulse) * ${vs} * inPaste;`;
+// The shader source is CONSTANT: colors, vein strength and the glow variant
+// (interior noise patches vs the WG-13 baked edge glow) all ride uniforms.
+export function createGoudaMaterial(m: BiomeMaterial): THREE.MeshToonMaterial {
+  const uniforms: GoudaUniforms = {
+    uPaste: { value: new THREE.Color(m.paste) },
+    uRind: { value: new THREE.Color(m.rind) },
+    uVein: { value: new THREE.Vector3(m.vein[0], m.vein[1], m.vein[2]) },
+    uVeinStrength: { value: m.veinStrength },
+    uEdgeVeins: { value: m.edgeVeins ? 1 : 0 },
+  };
 
   const injectCheese = (
     shader: THREE.WebGLProgramParametersWithUniforms,
   ): void => {
     shader.uniforms.uGoudaTime = uGoudaTime;
+    Object.assign(shader.uniforms, uniforms);
 
     shader.vertexShader =
       "attribute float aCrust;\nattribute float aVein;\nvarying float vCrust;\nvarying float vVein;\nvarying vec3 vGoudaWorld;\nvarying vec3 vGoudaNormal;\n" +
@@ -1270,7 +1070,7 @@ export function createGoudaMaterial({
       );
 
     shader.fragmentShader =
-      "uniform float uGoudaTime;\nvarying float vCrust;\nvarying float vVein;\nvarying vec3 vGoudaWorld;\nvarying vec3 vGoudaNormal;\n" +
+      "uniform float uGoudaTime;\nuniform vec3 uPaste;\nuniform vec3 uRind;\nuniform vec3 uVein;\nuniform float uVeinStrength;\nuniform float uEdgeVeins;\nvarying float vCrust;\nvarying float vVein;\nvarying vec3 vGoudaWorld;\nvarying vec3 vGoudaNormal;\n" +
       shader.fragmentShader
         .replace(
           "#include <color_fragment>",
@@ -1279,7 +1079,7 @@ export function createGoudaMaterial({
           // Slight albedo mottling so big waxy surfaces aren't flat.
           float mottle = 0.92 + 0.08 * sin(vGoudaWorld.x * 0.9 + vGoudaWorld.y * 1.3)
                                      * sin(vGoudaWorld.z * 1.1 - vGoudaWorld.y * 0.7);
-          diffuseColor.rgb = mix(${pasteVec}, ${rindVec}, vCrust) * mottle;
+          diffuseColor.rgb = mix(uPaste, uRind, vCrust) * mottle;
         }`,
         )
         .replace(
@@ -1291,7 +1091,25 @@ export function createGoudaMaterial({
           float g2 = sin(gp.x * 0.083 + 2.1) * sin(gp.y * 0.077) * sin(gp.z * 0.09 + 4.0);
           vec3 gv = normalize(cameraPosition - gp);
           vec3 gn = normalize(vGoudaNormal + vec3(1e-5));
-${emissiveGlow}
+          float inPaste = 1.0 - vCrust * 0.85; // the glow lives in the paste
+          if (uEdgeVeins > 0.5) {
+            // WG-13 edge glow: aVein marks convex rims/carve mouths,
+            // filaments break the rim light into strands, and it never
+            // pulses — occlusion (rotation) is what makes the trail light
+            // vanish and return. Interior faces carry no aVein: near-black.
+            float fil = sin(gp.x * 5.3 + 1.7) * sin(gp.y * 4.7 + 0.6) * sin(gp.z * 5.9 + 3.9);
+            fil = 0.35 + 0.65 * smoothstep(0.15, 0.85, fil * 0.5 + 0.5);
+            totalEmissiveRadiance += uPaste * inPaste * 0.015;
+            totalEmissiveRadiance += uVein * vVein * fil * uVeinStrength;
+          } else {
+            float patches = smoothstep(0.12, 0.72, g1 * 0.5 + 0.5)
+                          * smoothstep(0.25, 0.9, g2 * 0.5 + 0.5);
+            float pulse = 0.5 + 0.5 * sin(uGoudaTime * 0.55 + g2 * 6.0);
+            pulse *= 0.7 + 0.3 * sin(uGoudaTime * 0.173 + gp.y * 0.05);
+            // Faint constant self-glow so the paste reads yellow even unlit.
+            totalEmissiveRadiance += uPaste * inPaste * 0.04;
+            totalEmissiveRadiance += uVein * patches * (0.25 + 0.75 * pulse) * uVeinStrength * inPaste;
+          }
 
           // WATER SHIMMER — drifting interference ripples playing over
           // up-facing surfaces, as if the glow of the veins refracts through
@@ -1313,14 +1131,28 @@ ${emissiveGlow}
         );
   };
 
-  // Cache key includes constants to prevent zone-merge.
-  return toonMaterial(
+  const material = toonMaterial(
     { color: 0xffffff }, // overridden per-fragment by the paste/rind mix
-    {
-      shader: injectCheese,
-      key: `gouda${pasteVec}${rindVec}${veinVec}${vs}${edgeVeins ? "E" : ""}`,
-    },
+    { shader: injectCheese, key: "gouda" }, // one program for every biome
   );
+  material.userData.gouda = uniforms;
+  return material;
+}
+
+// Retune a gouda material in place (WG-24) — the bench's skin sliders write
+// uniforms instead of minting materials. Returns false for non-gouda mats.
+export function updateGoudaMaterial(
+  mat: THREE.Material,
+  m: BiomeMaterial,
+): boolean {
+  const u = mat.userData.gouda as GoudaUniforms | undefined;
+  if (!u) return false;
+  u.uPaste.value.set(m.paste);
+  u.uRind.value.set(m.rind);
+  u.uVein.value.set(m.vein[0], m.vein[1], m.vein[2]);
+  u.uVeinStrength.value = m.veinStrength;
+  u.uEdgeVeins.value = m.edgeVeins ? 1 : 0;
+  return true;
 }
 
 // One wax material per biome, from the recipe tables.
@@ -1457,6 +1289,7 @@ export function updateGouda(
   if (elapsed < lastCull) lastCull = elapsed - 1;
   if (cameraPos && worldGroup && elapsed - lastCull > 0.25) {
     lastCull = elapsed;
+    pumpStreaming(cameraPos); // WG-22: mesh what the player is approaching
     const cullDist = Math.min(Math.max(visibility * 1.25, 80), 720);
     for (const child of worldGroup.children) {
       const reach =
@@ -2551,16 +2384,43 @@ function shareCarves(list: Chunk[]): void {
     }
   };
 
-  for (let a = 0; a < list.length; a++) {
+  // Candidate pairs off a coarse grid over the chunks' influence balls
+  // (WG-21): two chunks within (sa+sb)·1.74 of each other always share a
+  // cell, so the cells yield a superset of the O(n²) sweep's hits. The
+  // original predicate then runs in ascending (a, b) order — the collected
+  // carve order, and so the geometry, is unchanged.
+  const CELL = 48;
+  const cellGrid = new Map<number, number[]>();
+  for (let i = 0; i < list.length; i++) {
+    const c = list[i];
+    const reach = c.s * 1.74;
+    const lo = (v: number) => Math.floor((v - reach) / CELL);
+    const hi = (v: number) => Math.floor((v + reach) / CELL);
+    for (let x = lo(c.center.x); x <= hi(c.center.x); x++)
+      for (let y = lo(c.center.y); y <= hi(c.center.y); y++)
+        for (let z = lo(c.center.z); z <= hi(c.center.z); z++) {
+          const key = ((x + 512) << 20) | ((y + 512) << 10) | (z + 512);
+          let bucket = cellGrid.get(key);
+          if (!bucket) cellGrid.set(key, (bucket = []));
+          bucket.push(i);
+        }
+  }
+  const pairKeys = new Set<number>();
+  const n = list.length;
+  for (const bucket of cellGrid.values())
+    for (let i = 0; i < bucket.length; i++)
+      for (let j = i + 1; j < bucket.length; j++)
+        pairKeys.add(bucket[i] * n + bucket[j]); // buckets are ascending
+  for (const key of [...pairKeys].sort((p, q) => p - q)) {
+    const a = Math.floor(key / n);
+    const b = key % n;
     const ca = list[a];
-    for (let b = a + 1; b < list.length; b++) {
-      const cb = list[b];
-      if (!ca.body && !cb.body) continue;
-      if (ca.body && ca.body === cb.body) continue;
-      if (ca.center.distanceTo(cb.center) > (ca.s + cb.s) * 1.74) continue;
-      collect(ca, cb, addH[b], addT[b]);
-      collect(cb, ca, addH[a], addT[a]);
-    }
+    const cb = list[b];
+    if (!ca.body && !cb.body) continue;
+    if (ca.body && ca.body === cb.body) continue;
+    if (ca.center.distanceTo(cb.center) > (ca.s + cb.s) * 1.74) continue;
+    collect(ca, cb, addH[b], addT[b]);
+    collect(cb, ca, addH[a], addT[a]);
   }
   for (let i = 0; i < list.length; i++) {
     if (addH[i].length) list[i].holes.push(...addH[i]);
@@ -2960,7 +2820,13 @@ export function buildWorldData(opts: {
 export async function buildGoudaWorld(
   scene: THREE.Scene,
   onProgress: (done: number, total: number, label: string) => void = () => {},
-  opts: { seed?: number; difficulty?: number; world?: WorldRecipe } = {},
+  opts: {
+    seed?: number;
+    difficulty?: number;
+    world?: WorldRecipe;
+    workers?: boolean; // false forces the sync path (node, tests, verifier)
+    stream?: boolean; // WG-22: mesh near spawn now, the rest by distance
+  } = {},
 ): Promise<THREE.Group> {
   worldSeed = (opts.seed ?? worldSeed) >>> 0;
   difficulty = Math.min(3, Math.max(1, opts.difficulty ?? difficulty));
@@ -2984,17 +2850,67 @@ export async function buildGoudaWorld(
   const total = specs.length + 1;
   let triangles = 0;
 
-  // Mesh phase (consumes no rng — the stream completed in buildWorldData).
-  for (let i = 0; i < data.chunks.length; i++) {
-    const chunk = data.chunks[i];
-    chunks.push(chunk);
-    const mesh = meshChunk(chunk, chunk.res, materials[chunk.zone!]!);
-    mesh.userData.reach = chunk.body ? chunk.s * 1.75 : chunk.s * 1.4;
+  // Chunk indices are the wire ids for chunk-local digs (WG-12): register
+  // every chunk in data order BEFORE meshing, so ids never depend on worker
+  // arrival order.
+  for (const chunk of data.chunks) chunks.push(chunk);
+
+  let built = 0;
+  const finishChunk = (chunk: Chunk, i: number, mesh: THREE.Mesh): void => {
+    mesh.userData.reach = chunkReach(chunk);
     mesh.userData.zone = chunk.zone; // bench perf HUD groups triangles by this
     triangles += mesh.geometry.attributes.position.count / 3;
     group.add(mesh);
-    onProgress(i + 1, total, specs[i].label);
-    await nextTick();
+    onProgress(++built, total, specs[i].label);
+  };
+
+  // Mesh phase (consumes no rng — the stream completed in buildWorldData).
+  // WG-19: fan out to the worker pool when one exists; buffers come back
+  // bit-identical to the sync path (same sdf.ts code, same inputs) and
+  // upload as results land. The sync path stays for node and as fallback.
+  // WG-22: with `stream`, chunks out of MESH_AHEAD of the spawn defer to
+  // the distance-driven pump in updateGouda.
+  const useWorkers = (opts.workers ?? true) && getMeshPool() !== null;
+  const streaming = (opts.stream ?? false) && useWorkers;
+  zoneMaterialsLive = materials;
+  const spawn = data.spawnPoint;
+  if (useWorkers) {
+    await Promise.all(
+      data.chunks.map(async (chunk, i) => {
+        if (
+          streaming &&
+          Math.hypot(
+            chunk.center.x - spawn.x,
+            chunk.center.y - spawn.y,
+            chunk.center.z - spawn.z,
+          ) -
+            chunkReach(chunk) >
+            MESH_AHEAD
+        ) {
+          unmeshed.push(chunk);
+          onProgress(++built, total, specs[i].label);
+          return;
+        }
+        try {
+          const r = await submitMeshJob(chunk, null, true);
+          chunk.field = r.field;
+          finishChunk(
+            chunk,
+            i,
+            mountChunkMesh(chunk, r, materials[chunk.zone!]!),
+          );
+        } catch (err) {
+          console.warn("gouda: mesh worker failed, meshing on main", err);
+          finishChunk(chunk, i, meshChunk(chunk, materials[chunk.zone!]!));
+        }
+      }),
+    );
+  } else {
+    for (let i = 0; i < data.chunks.length; i++) {
+      const chunk = data.chunks[i];
+      finishChunk(chunk, i, meshChunk(chunk, materials[chunk.zone!]!));
+      await nextTick();
+    }
   }
   // NOTE: the MC scratch instances are deliberately KEPT — digging reuses
   // them to re-mesh chunks at runtime.
@@ -3014,6 +2930,8 @@ export async function buildGoudaWorld(
   }
 
   scene.add(group);
+
+  buildChunkGrid(); // WG-21 — the runtime queries' spatial index
 
   goldPos = data.goldPos;
   // Wheel is an item (game/items.ts), world only seeds position.
@@ -3059,6 +2977,11 @@ export function disposeWorld(scene: THREE.Scene): void {
   worldSoftSpots = [];
   worldProps = [];
   hasSpin = false;
+  chunkGrid = null;
+  unmeshed = [];
+  zoneMaterialsLive = {};
+  remeshInFlight.clear();
+  remeshDirty.clear();
 }
 
 // Seeded gold position; read once at world build.
@@ -3116,6 +3039,63 @@ export function tileFieldCovers(
   return dz >= lo && dz <= hi;
 }
 
+// --- Chunk spatial hash (WG-21) ------------------------------------------------
+
+// Uniform grid over chunk influence balls, built once per world build. A
+// point query reads ONE cell; a chunk missing from that cell is guaranteed
+// either > GRID_SAT of open water away (distance queries saturate there —
+// every caller compares against ≤ 2 u) or out of reach of the largest dig
+// sphere (≤ DIG_PAD). Rotating chunks index by their bounding sphere, so
+// the cell set is rotation-invariant.
+const GRID_CELL = 24;
+const GRID_SAT = 8;
+const DIG_PAD = 3; // covers the driller (2.4 u) with margin
+
+let chunkGrid: Map<number, number[]> | null = null;
+
+function gridKey(cx: number, cy: number, cz: number): number {
+  return ((cx + 512) << 20) | ((cy + 512) << 10) | (cz + 512);
+}
+
+// Everything a chunk can influence: its near-field (chunkSdf reach), its
+// far-field estimate dropping below GRID_SAT, or a dig sphere touching it.
+function gridReach(c: Chunk): number {
+  return c.body
+    ? c.s * 1.9 + DIG_PAD // covers the tile box diagonal AND the dig ball
+    : Math.max(c.s * 1.4, c.s * 0.85 + GRID_SAT, c.s * 1.35 + DIG_PAD);
+}
+
+function buildChunkGrid(): void {
+  const grid = new Map<number, number[]>();
+  for (let i = 0; i < chunks.length; i++) {
+    const c = chunks[i];
+    const reach = gridReach(c);
+    const lo = (v: number) => Math.floor((v - reach) / GRID_CELL);
+    const hi = (v: number) => Math.floor((v + reach) / GRID_CELL);
+    for (let x = lo(c.center.x); x <= hi(c.center.x); x++)
+      for (let y = lo(c.center.y); y <= hi(c.center.y); y++)
+        for (let z = lo(c.center.z); z <= hi(c.center.z); z++) {
+          const key = gridKey(x, y, z);
+          let bucket = grid.get(key);
+          if (!bucket) grid.set(key, (bucket = []));
+          bucket.push(i);
+        }
+  }
+  chunkGrid = grid;
+}
+
+function gridBucketAt(x: number, y: number, z: number): number[] | null {
+  return (
+    chunkGrid?.get(
+      gridKey(
+        Math.floor(x / GRID_CELL),
+        Math.floor(y / GRID_CELL),
+        Math.floor(z / GRID_CELL),
+      ),
+    ) ?? null
+  );
+}
+
 // World distance to ONE chunk's solid (world units) — exported for the
 // worldgen bench, whose part/biome previews keep their own chunk lists.
 export function chunkDistance(
@@ -3136,6 +3116,47 @@ export function chunkDistance(
   return chunkSdf(c, dx / c.s, dy / c.s, dz / c.s) * c.s;
 }
 
+// One chunk's contribution to the world distance at a point — returns the
+// (possibly lowered) running best. The per-chunk bounds mirror gridReach.
+function chunkContribution(
+  c: Chunk,
+  x: number,
+  y: number,
+  z: number,
+  best: number,
+): number {
+  const dx = x - c.center.x,
+    dy = y - c.center.y,
+    dz = z - c.center.z;
+  const dc = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  if (c.body) {
+    // Tile of a layer body: the tile's box owns its region (see
+    // tileFieldCovers) — outside it the tile must not contribute.
+    if (dc - c.s * 1.74 > best) return best;
+    if (!tileFieldCovers(c, x, y, z)) return best;
+    const d = chunkSdf(c, dx / c.s, dy / c.s, dz / c.s) * c.s;
+    return d < best ? d : best;
+  }
+  if (dc - c.s > best) return best;
+  if (dc > c.s * 1.4) {
+    const d = dc - c.s * (R0 + 0.25);
+    return d < best ? d : best;
+  }
+  // Rotating chunks (WG-12): un-rotate the probe — the SDF stays static in
+  // local space, so collision matches the rotated mesh by construction.
+  let lx = dx,
+    ly = dy,
+    lz = dz;
+  if (c.spin) {
+    spinRotate(c.spin, dx, dy, dz, -c.spin.sin, _sv);
+    lx = _sv.x;
+    ly = _sv.y;
+    lz = _sv.z;
+  }
+  const d = chunkSdf(c, lx / c.s, ly / c.s, lz / c.s) * c.s;
+  return d < best ? d : best;
+}
+
 // Distance over explicit lists — the one implementation behind the module
 // query AND the data phase (debris seeding probes chunks before any mesh
 // exists). Exported for the verifier (src/world/verify.ts).
@@ -3147,40 +3168,8 @@ export function distanceToWorld(
   z: number,
 ): number {
   let best = 1e9;
-  for (let i = 0; i < chunkList.length; i++) {
-    const c = chunkList[i];
-    const dx = x - c.center.x,
-      dy = y - c.center.y,
-      dz = z - c.center.z;
-    const dc = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (c.body) {
-      // Tile of a layer body: the tile's box owns its region (see
-      // tileFieldCovers) — outside it the tile must not contribute.
-      if (dc - c.s * 1.74 > best) continue;
-      if (!tileFieldCovers(c, x, y, z)) continue;
-      const d = chunkSdf(c, dx / c.s, dy / c.s, dz / c.s) * c.s;
-      if (d < best) best = d;
-      continue;
-    }
-    if (dc - c.s > best) continue;
-    if (dc > c.s * 1.4) {
-      if (dc - c.s * (R0 + 0.25) < best) best = dc - c.s * (R0 + 0.25);
-      continue;
-    }
-    // Rotating chunks (WG-12): un-rotate the probe — the SDF stays static in
-    // local space, so collision matches the rotated mesh by construction.
-    let lx = dx,
-      ly = dy,
-      lz = dz;
-    if (c.spin) {
-      spinRotate(c.spin, dx, dy, dz, -c.spin.sin, _sv);
-      lx = _sv.x;
-      ly = _sv.y;
-      lz = _sv.z;
-    }
-    const d = chunkSdf(c, lx / c.s, ly / c.s, lz / c.s) * c.s;
-    if (d < best) best = d;
-  }
+  for (let i = 0; i < chunkList.length; i++)
+    best = chunkContribution(chunkList[i], x, y, z, best);
   for (let i = 0; i < debrisList.length; i++) {
     const b = debrisList[i];
     const dx = x - b.center.x,
@@ -3192,8 +3181,24 @@ export function distanceToWorld(
   return best;
 }
 
+// The module query rides the spatial hash (WG-21): one cell, ~2–8 chunks,
+// saturating at GRID_SAT open water — every caller compares against ≤ 2 u.
 export function worldDistance(x: number, y: number, z: number): number {
-  return distanceToWorld(chunks, debris, x, y, z);
+  if (!chunkGrid) return distanceToWorld(chunks, debris, x, y, z);
+  let best = GRID_SAT;
+  const bucket = gridBucketAt(x, y, z);
+  if (bucket)
+    for (let i = 0; i < bucket.length; i++)
+      best = chunkContribution(chunks[bucket[i]], x, y, z, best);
+  for (let i = 0; i < debris.length; i++) {
+    const b = debris[i];
+    const dx = x - b.center.x,
+      dy = y - b.center.y,
+      dz = z - b.center.z;
+    const d = Math.sqrt(dx * dx + dy * dy + dz * dz) - b.r;
+    if (d < best) best = d;
+  }
+  return best;
 }
 
 const GRAD_EPS = 0.25;

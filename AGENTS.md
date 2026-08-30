@@ -31,9 +31,16 @@ src/
     catfishSystem.ts cargoSystem.ts itemsSystem.ts
   world/             the map
     gouda.ts           destructible SDF cheese world (marching cubes) —
-                       the shape-family/placement IMPLEMENTATIONS
+                       the shape-family/placement IMPLEMENTATIONS, queries,
+                       digging, the mesh worker pool + chunk spatial hash
+    sdf.ts             render-free SDF core: chunkSdf/layer bodies/frame +
+                       field fill + buffer extraction — the code shared
+                       verbatim by gouda.ts, the mesh worker and node
+    meshWorker.ts      Vite module worker: serialized chunk in, marching-
+                       cubes buffers out via transferables (WG-19/20/22)
     recipes.ts         the cheese kit's DATA: part/biome/world recipe
                        tables (pure data, node-testable)
+    verify.ts          the route verifier (sealed/reachable/clearance)
     bathyscaphe.ts     tin diving bells (visual + analytic collision)
   entities/          animated creatures/bodies
     catfish.ts         lantern-catfish AI + model
@@ -204,11 +211,21 @@ that's expected; just don't reorder the `biomes` array casually: generation
 order is a contract (the Wheel's soft spots must exist before the veins
 place, and the veins before the melt shell picks its entrance terminus).
 
-⚠ Wheel-world build cost: the fused layers are honest solid volumes — ~900
-chunks, ~7.5M tris, ~80 s at full res in node. That is an authoring-time
-reality, not a shipping target: iterate at half res (the bench default),
-and expect an M2.7 perf pass (worker meshing, per-distance res) before the
-wheel map becomes the game's default.
+Wheel-world build cost after the P3 perf pass (WG-19..24): in the browser,
+meshing fans out to a worker pool (min(cores−1, 8), ~7× wall time on a
+12-thread machine; sync-path geometry is bit-identical because both run the
+same sdf.ts code), the GAME additionally streams chunks by distance
+(`stream: true` — spawn surroundings mesh first, the rest follow the player
+at ~120 u; collision needs no mesh, chunkSdf is the collider, and digs into
+unmeshed chunks are recorded and baked at first meshing). Runtime queries
+(worldDistance/digAt/raycast) ride a chunk spatial hash built per world
+build and saturate at 8 u of open water. Dig remeshes run async through the
+pool (one in-flight per chunk, latest field wins) — collision is exact the
+moment digAt returns. Node and the tests keep the sync path
+(`workers: false` or no Worker global); a full-res node build still costs
+~80 s — iterate at half res (the bench default). Biome wax is ONE shader
+program: colors/veinStrength/edge-glow are uniforms (WG-24), so bench skin
+edits write uniforms in place and never recompile.
 
 ## Model bench — standing rule
 

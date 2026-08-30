@@ -26,7 +26,6 @@
 import {
   buildWorldData,
   chunkDistance,
-  R0,
   SIGHT_RANGE,
   tileFieldCovers,
   type Chunk,
@@ -34,6 +33,7 @@ import {
   type WorldData,
   type WorldPlan,
 } from "./gouda.ts";
+import { R0 } from "./sdf.ts";
 import { WHEEL_WORLD, type WorldRecipe, type ZoneName } from "./recipes.ts";
 import type { Vec3 } from "../state.ts";
 
@@ -82,13 +82,7 @@ interface Grid {
   plug: { a: Vec3; b: Vec3; r: number } | null;
 }
 
-function segDist(
-  px: number,
-  py: number,
-  pz: number,
-  a: Vec3,
-  b: Vec3,
-): number {
+function segDist(px: number, py: number, pz: number, a: Vec3, b: Vec3): number {
   const abx = b.x - a.x,
     aby = b.y - a.y,
     abz = b.z - a.z;

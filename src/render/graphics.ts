@@ -48,6 +48,7 @@ type WorldProgress = (done: number, total: number, label: string) => void;
 interface WorldOptions {
   seed?: number;
   difficulty?: number;
+  stream?: boolean; // WG-22: lazy meshing by distance (needs the worker pool)
 }
 
 // Params for the volumetric beam builders.
