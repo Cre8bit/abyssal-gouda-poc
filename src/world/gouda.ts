@@ -221,6 +221,8 @@ let worldSpine: SpinePoint[] = [];
 let worldSoftSpots: SoftSpot[] = [];
 let worldProps: SeededProp[] = [];
 let hasSpin = false; // any rotating chunk in the built world (skip the frame loop otherwise)
+let wireframeOn = false; // debug overlay (M key, main.ts) — superposed, not a material swap
+let wireMaterial: THREE.LineBasicMaterial | null = null;
 
 const uGoudaTime = { value: 0 };
 
@@ -591,6 +593,53 @@ function buffersToGeometry(
   return geometry;
 }
 
+// Debug wireframe overlay (M key, main.ts): a LineSegments child riding
+// each chunk mesh, so it inherits position/rotation/culling for free and
+// never drifts from the surface it traces. Superposed on the solid render
+// rather than swapped in, since `wireframe: true` on the shared toon
+// material would flip every chunk of that biome, not just this one.
+function ensureWireMaterial(): THREE.LineBasicMaterial {
+  wireMaterial ??= new THREE.LineBasicMaterial({
+    color: 0x39ffe0,
+    transparent: true,
+    opacity: 0.55,
+  });
+  return wireMaterial;
+}
+
+function buildWireOverlay(mesh: THREE.Mesh): void {
+  const wire = new THREE.LineSegments(
+    new THREE.WireframeGeometry(mesh.geometry),
+    ensureWireMaterial(),
+  );
+  wire.visible = wireframeOn;
+  wire.raycast = () => {}; // debug-only, never picked
+  mesh.add(wire);
+  mesh.userData.wire = wire;
+}
+
+// Called after a dig swaps a chunk's geometry — keeps the overlay in sync
+// with the newly carved surface (no-op if the overlay was never built).
+function refreshWireOverlay(mesh: THREE.Mesh): void {
+  const wire = mesh.userData.wire as THREE.LineSegments | undefined;
+  if (!wire) return;
+  wire.geometry.dispose();
+  wire.geometry = new THREE.WireframeGeometry(mesh.geometry);
+}
+
+// Toggle the overlay for every currently-mounted chunk, and flag future
+// (streamed-in) chunks to build theirs on mount.
+export function setWireframeOverlay(on: boolean): void {
+  wireframeOn = on;
+  if (!worldGroup) return;
+  for (const child of worldGroup.children) {
+    const mesh = child as THREE.Mesh;
+    const wire = mesh.userData.wire as THREE.LineSegments | undefined;
+    if (on && !wire) buildWireOverlay(mesh);
+    else if (wire) wire.visible = on;
+  }
+}
+
 // Wrap ready buffers into the chunk's live mesh (build + worker upload path).
 function mountChunkMesh(
   c: Chunk,
@@ -603,6 +652,7 @@ function mountChunkMesh(
   mesh.castShadow = true;
   mesh.receiveShadow = true;
   c.mesh = mesh;
+  if (wireframeOn) buildWireOverlay(mesh);
   return mesh;
 }
 
@@ -619,6 +669,7 @@ function remeshChunk(c: Chunk): void {
   const geometry = buffersToGeometry(meshChunkBuffers(c, c.field));
   c.mesh.geometry.dispose();
   c.mesh.geometry = geometry;
+  refreshWireOverlay(c.mesh);
 }
 
 // --- Mesh worker pool (WG-19) ---------------------------------------------------------
@@ -746,6 +797,7 @@ function scheduleRemesh(c: Chunk): void {
       if (!c.mesh) return;
       c.mesh.geometry.dispose();
       c.mesh.geometry = buffersToGeometry(r);
+      refreshWireOverlay(c.mesh);
     })
     .catch((err) => {
       console.warn("gouda: remesh worker failed, remeshing on main", err);
@@ -2982,6 +3034,8 @@ export function disposeWorld(scene: THREE.Scene): void {
   zoneMaterialsLive = {};
   remeshInFlight.clear();
   remeshDirty.clear();
+  wireframeOn = false;
+  wireMaterial = null;
 }
 
 // Seeded gold position; read once at world build.

@@ -310,6 +310,27 @@ button:active {
   border: 1px dashed rgba(255, 208, 96, 0.6);
 }
 
+#debug-panel {
+  position: absolute;
+  bottom: 4.4rem;
+  right: 1.5rem;
+  padding: 0.5rem 0.8rem;
+  font-family: monospace;
+  font-size: 0.8rem;
+  letter-spacing: 0.03em;
+  text-align: right;
+  background: rgba(70, 45, 0, 0.6);
+  border: 1px dashed rgba(255, 208, 96, 0.5);
+  border-radius: 4px;
+  color: rgba(255, 224, 160, 0.9);
+}
+
+#debug-hint {
+  margin-top: 0.2rem;
+  font-size: 0.7rem;
+  opacity: 0.75;
+}
+
 #mini-copy-link-btn {
   position: absolute;
   top: 0.75rem;

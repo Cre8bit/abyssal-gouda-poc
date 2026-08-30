@@ -49,6 +49,7 @@ import {
   mulberry32,
   nearestSpinePoint,
   planWorldLayout,
+  setWireframeOverlay,
   updateGouda,
   updateGoudaMaterial,
   worldDistance,
@@ -963,6 +964,10 @@ function applyWire(): void {
     for (const mat of Array.isArray(m.material) ? m.material : [m.material])
       (mat as THREE.MeshToonMaterial).wireframe = view.wire;
   });
+  // A real build's chunks live under buildGoudaWorld's own worldGroup, not
+  // `content` (which is just the map's marker overlay here) — same overlay
+  // toggle the game's M key uses, so it never fights the shared zone material.
+  if (view.built) setWireframeOverlay(view.wire);
 }
 
 // Bench skins are double-sided so clipped cut faces read.

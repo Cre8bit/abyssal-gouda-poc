@@ -29,6 +29,12 @@ export interface SphereDig {
   c?: number; // rotating target's chunk index (chunk arrays are seed-identical)
 }
 
+// Debug aids
+export interface DebugState {
+  mode: boolean;
+  freeCam: boolean;
+}
+
 export interface GameState {
   // World identity — the host's values win; joiners rebuild on mismatch.
   seed: number;
@@ -43,6 +49,8 @@ export interface GameState {
   spawnPoint: Vec3; // bathyscaphe berth — also the O₂ recharge zone
   flashlightOn: boolean;
   digTool: DigTool; // debug-toggled until M3 seeds the driller item
+  debug: DebugState;
+  mapWireframe: boolean; // M key — overlay only, survives independent of debug.mode
 
   // Session roles.
   hostedId: string | null; // our shareable id when we are the host
@@ -66,6 +74,8 @@ export const game: GameState = {
   spawnPoint: { ...DEFAULT_SPAWN },
   flashlightOn: true,
   digTool: "hands",
+  debug: { mode: false, freeCam: false },
+  mapWireframe: false,
   hostedId: null,
   fishAuthority: true,
   fishAuthorityId: null,

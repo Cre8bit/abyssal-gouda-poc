@@ -38,6 +38,7 @@ import {
   digAtChunkLocal,
   chunkLocalToWorld,
   raycastSolid,
+  setWireframeOverlay,
   WORLD_R,
 } from "./world/gouda.ts";
 import {
@@ -129,6 +130,7 @@ import {
 
 const MAX_SPEED = 10.0; // units per second — brisk fins
 const SPRINT_MULT = 1.9; // hold Shift: burst of speed (descend is on C)
+const FREECAM_SPEED = 40.0; // debug noclip flight — fast enough to cross the map
 const WATER_INERTIA = 4; // how quickly velocity reaches its target
 const NETWORK_RATE = 1 / 30; // send state 30x per second
 const ABYSS_DEPTH = 612; // flavor: depth readout at y = 0
@@ -174,6 +176,8 @@ const deathOverlay = el("death-overlay");
 const winOverlay = el("win-overlay");
 const winSub = el("win-sub");
 const carryPrompt = el("carry-prompt");
+const debugPanel = el("debug-panel");
+const debugCoords = el("debug-coords");
 
 // Network events trusted as-is (same-version peers). Dig shape shared with state.ts.
 type DigEvent = SphereDig;
@@ -269,6 +273,8 @@ async function buildWorld(rebuild = false) {
   for (const d of game.pendingDigs) applyDigEvent(d);
   game.pendingDigs.length = 0;
   loaderEl.classList.add("done");
+  // Debug wireframe preference survives a rebuild; the overlay itself doesn't.
+  if (game.mapWireframe) setWireframeOverlay(true);
 
   // Spawn catfish (host simulates, joiners get puppets).
   catfishSys.spawn(game.difficulty);
@@ -411,6 +417,47 @@ window.addEventListener("keydown", (e) => {
   } else if (e.code === "KeyE") {
     // E key: Gouda first (can't dig with both arms full), then pickaxe.
     if (!cargoSys.use()) tryDig();
+  } else if (e.code === "KeyO") {
+    // DEBUG mode: coordinate HUD + TP + freecam. Leaving it also drops
+    // freecam, so you can never get stuck noclipped with the panel gone.
+    game.debug.mode = !game.debug.mode;
+    if (!game.debug.mode) game.debug.freeCam = false;
+    debugPanel.classList.toggle("hidden", !game.debug.mode);
+    playClick();
+    showEvent(
+      game.debug.mode
+        ? "🐞 [DEBUG] Debug mode ON"
+        : "🐞 [DEBUG] Debug mode OFF",
+    );
+  } else if (e.code === "KeyI" && game.debug.mode) {
+    // DEBUG: map wireframe overlay, superposed on the normal render.
+    game.mapWireframe = !game.mapWireframe;
+    setWireframeOverlay(game.mapWireframe);
+    playClick();
+    showEvent(
+      game.mapWireframe ? "🕸 [DEBUG] Wireframe ON" : "🕸 [DEBUG] Wireframe OFF",
+    );
+  } else if (e.code === "KeyN" && game.debug.mode) {
+    // DEBUG: noclip flight, debug-mode only.
+    game.debug.freeCam = !game.debug.freeCam;
+    game.velocity.x = game.velocity.y = game.velocity.z = 0;
+    showEvent(
+      game.debug.freeCam
+        ? "🐞 [DEBUG] Freecam ON — no collisions"
+        : "🐞 [DEBUG] Freecam OFF",
+    );
+  } else if (e.code === "KeyP" && game.debug.mode) {
+    // DEBUG: teleport to typed coordinates.
+    const raw = prompt("Teleport to x,y,z:");
+    if (!raw) return;
+    const parts = raw.split(",").map((s) => Number.parseFloat(s.trim()));
+    if (parts.length !== 3 || parts.some((n) => !Number.isFinite(n))) {
+      showEvent("🐞 [DEBUG] Invalid coordinates — use x,y,z");
+      return;
+    }
+    teleportLocal(parts[0], parts[1], parts[2]);
+    playWhoosh();
+    showEvent(`🐞 [DEBUG] Teleported to ${parts.join(", ")}`);
   }
 });
 
@@ -669,9 +716,11 @@ renderLoop((delta) => {
   updateSystems(frameCtx);
 
   // Desired velocity along lazy body orientation (not raw look). Dead divers drift.
-  const move = isDead() ? ZERO_MOVE : getMovement();
-  const swimYaw = getSwimYaw();
-  const swimPitch = getSwimPitch();
+  // DEBUG freecam: no lazy trailing, fly exactly where the camera looks.
+  const freeCam = game.debug.mode && game.debug.freeCam;
+  const move = isDead() && !freeCam ? ZERO_MOVE : getMovement();
+  const swimYaw = freeCam ? yaw : getSwimYaw();
+  const swimPitch = freeCam ? pitch : getSwimPitch();
   const cosP = Math.cos(swimPitch);
   _fwd.x = -Math.sin(swimYaw) * cosP;
   _fwd.y = Math.sin(swimPitch);
@@ -682,11 +731,13 @@ renderLoop((delta) => {
   // Carry: lower cap, downward pull (sink vs buoyancy).
   const carrying = hasLocalStatus(STATUS.CARRYING);
   const baseCap = carrying ? carrySpeedCap(MAX_SPEED) : MAX_SPEED;
-  const speedCap = baseCap * (isSprinting() ? SPRINT_MULT : 1);
+  const speedCap = freeCam
+    ? FREECAM_SPEED * (isSprinting() ? SPRINT_MULT : 1)
+    : baseCap * (isSprinting() ? SPRINT_MULT : 1);
   _target.x = (_fwd.x * move.z + _right.x * move.x) * speedCap;
   _target.y = (_fwd.y * move.z + move.y) * speedCap;
   _target.z = (_fwd.z * move.z + _right.z * move.x) * speedCap;
-  if (carrying) _target.y -= CARGO.SINK_RATE;
+  if (carrying && !freeCam) _target.y -= CARGO.SINK_RATE;
 
   // Water inertia.
   const k = 1 - Math.exp(-WATER_INERTIA * delta);
@@ -702,6 +753,7 @@ renderLoop((delta) => {
     pos.x += vel.x * stepDelta;
     pos.y += vel.y * stepDelta;
     pos.z += vel.z * stepDelta;
+    if (freeCam) continue; // DEBUG: noclip — no collision resolution
 
     // Resolve SDF collision; remove velocity component into wall (slide, no bounce).
     const hit = resolveCollision(pos, PLAYER_RADIUS);
@@ -717,9 +769,10 @@ renderLoop((delta) => {
     }
   }
 
-  // Soft leash: boundary current pulls diver back.
+  // Soft leash: boundary current pulls diver back. Suspended in freecam so
+  // debug flight can actually reach outside the playable radius.
   const distFromCenter = Math.hypot(pos.x, pos.y, pos.z);
-  if (distFromCenter > WORLD_LIMIT) {
+  if (!freeCam && distFromCenter > WORLD_LIMIT) {
     const pull = (distFromCenter - WORLD_LIMIT) * 0.8 * delta;
     pos.x -= (pos.x / distFromCenter) * pull;
     pos.y -= (pos.y / distFromCenter) * pull;
@@ -783,6 +836,13 @@ renderLoop((delta) => {
   // HUD. Gold hidden by design (seek by sound); SHOW_GOUDA_BEARING overrides.
   drawCompass(yaw);
   depthText.textContent = `▼ ${Math.max(0, Math.round(ABYSS_DEPTH - pos.y))} m`;
+
+  // DEBUG coordinate readout (Minus key).
+  if (game.debug.mode) {
+    debugCoords.textContent =
+      `x ${pos.x.toFixed(1)}  y ${pos.y.toFixed(1)}  z ${pos.z.toFixed(1)}` +
+      (freeCam ? "  · FREECAM" : "");
+  }
 
   // Slow HUD: RTT + peer statuses.
   hudTimer += delta;
