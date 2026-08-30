@@ -35,6 +35,8 @@ import {
   getSpawnPoint,
   getGoldPos,
   digAt,
+  digAtChunkLocal,
+  chunkLocalToWorld,
   raycastSolid,
   WORLD_R,
 } from "./world/gouda.ts";
@@ -411,7 +413,9 @@ window.addEventListener("keydown", (e) => {
 // same world, same tool ⇒ same verdict on every client.
 function applyDigEvent(d: SphereDig) {
   const tool: DigTool = d.tool ?? "hands";
-  digAt(d.x, d.y, d.z, d.r ?? DIG_RADII[tool], tool);
+  const r = d.r ?? DIG_RADII[tool];
+  if (d.c != null) digAtChunkLocal(d.c, d.x, d.y, d.z, r, tool);
+  else digAt(d.x, d.y, d.z, r, tool);
 }
 
 // Dig tool: SDF edits chunk voxels + marching cubes; collision tracks.
@@ -461,7 +465,14 @@ function tryDig() {
       : "⛏ You carve into the gouda",
   );
   if (isConnected()) {
-    sendEvent({ kind: "dig", x: hit.x, y: hit.y, z: hit.z, r, tool });
+    // A dig on a rotating chunk ships chunk-local (WG-12) so every peer's
+    // replay lands on the same spot of the cheese, whatever their clock.
+    const local = result.spinLocal;
+    sendEvent(
+      local
+        ? { kind: "dig", c: local.chunk, x: local.x, y: local.y, z: local.z, r, tool }
+        : { kind: "dig", x: hit.x, y: hit.y, z: hit.z, r, tool },
+    );
   }
 }
 
@@ -579,15 +590,20 @@ onEventReceived((peerId, data) => {
       game.pendingDigs.push(d);
       return;
     }
+    // Chunk-local digs resolve to world through the chunk's current
+    // orientation — for the burst/sound AND the replay inside.
+    const w = d.c != null ? chunkLocalToWorld(d.c, d) : d;
     applyDigEvent(d);
-    burstAt(d.x, d.y, d.z);
-    // Audible only if they're digging nearby — muffled thumps through cheese.
-    const dd = Math.hypot(
-      d.x - game.localPosition.x,
-      d.y - game.localPosition.y,
-      d.z - game.localPosition.z,
-    );
-    if (dd < 45) playDig();
+    if (w) {
+      burstAt(w.x, w.y, w.z);
+      // Audible only if they're digging nearby — muffled thumps through cheese.
+      const dd = Math.hypot(
+        w.x - game.localPosition.x,
+        w.y - game.localPosition.y,
+        w.z - game.localPosition.z,
+      );
+      if (dd < 45) playDig();
+    }
   } else if (
     data.kind === "seed" &&
     peerId === getHostId() && // only the host's seed is authoritative

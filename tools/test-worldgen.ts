@@ -7,7 +7,12 @@
 // perf changes must not move it; content changes rebase it deliberately.
 // Pure data — no meshing, no DOM/GL. Runs in npm test.
 import { verifyWorld } from "../src/world/verify.ts";
-import { buildWorldData } from "../src/world/gouda.ts";
+import {
+  buildWorldData,
+  distanceToWorld,
+  type SeededPropKind,
+  type WorldData,
+} from "../src/world/gouda.ts";
 import { WHEEL_WORLD, cloneWorld } from "../src/world/recipes.ts";
 
 let failures = 0;
@@ -92,6 +97,90 @@ for (const [seed, diff] of MATRIX) {
       ` · entrance ${r.entranceClearance?.toFixed(2) ?? "—"} u` +
       ` · trail ${r.trail?.linked ?? 0}/${r.trail?.nodes ?? 0}` +
       ` · path ${r.path.length} pts · ${r.visited} cells · ${r.ms} ms`,
+  );
+}
+
+// WG-11 · seeded props — counts match budgets, positions hug a surface in
+// open water, hazards carry dir + phase, and the list is deterministic. The
+// prop draws sit at the TAIL of the stream: the unchanged fingerprint pins
+// below prove the chunk/debris/gold/spawn stream never moved.
+// WG-12 · seeded spin — rotating bands carry a per-chunk axis + signed rate
+// from the SIDE stream; every other placement carries none.
+const dataBySeed = new Map<string, WorldData>();
+for (const [seed, diff] of MATRIX) {
+  const data = buildWorldData({ seed, difficulty: diff });
+  dataBySeed.set(`${seed}/${diff}`, data);
+  const props = data.plan.props;
+  const tag = `props seed ${seed} d${diff}`;
+  const count = (k: SeededPropKind, zone?: string) =>
+    props.filter((p) => p.kind === k && (!zone || p.zone === zone)).length;
+  check(
+    `${tag}: counts match the biome budgets`,
+    count("airPocket", "drift") === 6 &&
+      count("airPocket", "heart") === 1 &&
+      count("melt_fall", "melt") === 12 &&
+      count("melt_pool", "melt") === 6 &&
+      count("thermal_vent", "melt") === 8 &&
+      count("wreck") === 1,
+    `air ${count("airPocket")} falls ${count("melt_fall")} pools ` +
+      `${count("melt_pool")} vents ${count("thermal_vent")} wreck ${count("wreck")}`,
+  );
+  let adrift = 0;
+  for (const p of props) {
+    if (p.kind === "wreck") continue; // mid-water on the spine by design
+    const d = distanceToWorld(data.chunks, [], p.pos.x, p.pos.y, p.pos.z);
+    if (!(d > 0 && d <= 0.5)) adrift++;
+  }
+  check(
+    `${tag}: positions in open water ≤ 0.5 u off a surface`,
+    adrift === 0,
+    `${adrift} adrift`,
+  );
+  check(
+    `${tag}: hazards carry dir + seeded phase`,
+    props
+      .filter((p) => p.kind !== "airPocket" && p.kind !== "wreck")
+      .every(
+        (p) => !!p.dir && p.phase !== undefined && p.phase >= 0 && p.phase < 1,
+      ),
+  );
+
+  const rotating = new Map<string, number>();
+  for (const b of WHEEL_WORLD.biomes)
+    if (b.placement.mode === "band" && b.placement.rotate)
+      rotating.set(b.id, b.placement.rotate.degPerSec);
+  let spinOk = true;
+  let spinCount = 0;
+  for (const spec of data.plan.specs) {
+    const deg = rotating.get(spec.zone);
+    if (deg === undefined) {
+      if (spec.spin) spinOk = false;
+      continue;
+    }
+    if (!spec.spin) {
+      spinOk = false;
+      continue;
+    }
+    spinCount++;
+    const maxRad = (deg * 1.5 * Math.PI) / 180;
+    const minRad = (deg * 0.5 * Math.PI) / 180;
+    const mag = Math.abs(spec.spin.rate);
+    const axisLen = Math.hypot(spec.spin.ax, spec.spin.ay, spec.spin.az);
+    if (mag < minRad || mag > maxRad || Math.abs(axisLen - 1) > 1e-6)
+      spinOk = false;
+  }
+  check(
+    `${tag.replace("props", "spin")}: rotating bands (and only them) carry seeded spin`,
+    spinOk && spinCount > 0,
+    `${spinCount} spinning`,
+  );
+}
+{
+  const a = dataBySeed.get("1337/1")!.plan.props;
+  const b = buildWorldData({ seed: 1337, difficulty: 1 }).plan.props;
+  check(
+    "prop list is deterministic (same seed ⇒ identical list)",
+    JSON.stringify(a) === JSON.stringify(b),
   );
 }
 

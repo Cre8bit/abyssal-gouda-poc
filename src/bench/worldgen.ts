@@ -27,12 +27,14 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import {
   buildGoudaWorld,
   buildLayerChunks,
+  buildWorldData,
   chunkDistance,
   createGoudaMaterial,
   effectiveTunnelRadius,
   tileFieldCovers,
   disposeWorld,
   getGoldPos,
+  getSeededProps,
   getSpawnPoint,
   makeChunkData,
   makeFrame,
@@ -44,6 +46,8 @@ import {
   worldDistance,
   type Chunk,
   type GenCtx,
+  type SeededProp,
+  type SeededPropKind,
   type WorldPlan,
 } from "../world/gouda.ts";
 import { traceTrail } from "../world/verify.ts";
@@ -149,6 +153,14 @@ const view = {
   // map view
   built: false, // real meshes mounted (vs proxies)
   buildHalfRes: true,
+  // seeded-prop marker overlay (WG-11), per kind
+  propKinds: {
+    airPocket: true,
+    wreck: true,
+    melt_fall: true,
+    melt_pool: true,
+    thermal_vent: true,
+  } as Record<SeededPropKind, boolean>,
   // shared view options
   clipOn: false,
   clipAxis: "y" as "x" | "y" | "z",
@@ -385,7 +397,115 @@ function disposeContent(): void {
   for (const d of disposables) d.dispose();
   disposables = [];
   benchChunks = [];
+  clearProps();
   setLoading(null);
+}
+
+// --- Seeded prop markers (WG-11) -------------------------------------------------
+
+const PROP_COLORS: Record<SeededPropKind, number> = {
+  airPocket: 0x8fe8ff,
+  wreck: 0x9ca3af,
+  melt_fall: 0xff7043,
+  melt_pool: 0xffb020,
+  thermal_vent: 0xffe36e,
+};
+
+let propsGroup: THREE.Group | null = null;
+let propDisposables: (THREE.BufferGeometry | THREE.Material)[] = [];
+
+function clearProps(): void {
+  if (propsGroup) scene.remove(propsGroup);
+  propsGroup = null;
+  for (const d of propDisposables) d.dispose();
+  propDisposables = [];
+}
+
+// Compute the prop list for the current view: the built world's own list, or
+// a fresh data build (no meshing, ~50 ms) matching what a build would seed.
+function computeProps(): SeededProp[] {
+  if (view.built) return getSeededProps();
+  try {
+    return buildWorldData({
+      seed: view.seed,
+      difficulty: view.difficulty,
+      world,
+    }).plan.props;
+  } catch {
+    return [];
+  }
+}
+
+// Redraw the marker overlay; returns the prop list for HUD counting.
+function drawProps(): SeededProp[] {
+  clearProps();
+  const props = computeProps();
+  const group = new THREE.Group();
+  const mats = new Map<SeededPropKind, THREE.MeshBasicMaterial>();
+  for (const p of props) {
+    if (!view.propKinds[p.kind]) continue;
+    let mat = mats.get(p.kind);
+    if (!mat) {
+      mat = new THREE.MeshBasicMaterial({ color: PROP_COLORS[p.kind] });
+      mats.set(p.kind, mat);
+      propDisposables.push(mat);
+    }
+    const marker = new THREE.Mesh(proxyGeo, mat);
+    marker.position.set(p.pos.x, p.pos.y, p.pos.z);
+    marker.scale.setScalar(p.kind === "wreck" ? 3 : 1.6);
+    group.add(marker);
+    if (p.dir) {
+      const geo = new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(p.pos.x, p.pos.y, p.pos.z),
+        new THREE.Vector3(
+          p.pos.x + p.dir.x * 5,
+          p.pos.y + p.dir.y * 5,
+          p.pos.z + p.dir.z * 5,
+        ),
+      ]);
+      const lineMat = new THREE.LineBasicMaterial({
+        color: PROP_COLORS[p.kind],
+        transparent: true,
+        opacity: 0.7,
+      });
+      propDisposables.push(geo, lineMat);
+      group.add(new THREE.Line(geo, lineMat));
+    }
+  }
+  scene.add(group);
+  propsGroup = group;
+  return props;
+}
+
+// HUD lines: seeded counts vs the recipe budgets.
+function propHudLines(props: SeededProp[]): HudLine[] {
+  const count = (kind: SeededPropKind, zone?: string) =>
+    props.filter((p) => p.kind === kind && (!zone || p.zone === zone)).length;
+  const lines: HudLine[] = [];
+  for (const biome of world.biomes) {
+    const bud = biome.budgets;
+    if (bud?.airPockets) {
+      const got = count("airPocket", biome.id);
+      lines.push([
+        `air · ${biome.id}`,
+        `${got} / ${bud.airPockets}`,
+        got === bud.airPockets ? "ok" : "bad",
+      ]);
+    }
+    if (bud?.hazards) {
+      const spec: [SeededPropKind, number][] = [
+        ["melt_fall", bud.hazards.meltFalls],
+        ["melt_pool", bud.hazards.meltPools],
+        ["thermal_vent", bud.hazards.vents],
+      ];
+      for (const [kind, want] of spec) {
+        const got = count(kind, biome.id);
+        lines.push([kind, `${got} / ${want}`, got === want ? "ok" : "bad"]);
+      }
+    }
+  }
+  lines.push(["wreck", String(count("wreck"))]);
+  return lines;
 }
 
 function mount(group: THREE.Group): void {
@@ -1018,6 +1138,7 @@ function rebuildMapProxies(): void {
   frameCamera(world.worldR * 2.05);
   clipScale = world.worldR;
 
+  const props = drawProps();
   const lines: HudLine[] = [
     ["chunks", String(plan.specs.length)],
     ["planned in", `${(performance.now() - t0).toFixed(0)} ms`],
@@ -1031,6 +1152,7 @@ function rebuildMapProxies(): void {
         `entrance ${trail.reachesEntrance ? "✓" : "✗"}`,
       trail.reachesEntrance && trail.orphans <= 3 ? "ok" : "bad",
     ]);
+  lines.push(...propHudLines(props));
   for (const biome of world.biomes)
     lines.push([biome.id, String(counts.get(biome.id) ?? 0)]);
   setHud("map · layout proxies", lines);
@@ -1087,6 +1209,7 @@ async function buildRealWorld(): Promise<void> {
   markers.add(spawn);
   mount(markers);
 
+  const props = drawProps();
   setHud("map · real build", [
     ["seed / diff", `${view.seed} / d${view.difficulty}`],
     ["res", view.buildHalfRes ? "half" : "full"],
@@ -1098,6 +1221,7 @@ async function buildRealWorld(): Promise<void> {
         : "—",
     ],
     ["gold radius", gold ? Math.hypot(gold.x, gold.y, gold.z).toFixed(0) : "—"],
+    ...propHudLines(props),
     ["walk it", "press F"],
   ]);
 }
@@ -1328,6 +1452,7 @@ const CATS: Record<Mode, { id: string; label: string }[]> = {
   map: [
     { id: "world", label: "world" },
     { id: "layers", label: "layers" },
+    { id: "props", label: "props" },
     { id: "build", label: "build" },
   ],
 };
@@ -1671,6 +1796,20 @@ function buildBiomeCat(panel: HTMLElement, cat: string): void {
         }, 0),
       );
       sightBtn.classList.toggle("on", !!pl.sightline);
+      sliderRow(
+        place,
+        "rotate °/s",
+        0,
+        3,
+        0.1,
+        pl.rotate?.degPerSec ?? 0,
+        (v) =>
+          edit(() => {
+            if (v <= 0) delete pl.rotate;
+            else pl.rotate = { degPerSec: v };
+          }),
+        (v) => (v <= 0 ? "off" : v.toFixed(1)),
+      );
     } else if (pl.mode === "fused") {
       rangePair(
         place,
@@ -1846,6 +1985,17 @@ function buildBiomeCat(panel: HTMLElement, cat: string): void {
       biome.material.veinStrength,
       (v) => editSkin(() => (biome.material.veinStrength = v)),
     );
+    // WG-13: glow from the baked edge attribute instead of interior noise.
+    // Remesh, not just re-skin — the attribute is baked at extraction.
+    const waxRow = wax.querySelector(".row") as HTMLElement;
+    const edgeBtn = button(waxRow, "edge veins", (b) =>
+      edit(() => {
+        if (biome.material.edgeVeins) delete biome.material.edgeVeins;
+        else biome.material.edgeVeins = true;
+        b.classList.toggle("on", !!biome.material.edgeVeins);
+      }, 0),
+    );
+    edgeBtn.classList.toggle("on", !!biome.material.edgeVeins);
     return;
   }
 
@@ -2146,6 +2296,36 @@ function buildMapCat(panel: HTMLElement, cat: string): void {
         int,
       );
     }
+    return;
+  }
+
+  if (cat === "props") {
+    // WG-11 marker overlay: per-kind toggles; the HUD carries count vs
+    // budget. Proxies mode seeds from a fresh data build, built mode from
+    // the world that is actually mounted.
+    const box = section(panel, "Seeded props (WG-11)").parentElement!;
+    const row = box.querySelector(".row") as HTMLElement;
+    const KIND_LABELS: [SeededPropKind, string][] = [
+      ["airPocket", "air pockets"],
+      ["melt_fall", "melt falls"],
+      ["melt_pool", "melt pools"],
+      ["thermal_vent", "vents"],
+      ["wreck", "wreck"],
+    ];
+    for (const [kind, label] of KIND_LABELS) {
+      const btn = button(row, label, (b) => {
+        view.propKinds[kind] = !view.propKinds[kind];
+        b.classList.toggle("on", view.propKinds[kind]);
+        // Built worlds only redraw the overlay — never tear down the build.
+        if (view.built) drawProps();
+        else scheduleRebuild(0);
+      });
+      btn.classList.toggle("on", view.propKinds[kind]);
+    }
+    moodLine(
+      box,
+      "positions are seeded by the generator — same seed, same list on every client",
+    );
     return;
   }
 

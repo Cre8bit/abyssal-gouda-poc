@@ -94,6 +94,7 @@ export type BiomePlacement =
       densityGrade?: "outward" | "inward"; // bias placement radius (absent = uniform)
       sizeGrade?: "outward" | "inward"; // size tracks band position (WG-06)
       sightline?: boolean; // chain each chunk within sight of the last (WG-07)
+      rotate?: { degPerSec: number }; // slow seeded tumble; per-chunk axis + signed rate (WG-12)
     }
   | {
       mode: "fused"; // ONE solid frame-band body, lattice-tiled (K9)
@@ -122,6 +123,9 @@ export interface BiomeMaterial {
   rind: number; // outer wax color (hex)
   vein: [number, number, number]; // glow color (linear rgb)
   veinStrength: number;
+  // WG-13: glow rides the baked edge-curvature attribute (silhouette rims,
+  // carve mouths) instead of the interior noise patches — the dark veins.
+  edgeVeins?: boolean;
 }
 
 // Seeded per-biome content counts (WG-11 places them; data-only today).
@@ -242,7 +246,7 @@ export const MVP_PARTS: PartRecipe[] = [
     deadEnds: 1,
     narrow: false,
     tangle: false,
-    tags: ["dark", "landmark"],
+    tags: ["dark", "landmark", "edge-veins"],
   },
   {
     id: "melt-rind",
@@ -473,17 +477,19 @@ export const WHEEL_BIOMES: BiomeRecipe[] = [
       densityGrade: "inward",
       sizeGrade: "inward",
       sightline: true,
+      rotate: { degPerSec: 1.2 },
     },
     sizeBase: 10,
     sizeVar: 30,
     res: 56,
     parts: [{ part: "roquefort-float", weight: 1 }],
-    // near-black paste, cold blue-grey, blue-green glow
+    // near-black paste, cold blue-grey, blue-green glow on the edges
     material: {
       paste: 0x424a5e,
       rind: 0x1f2229,
       vein: [0.2, 0.95, 0.72],
       veinStrength: 1.35,
+      edgeVeins: true,
     },
     fishMayEnter: true,
     budgets: { airPockets: 0, softSpots: 0 },
@@ -538,6 +544,7 @@ export const WHEEL_BIOMES: BiomeRecipe[] = [
       count: 120,
       guard: 1.0,
       densityGrade: "inward",
+      rotate: { degPerSec: 0.6 },
     },
     sizeBase: 8,
     sizeVar: 10,
@@ -625,6 +632,14 @@ export function validateWorld(world: WorldRecipe): string[] {
       errors.push(`${biome.id}: fused band ${pl.rMin}–${pl.rMax} not ordered`);
     if (pl.mode === "band" && pl.rMin >= pl.rMax)
       errors.push(`${biome.id}: band ${pl.rMin}–${pl.rMax} not ordered`);
+    if (
+      pl.mode === "band" &&
+      pl.rotate &&
+      (pl.rotate.degPerSec <= 0 || pl.rotate.degPerSec > 4)
+    )
+      errors.push(
+        `${biome.id}: rotate ${pl.rotate.degPerSec}°/s outside (0, 4]`,
+      );
     if (pl.mode === "hull") {
       for (const entry of biome.parts) {
         const part = world.parts.find((p) => p.id === entry.part);

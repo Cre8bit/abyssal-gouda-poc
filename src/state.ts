@@ -16,12 +16,17 @@ export interface Vec3 {
 export type DigTool = "hands" | "driller";
 
 // One sphere carve out of the world. Also the wire shape of the "dig" event.
+// When `c` is present the dig landed on a ROTATING chunk (WG-12): x/y/z are
+// that chunk's local (unit) coords, resolved through the receiver's current
+// orientation — a world point replayed at a different clock would land
+// elsewhere on the cheese.
 export interface SphereDig {
   x: number;
   y: number;
   z: number;
   r?: number; // omitted = the sender used the default dig radius
   tool?: DigTool; // omitted = hands (the conservative gate)
+  c?: number; // rotating target's chunk index (chunk arrays are seed-identical)
 }
 
 export interface GameState {

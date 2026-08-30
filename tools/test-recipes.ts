@@ -211,6 +211,27 @@ check(
   WHEEL_WORLD.goldBand.min === 0 && WHEEL_WORLD.goldBand.max < 20,
 );
 
+// WG-12: the two scatter bands tumble — slow seeded rotation, in the law's
+// (0, 4] °/s window.
+const driftPl = drift.placement;
+check(
+  "wheel: veins + drift carry a rotate rate in (0, 4] °/s",
+  veins.placement.mode === "band" &&
+    driftPl.mode === "band" &&
+    (veins.placement.rotate?.degPerSec ?? 0) > 0 &&
+    (veins.placement.rotate?.degPerSec ?? 9) <= 4 &&
+    (driftPl.rotate?.degPerSec ?? 0) > 0 &&
+    (driftPl.rotate?.degPerSec ?? 9) <= 4,
+);
+
+// WG-13: the dark-veins glow is edge-baked — the part bakes aVein, the
+// biome material consumes it instead of interior noise patches.
+check(
+  "wheel: roquefort bakes edge veins and the veins wax consumes them",
+  partById(WHEEL_WORLD, "roquefort-float").tags.includes("edge-veins") &&
+    veins.material.edgeVeins === true,
+);
+
 // The emmental holes stay readable: r × res ≥ 4 (cheese-parts §1).
 const emmental = WHEEL_WORLD.parts.find((p) => p.id === "emmental-drift")!;
 check(

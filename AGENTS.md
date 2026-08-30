@@ -128,8 +128,15 @@ placement mode were retired in WG-04.
 
 - *Per-chunk bodies* — `center | band`: every chunk is its own closed
   ellipsoid SDF. `band` supports `densityGrade`/`sizeGrade`
-  (outward/inward) and `sightline` (each chunk placed within sight of the
-  already-placed trail — the dark veins).
+  (outward/inward), `sightline` (each chunk placed within sight of the
+  already-placed trail — the dark veins), and `rotate` (WG-12: a slow
+  seeded tumble — axis + signed rate per chunk from a SIDE rng stream, so
+  the main stream and its fingerprint never move). Orientation is
+  `rate × the clock fed to updateGouda`; queries un-rotate the probe point
+  and digs are stored chunk-local, so collision == render by construction.
+  A dig on a rotating chunk replicates as **chunk id + local coords**
+  (`SphereDig.c`, replayed via `digAtChunkLocal`) — a world point replayed
+  at a different clock would land elsewhere on the cheese.
 - *Layer bodies* — `fused | hull`: ONE analytic body per biome (a radial
   band of solid cheese; the Great Wheel's rounded-cylinder husk with
   soft-spot bulges; the melt shell's sphere husk with its one generated
@@ -142,6 +149,21 @@ placement mode were retired in WG-04.
   every tile they touch; `shareCarves()` then composes carves across
   interpenetrating meshes (a heart exit cuts the galleries tiles it passes
   through) — except into `sealed` tiles (`noCarveWithin`).
+
+**Seeded props (WG-11)**: air pockets (drift ×6, heart ×1, at eye
+ceilings), melt hazards (falls/pools/vents at cavern ceilings/floors, each
+with a seeded phase), and the wreck are drawn at the **tail of the rng
+stream** — strictly after every chunk/debris/gold/spawn draw, so the world
+fingerprint is untouched. Exposed as `WorldPlan.props` / `getSeededProps()`;
+the bench map view draws them (props tab, toggles per kind, HUD counts vs
+budget); game systems consume them in M5/M6.
+
+**Edge-vein glow (WG-13)**: parts tagged `edge-veins` (roquefort-float) get
+an `aVein` vertex attribute baked at geometry extraction — an SDF-Laplacian
+curvature probe, so convex rims and carve mouths light up and cavity
+interiors stay dark; digs remesh with the glow on the new rims. A biome
+material with `edgeVeins: true` (the veins wax) consumes it in place of the
+interior noise-patch glow, scaled by `veinStrength` as before.
 
 **The frame and the spine** (`WorldRecipe.frame`/`spine`): layer radii are
 measured in an optionally squashed + tilted frame, which is how the whole

@@ -33,6 +33,17 @@
 // on that single chunk. Collision stays exact because the same dig list is
 // part of the chunk's SDF. The world is fully destructible.
 //
+// ROTATION (WG-12) — band biomes may tumble: each chunk gets a seeded axis +
+// rate from a SIDE rng stream (the main stream, and so the fingerprint,
+// never moves). Orientation = rate × the clock fed to updateGouda; queries
+// un-rotate the probe point, meshes get the forward rotation, digs are
+// stored chunk-local — collision == render by construction. Digs on
+// rotating chunks replicate as chunk id + local coords (digAtChunkLocal).
+//
+// SEEDED PROPS (WG-11) — air pockets, melt hazards and the wreck are drawn
+// at the TAIL of the rng stream and exposed via WorldPlan.props /
+// getSeededProps(); game systems consume them in M5/M6.
+//
 // THE MAP (cheese-parts.md §3) — six biomes, two seals, outside → in:
 //   the drift      (240–300)  emmental debris clustered against the Wheel
 //   the Great Wheel (R 233)   SEAL #1 — hull husk, drilled at a soft spot
@@ -130,6 +141,22 @@ export interface GenCtx {
   blastPoints: Vec3[]; // sink for thin-wall marker positions
 }
 
+// Seeded tumble of a scatter chunk (WG-12): unit axis + signed rad/s. The
+// orientation is angle = rate × clock — a pure function of time; cos/sin are
+// the runtime cache updateGouda refreshes each frame (identity until then,
+// so the verifier and node tests see the t = 0 world).
+export interface ChunkSpin {
+  ax: number;
+  ay: number;
+  az: number;
+  rate: number;
+}
+
+interface SpinState extends ChunkSpin {
+  cos: number;
+  sin: number;
+}
+
 export interface Chunk {
   center: THREE.Vector3;
   s: number;
@@ -153,6 +180,8 @@ export interface Chunk {
   zone?: ZoneName; // set by buildGoudaWorld
   body?: LayerBody; // layer-body tile: base SDF comes from the layer, not the ellipsoid
   sealed?: boolean; // seal tiles never receive foreign carves (noCarveWithin)
+  spin?: SpinState; // rotating scatter chunk (WG-12); queries un-rotate probes
+  veinEdges?: boolean; // bake the aVein edge-glow attribute at extraction (WG-13)
 }
 
 export interface ChunkSpec {
@@ -163,6 +192,7 @@ export interface ChunkSpec {
   zone: ZoneName;
   part: PartRecipe;
   body?: LayerBody; // layer-body tile (fused/hull placements)
+  spin?: ChunkSpin; // seeded tumble (band rotate, WG-12)
 }
 
 // One point of the seeded descent route: a through-point per layer boundary.
@@ -183,12 +213,31 @@ export interface EntranceSpec {
   r: number;
 }
 
+// One deterministic world-space prop seed (WG-11): air pockets at eye
+// ceilings, melt hazards at cavern ceilings/floors, the wreck. Positions are
+// consumed by M5/M6 game systems; replicated for free (same seed, same list).
+export type SeededPropKind =
+  | "airPocket"
+  | "wreck"
+  | "melt_fall"
+  | "melt_pool"
+  | "thermal_vent";
+
+export interface SeededProp {
+  kind: SeededPropKind;
+  zone: ZoneName;
+  pos: Vec3;
+  dir?: Vec3; // surface normal into open water (hazards)
+  phase?: number; // seeded cycle offset 0–1 (hazards; timing itself is M5)
+}
+
 export interface WorldPlan {
   specs: ChunkSpec[];
   spine: SpinePoint[];
   softSpots: SoftSpot[];
   entrance: EntranceSpec | null;
   wreckPos: Vec3 | null; // the drowned bathyscaphe + driller (WG-05/WG-11)
+  props: SeededProp[]; // filled by buildWorldData (needs the carved eyes)
 }
 
 interface Debris {
@@ -213,6 +262,8 @@ let spawnPoint: THREE.Vector3 | null = null;
 let lastCull = -1;
 let worldSpine: SpinePoint[] = [];
 let worldSoftSpots: SoftSpot[] = [];
+let worldProps: SeededProp[] = [];
+let hasSpin = false; // any rotating chunk in the built world (skip the frame loop otherwise)
 
 const uGoudaTime = { value: 0 };
 
@@ -293,6 +344,34 @@ function segDist(
 function smoothMin(a: number, b: number, k: number): number {
   const h = Math.max(k - Math.abs(a - b), 0) / k;
   return Math.min(a, b) - h * h * k * 0.25;
+}
+
+// Rodrigues rotation of a chunk-relative vector about the spin axis. Pass
+// -sp.sin to un-rotate a world probe into the chunk's frame, +sp.sin to push
+// chunk-local data back out to world.
+const _sv: Vec3 = { x: 0, y: 0, z: 0 };
+function spinRotate(
+  sp: SpinState,
+  x: number,
+  y: number,
+  z: number,
+  sin: number,
+  out: Vec3,
+): void {
+  const cos = sp.cos;
+  if (cos === 1 && sin === 0) {
+    out.x = x;
+    out.y = y;
+    out.z = z;
+    return;
+  }
+  const kx = sp.ax,
+    ky = sp.ay,
+    kz = sp.az;
+  const dot = (kx * x + ky * y + kz * z) * (1 - cos);
+  out.x = x * cos + (ky * z - kz * y) * sin + kx * dot;
+  out.y = y * cos + (kz * x - kx * z) * sin + ky * dot;
+  out.z = z * cos + (kx * y - ky * x) * sin + kz * dot;
 }
 
 // --- World frame (squash + tilt) — layer-body radii are measured here ------------
@@ -811,6 +890,8 @@ export function makeChunkData(
   for (const e of eyes) if (e.r > (biggest?.r ?? 0)) biggest = e;
   c.biggestEye = biggest;
 
+  if (part.tags.includes("edge-veins")) c.veinEdges = true;
+
   return c;
 }
 
@@ -833,6 +914,12 @@ function getMC(res: number): MarchingCubes {
   }
   return mc;
 }
+
+// Edge-vein bake thresholds (WG-13): world-space mean-curvature band mapped
+// to aVein 0→1. Smooth hunk faces (ρ ≫ 4 u) stay dark; carve mouths and
+// silhouette rims (fillet ρ ≈ SMOOTH_K·s ≈ 0.5–2 u) light up.
+const VEIN_CURV_LO = 0.25;
+const VEIN_CURV_HI = 1.1;
 
 // Extract compact geometry with sanitized normals; compute rind factor (1=crust, 0=carved).
 function extractGeometry(mc: MarchingCubes, c: Chunk): THREE.BufferGeometry {
@@ -864,6 +951,36 @@ function extractGeometry(mc: MarchingCubes, c: Chunk): THREE.BufferGeometry {
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   geometry.setAttribute("normal", new THREE.BufferAttribute(normals, 3));
   geometry.setAttribute("aCrust", new THREE.BufferAttribute(crust, 1));
+
+  // WG-13 — bake aVein for edge-vein parts: the SDF Laplacian at the vertex
+  // estimates mean curvature (convex edges > 0, cavity interiors < 0).
+  // chunkSdf includes digs, so remeshing keeps the glow on the new rims;
+  // chunks without the flag skip the buffer (a missing attribute reads 0).
+  if (c.veinEdges) {
+    const vein = new Float32Array(count);
+    const eps = 2.5 / c.res;
+    const inv = 1 / (eps * eps * c.s);
+    for (let i = 0; i < count; i++) {
+      const i3 = i * 3;
+      const x = positions[i3],
+        y = positions[i3 + 1],
+        z = positions[i3 + 2];
+      const lap =
+        chunkSdf(c, x + eps, y, z) +
+        chunkSdf(c, x - eps, y, z) +
+        chunkSdf(c, x, y + eps, z) +
+        chunkSdf(c, x, y - eps, z) +
+        chunkSdf(c, x, y, z + eps) +
+        chunkSdf(c, x, y, z - eps) -
+        6 * chunkSdf(c, x, y, z);
+      const t2 = Math.max(
+        0,
+        Math.min(1, (lap * inv - VEIN_CURV_LO) / (VEIN_CURV_HI - VEIN_CURV_LO)),
+      );
+      vein[i] = t2 * t2 * (3 - 2 * t2);
+    }
+    geometry.setAttribute("aVein", new THREE.BufferAttribute(vein, 1));
+  }
   geometry.computeBoundingSphere();
   return geometry;
 }
@@ -944,6 +1061,10 @@ function digHardness(c: Chunk, x: number, y: number, z: number): number {
 export interface DigResult {
   changed: boolean; // some chunk/debris took the carve
   rejected: boolean; // some chunk in range bounced the tool (feedback hook)
+  // The nearest ROTATING chunk that took the carve (WG-12): digs on spinning
+  // cheese replicate as chunk id + these local (unit) coords, because a
+  // world-space point replayed at a different clock lands elsewhere.
+  spinLocal?: { chunk: number; x: number; y: number; z: number };
 }
 
 // Carve sphere through chunks; update fields, re-mesh, destroy small debris.
@@ -958,9 +1079,12 @@ export function digAt(
 ): DigResult {
   let changed = false;
   let rejected = false;
+  let spinLocal: DigResult["spinLocal"];
+  let spinDc = Infinity;
   const maxHardness = TOOL_MAX_HARDNESS[tool];
 
-  for (const c of chunks) {
+  for (let ci = 0; ci < chunks.length; ci++) {
+    const c = chunks[ci];
     const dx = x - c.center.x,
       dy = y - c.center.y,
       dz = z - c.center.z;
@@ -971,11 +1095,24 @@ export function digAt(
       continue;
     }
 
-    const lx = dx / c.s,
-      ly = dy / c.s,
-      lz = dz / c.s;
+    let ldx = dx,
+      ldy = dy,
+      ldz = dz;
+    if (c.spin) {
+      spinRotate(c.spin, dx, dy, dz, -c.spin.sin, _sv);
+      ldx = _sv.x;
+      ldy = _sv.y;
+      ldz = _sv.z;
+    }
+    const lx = ldx / c.s,
+      ly = ldy / c.s,
+      lz = ldz / c.s;
     const lr = r / c.s;
     c.digs.push({ x: lx, y: ly, z: lz, r: lr });
+    if (c.spin && dc < spinDc) {
+      spinDc = dc;
+      spinLocal = { chunk: ci, x: lx, y: ly, z: lz };
+    }
 
     // Edit only voxels the dig can touch.
     const res = c.res;
@@ -1021,7 +1158,39 @@ export function digAt(
     }
   }
 
-  return { changed, rejected };
+  return { changed, rejected, spinLocal };
+}
+
+// Chunk-local (unit) coords → world, through the chunk's CURRENT orientation.
+export function chunkLocalToWorld(index: number, p: Vec3): Vec3 | null {
+  const c = chunks[index];
+  if (!c) return null;
+  let x = p.x * c.s,
+    y = p.y * c.s,
+    z = p.z * c.s;
+  if (c.spin) {
+    spinRotate(c.spin, x, y, z, c.spin.sin, _sv);
+    x = _sv.x;
+    y = _sv.y;
+    z = _sv.z;
+  }
+  return { x: c.center.x + x, y: c.center.y + y, z: c.center.z + z };
+}
+
+// Replay a chunk-local dig (the wire shape rotating chunks replicate as,
+// WG-12): resolve to world through the chunk's current orientation, then run
+// the normal dig — the round trip lands on the same spot of the cheese.
+export function digAtChunkLocal(
+  index: number,
+  lx: number,
+  ly: number,
+  lz: number,
+  r: number,
+  tool: DigTool,
+): DigResult {
+  const w = chunkLocalToWorld(index, { x: lx, y: ly, z: lz });
+  if (!w) return { changed: false, rejected: false };
+  return digAt(w.x, w.y, w.z, r, tool);
 }
 
 // Sphere-trace along ray; return hit point or null.
@@ -1060,11 +1229,33 @@ export function createGoudaMaterial({
   rind,
   vein,
   veinStrength,
+  edgeVeins,
 }: BiomeMaterial): THREE.MeshToonMaterial {
   const pasteVec = vec3str(paste);
   const rindVec = vec3str(rind);
   const veinVec = `vec3(${vein[0].toFixed(3)}, ${vein[1].toFixed(3)}, ${vein[2].toFixed(3)})`;
   const vs = veinStrength.toFixed(3);
+
+  // Interior noise-patch glow (the default), or the baked edge glow (WG-13):
+  // aVein marks convex rims/carve mouths, filaments break the rim light into
+  // strands, and it never pulses — occlusion (rotation) is what makes the
+  // trail light vanish and return. Interior faces carry no aVein: near-black.
+  const emissiveGlow = edgeVeins
+    ? `
+          float fil = sin(gp.x * 5.3 + 1.7) * sin(gp.y * 4.7 + 0.6) * sin(gp.z * 5.9 + 3.9);
+          fil = 0.35 + 0.65 * smoothstep(0.15, 0.85, fil * 0.5 + 0.5);
+          float inPaste = 1.0 - vCrust * 0.85;
+          totalEmissiveRadiance += ${pasteVec} * inPaste * 0.015;
+          totalEmissiveRadiance += ${veinVec} * vVein * fil * ${vs};`
+    : `
+          float patches = smoothstep(0.12, 0.72, g1 * 0.5 + 0.5)
+                        * smoothstep(0.25, 0.9, g2 * 0.5 + 0.5);
+          float pulse = 0.5 + 0.5 * sin(uGoudaTime * 0.55 + g2 * 6.0);
+          pulse *= 0.7 + 0.3 * sin(uGoudaTime * 0.173 + gp.y * 0.05);
+          float inPaste = 1.0 - vCrust * 0.85; // the glow lives in the paste
+          // Faint constant self-glow so the paste reads yellow even unlit.
+          totalEmissiveRadiance += ${pasteVec} * inPaste * 0.04;
+          totalEmissiveRadiance += ${veinVec} * patches * (0.25 + 0.75 * pulse) * ${vs} * inPaste;`;
 
   const injectCheese = (
     shader: THREE.WebGLProgramParametersWithUniforms,
@@ -1072,17 +1263,18 @@ export function createGoudaMaterial({
     shader.uniforms.uGoudaTime = uGoudaTime;
 
     shader.vertexShader =
-      "attribute float aCrust;\nvarying float vCrust;\nvarying vec3 vGoudaWorld;\nvarying vec3 vGoudaNormal;\n" +
+      "attribute float aCrust;\nattribute float aVein;\nvarying float vCrust;\nvarying float vVein;\nvarying vec3 vGoudaWorld;\nvarying vec3 vGoudaNormal;\n" +
       shader.vertexShader.replace(
         "#include <begin_vertex>",
         `#include <begin_vertex>
         vCrust = aCrust;
+        vVein = aVein;
         vGoudaWorld = (modelMatrix * vec4(transformed, 1.0)).xyz;
         vGoudaNormal = mat3(modelMatrix) * objectNormal;`,
       );
 
     shader.fragmentShader =
-      "uniform float uGoudaTime;\nvarying float vCrust;\nvarying vec3 vGoudaWorld;\nvarying vec3 vGoudaNormal;\n" +
+      "uniform float uGoudaTime;\nvarying float vCrust;\nvarying float vVein;\nvarying vec3 vGoudaWorld;\nvarying vec3 vGoudaNormal;\n" +
       shader.fragmentShader
         .replace(
           "#include <color_fragment>",
@@ -1101,16 +1293,9 @@ export function createGoudaMaterial({
           vec3 gp = vGoudaWorld;
           float g1 = sin(gp.x * 0.21 + 1.3) * sin(gp.y * 0.19 + 3.1) * sin(gp.z * 0.23 + 5.2);
           float g2 = sin(gp.x * 0.083 + 2.1) * sin(gp.y * 0.077) * sin(gp.z * 0.09 + 4.0);
-          float patches = smoothstep(0.12, 0.72, g1 * 0.5 + 0.5)
-                        * smoothstep(0.25, 0.9, g2 * 0.5 + 0.5);
-          float pulse = 0.5 + 0.5 * sin(uGoudaTime * 0.55 + g2 * 6.0);
-          pulse *= 0.7 + 0.3 * sin(uGoudaTime * 0.173 + gp.y * 0.05);
           vec3 gv = normalize(cameraPosition - gp);
           vec3 gn = normalize(vGoudaNormal + vec3(1e-5));
-          float inPaste = 1.0 - vCrust * 0.85; // the glow lives in the paste
-          // Faint constant self-glow so the paste reads yellow even unlit.
-          totalEmissiveRadiance += ${pasteVec} * inPaste * 0.04;
-          totalEmissiveRadiance += ${veinVec} * patches * (0.25 + 0.75 * pulse) * ${vs} * inPaste;
+${emissiveGlow}
 
           // WATER SHIMMER — drifting interference ripples playing over
           // up-facing surfaces, as if the glow of the veins refracts through
@@ -1137,7 +1322,7 @@ export function createGoudaMaterial({
     { color: 0xffffff }, // overridden per-fragment by the paste/rind mix
     {
       shader: injectCheese,
-      key: `gouda${pasteVec}${rindVec}${veinVec}${vs}`,
+      key: `gouda${pasteVec}${rindVec}${veinVec}${vs}${edgeVeins ? "E" : ""}`,
     },
   );
 }
@@ -1240,12 +1425,31 @@ function createBlastMarkers(parent: THREE.Group): void {
 
 // --- Per-frame updates ------------------------------------------------------------------------
 
+const _spinAxis = new THREE.Vector3();
+
 export function updateGouda(
   elapsed: number,
   cameraPos: THREE.Vector3 | null = null,
   visibility = 90,
 ): void {
   uGoudaTime.value = elapsed;
+
+  // WG-12: orientation = rate × clock, refreshed once per frame — queries
+  // un-rotate probes through the same cos/sin, so collision == render holds
+  // per frame (surfaces are static within a frame; no drag is imparted).
+  if (hasSpin) {
+    for (const c of chunks) {
+      const sp = c.spin;
+      if (!sp) continue;
+      const a = sp.rate * elapsed;
+      sp.cos = Math.cos(a);
+      sp.sin = Math.sin(a);
+      if (c.mesh) {
+        _spinAxis.set(sp.ax, sp.ay, sp.az);
+        c.mesh.quaternion.setFromAxisAngle(_spinAxis, a);
+      }
+    }
+  }
 
   if (markerMaterial) {
     markerMaterial.opacity = 0.35 + 0.22 * Math.sin(elapsed * 2.6);
@@ -1360,7 +1564,15 @@ function makeHullBody(
 
 // BiomeRecipe placements → chunk layout, in table order. The rng stream is a
 // pure function of the tables — draw order is part of the world format.
-function placeChunks(rng: Rng, world: WorldRecipe, _diff: number): WorldPlan {
+// Spin (WG-12) draws from its own side stream keyed off the seed, so adding
+// or tuning rotation never moves the main stream (fingerprints hold).
+function placeChunks(
+  rng: Rng,
+  world: WorldRecipe,
+  _diff: number,
+  seed: number,
+): WorldPlan {
+  const spinRng = mulberry32((seed ^ 0x51f15e5) >>> 0);
   const frame = makeFrame(world.frame);
   const specs: ChunkSpec[] = [];
   const softSpots: SoftSpot[] = [];
@@ -1523,6 +1735,16 @@ function placeChunks(rng: Rng, world: WorldRecipe, _diff: number): WorldPlan {
           }
           if (!seen) continue;
         }
+        // Seeded tumble (WG-12): axis + varied signed rate off the side
+        // stream, drawn per ACCEPTED chunk in placement order.
+        let spin: ChunkSpin | undefined;
+        if (pl.rotate) {
+          randDir(spinRng, _dir2);
+          const rate =
+            ((pl.rotate.degPerSec * (0.5 + spinRng()) * Math.PI) / 180) *
+            (spinRng() < 0.5 ? -1 : 1);
+          spin = { ax: _dir2.x, ay: _dir2.y, az: _dir2.z, rate };
+        }
         specs.push({
           center: p,
           s,
@@ -1530,6 +1752,7 @@ function placeChunks(rng: Rng, world: WorldRecipe, _diff: number): WorldPlan {
           label: biome.label,
           zone: biome.id,
           part,
+          spin,
         });
         return;
       }
@@ -1773,7 +1996,7 @@ function placeChunks(rng: Rng, world: WorldRecipe, _diff: number): WorldPlan {
     wreckPos = { x: w.x, y: w.y, z: w.z };
   }
 
-  return { specs, spine, softSpots, entrance, wreckPos };
+  return { specs, spine, softSpots, entrance, wreckPos, props: [] };
 }
 
 // Layout-only pass for the worldgen bench's map view: the chunk placement a
@@ -1785,7 +2008,7 @@ export function planWorldLayout(
 ): WorldPlan {
   const errors = validateWorld(world);
   if (errors.length) throw new Error(`worldgen: ${errors.join("; ")}`);
-  return placeChunks(mulberry32(seed >>> 0), world, difficulty);
+  return placeChunks(mulberry32(seed >>> 0), world, difficulty, seed >>> 0);
 }
 
 // --- Layer carve networks ---------------------------------------------------------------------
@@ -1795,6 +2018,7 @@ export interface LayerGenOpts {
   sideExits: number;
   spineIn: SpinePoint | null;
   spineOut: SpinePoint | null;
+  eyesOut?: SphereCarve[]; // sink for the layer's world-space eyes (WG-11 hazard hosts)
 }
 
 // World-space bent tunnel polyline (addTunnel's world-unit twin).
@@ -2133,6 +2357,8 @@ export function buildLayerChunks(
   spineLink(opts.spineIn, true);
   spineLink(opts.spineOut, false);
 
+  if (opts.eyesOut) for (const eyes of tileEyes) opts.eyesOut.push(...eyes);
+
   // WG-08: the hull's own hidden-entrance carves. Sealed tiles refuse only
   // FOREIGN carves — the door belongs to this layer; shareCarves later
   // spreads it into the interpenetrating neighbours as usual.
@@ -2374,6 +2600,138 @@ export interface WorldData {
   blastPoints: Vec3[];
 }
 
+// WG-11 — seeded props. Drawn at the TAIL of the rng stream (strictly after
+// every chunk/debris/gold/spawn draw), so the world fingerprint is untouched.
+// Draw order: biomes in table order — air-pocket picks, then hazards as
+// melt_fall → melt_pool → thermal_vent — then the wreck (no rng). A prop is
+// marched along ±y from its host eye and bisected to PROP_SNAP u of water
+// between it and the surface, so it hugs a real ceiling/floor of the carved
+// geometry (spot-checkable via distanceToWorld).
+const PROP_SNAP = 0.38;
+const HAZARD_MIN_EYE_R = 5; // hazards live in the big caverns only
+const HAZARD_SPACING = 4; // min gap between same-kind hazards
+
+function seedProps(
+  rng: Rng,
+  world: WorldRecipe,
+  plan: WorldPlan,
+  chunkList: Chunk[],
+  layerEyes: Map<ZoneName, SphereCarve[]>,
+): SeededProp[] {
+  const props: SeededProp[] = [];
+  const dist = (x: number, y: number, z: number) =>
+    distanceToWorld(chunkList, [], x, y, z);
+
+  const snapToSurface = (from: Vec3, dirY: 1 | -1, maxT: number): Vec3 | null => {
+    if (dist(from.x, from.y, from.z) < PROP_SNAP) return null;
+    let lo = 0;
+    for (let t = 0.25; t <= maxT; t += 0.25) {
+      if (dist(from.x, from.y + dirY * t, from.z) < PROP_SNAP) {
+        let hi = t;
+        for (let i = 0; i < 8; i++) {
+          const mid = (lo + hi) / 2;
+          if (dist(from.x, from.y + dirY * mid, from.z) < PROP_SNAP) hi = mid;
+          else lo = mid;
+        }
+        return { x: from.x, y: from.y + dirY * lo, z: from.z };
+      }
+      lo = t;
+    }
+    return null;
+  };
+  const normalAt = (p: Vec3): Vec3 => {
+    const E = 0.2;
+    const nx = dist(p.x + E, p.y, p.z) - dist(p.x - E, p.y, p.z);
+    const ny = dist(p.x, p.y + E, p.z) - dist(p.x, p.y - E, p.z);
+    const nz = dist(p.x, p.y, p.z + E) - dist(p.x, p.y, p.z - E);
+    const len = Math.hypot(nx, ny, nz);
+    if (len < 1e-6) return { x: 0, y: 1, z: 0 };
+    return { x: nx / len, y: ny / len, z: nz / len };
+  };
+
+  for (const biome of world.biomes) {
+    const budget = biome.budgets;
+    if (!budget) continue;
+
+    if (budget.airPockets > 0) {
+      // Candidate hosts: this zone's chunks with a roomy interior eye. Picks
+      // draw without replacement; a failed march discards the candidate.
+      const cands: { x: number; y: number; z: number; r: number }[] = [];
+      for (const c of chunkList) {
+        if (c.zone !== biome.id || !c.biggestEye) continue;
+        const e = c.biggestEye;
+        if (e.r * c.s < 1.2) continue;
+        cands.push({
+          x: c.center.x + e.x * c.s,
+          y: c.center.y + e.y * c.s,
+          z: c.center.z + e.z * c.s,
+          r: e.r * c.s,
+        });
+      }
+      for (let n = 0; n < budget.airPockets && cands.length; n++) {
+        for (let attempt = 0; attempt < 20 && cands.length; attempt++) {
+          const eye = cands.splice(Math.floor(rng() * cands.length), 1)[0];
+          const pos = snapToSurface(eye, 1, eye.r * 1.3 + 1);
+          if (pos) {
+            props.push({ kind: "airPocket", zone: biome.id, pos });
+            break;
+          }
+        }
+      }
+    }
+
+    const haz = budget.hazards;
+    if (haz) {
+      const eyes = (layerEyes.get(biome.id) ?? []).filter(
+        (e) => e.r >= HAZARD_MIN_EYE_R,
+      );
+      const place = (kind: SeededPropKind, count: number, dirY: 1 | -1) => {
+        const placed: Vec3[] = [];
+        for (let n = 0; n < count && eyes.length; n++) {
+          for (let attempt = 0; attempt < 12; attempt++) {
+            const e = eyes[Math.floor(rng() * eyes.length)];
+            const ang = rng() * Math.PI * 2;
+            const f = Math.sqrt(rng()) * 0.5;
+            const from = {
+              x: e.x + Math.cos(ang) * e.r * f,
+              y: e.y,
+              z: e.z + Math.sin(ang) * e.r * f,
+            };
+            const pos = snapToSurface(from, dirY, e.r * 1.4);
+            if (!pos) continue;
+            let clear = true;
+            for (const q of placed)
+              if (
+                Math.hypot(pos.x - q.x, pos.y - q.y, pos.z - q.z) <
+                HAZARD_SPACING
+              ) {
+                clear = false;
+                break;
+              }
+            if (!clear) continue;
+            placed.push(pos);
+            props.push({
+              kind,
+              zone: biome.id,
+              pos,
+              dir: normalAt(pos),
+              phase: rng(),
+            });
+            break;
+          }
+        }
+      };
+      place("melt_fall", haz.meltFalls, 1);
+      place("melt_pool", haz.meltPools, -1);
+      place("thermal_vent", haz.vents, -1);
+    }
+  }
+
+  if (plan.wreckPos)
+    props.push({ kind: "wreck", zone: "drift", pos: { ...plan.wreckPos } });
+  return props;
+}
+
 // The data phase of buildGoudaWorld: plan + chunks + carves, no meshing, no
 // module state. Draw order IS the world format — any reordering here changes
 // every seed's world.
@@ -2389,7 +2747,7 @@ export function buildWorldData(opts: {
   if (errors.length) throw new Error(`worldgen: ${errors.join("; ")}`);
 
   const rng = mulberry32(opts.seed >>> 0);
-  const plan = placeChunks(rng, world, diff);
+  const plan = placeChunks(rng, world, diff, opts.seed >>> 0);
   const specs = plan.specs;
   const frame = makeFrame(world.frame);
   const blast: Vec3[] = [];
@@ -2398,6 +2756,7 @@ export function buildWorldData(opts: {
   // Phase 1 — chunk data. Layer-body biomes generate as whole layers (their
   // tiles are contiguous in spec order); everything else is per-chunk.
   const pending: Chunk[] = [];
+  const layerEyes = new Map<ZoneName, SphereCarve[]>(); // WG-11 hazard hosts
   for (let i = 0; i < specs.length;) {
     const spec = specs[i];
     if (spec.body) {
@@ -2411,6 +2770,7 @@ export function buildWorldData(opts: {
           if (!best || Math.abs(p.r - r) < Math.abs(best.r - r)) best = p;
         return best && Math.abs(best.r - r) < 15 ? best : null;
       };
+      const eyeSink: SphereCarve[] = [];
       const layerOpts: LayerGenOpts =
         pl.mode === "fused"
           ? {
@@ -2418,8 +2778,15 @@ export function buildWorldData(opts: {
               sideExits: pl.sideExits,
               spineIn: near(pl.rMax),
               spineOut: near(pl.rMin),
+              eyesOut: eyeSink,
             }
-          : { loopFrac: 0, sideExits: 0, spineIn: null, spineOut: null };
+          : {
+              loopFrac: 0,
+              sideExits: 0,
+              spineIn: null,
+              spineOut: null,
+              eyesOut: eyeSink,
+            };
       for (const c of buildLayerChunks(
         rng,
         specs.slice(i, j),
@@ -2429,6 +2796,7 @@ export function buildWorldData(opts: {
         c.zone = spec.zone;
         pending.push(c);
       }
+      layerEyes.set(spec.zone, eyeSink);
       i = j;
     } else {
       const chunk = makeChunkData(
@@ -2440,6 +2808,7 @@ export function buildWorldData(opts: {
         ctx,
       );
       chunk.zone = spec.zone;
+      if (spec.spin) chunk.spin = { ...spec.spin, cos: 1, sin: 0 };
       pending.push(chunk);
       i++;
     }
@@ -2561,6 +2930,10 @@ export function buildWorldData(opts: {
   )
     p.z += 3;
 
+  // WG-11 — the tail of the stream: prop seeding draws only after everything
+  // above, so the chunk/debris/gold/spawn fingerprint never moves.
+  plan.props = seedProps(rng, world, plan, pending, layerEyes);
+
   return {
     world,
     plan,
@@ -2594,6 +2967,8 @@ export async function buildGoudaWorld(
   const specs = data.plan.specs;
   worldSpine = data.plan.spine;
   worldSoftSpots = data.plan.softSpots;
+  worldProps = data.plan.props;
+  hasSpin = data.chunks.some((c) => c.spin);
   blastPoints.push(...data.blastPoints);
   const total = specs.length + 1;
   let triangles = 0;
@@ -2669,6 +3044,8 @@ export function disposeWorld(scene: THREE.Scene): void {
   spawnPoint = null;
   worldSpine = [];
   worldSoftSpots = [];
+  worldProps = [];
+  hasSpin = false;
 }
 
 // Seeded gold position; read once at world build.
@@ -2692,6 +3069,12 @@ export function getSpinePoints(): SpinePoint[] {
 
 export function getSoftSpots(): SoftSpot[] {
   return worldSoftSpots;
+}
+
+// Seeded prop positions of the built world (WG-11) — air pockets, melt
+// hazards, the wreck. Game systems consume these in M5/M6.
+export function getSeededProps(): SeededProp[] {
+  return worldProps;
 }
 
 // --- Runtime queries -----------------------------------------------------------------------
@@ -2728,14 +3111,16 @@ export function chunkDistance(
   y: number,
   z: number,
 ): number {
-  return (
-    chunkSdf(
-      c,
-      (x - c.center.x) / c.s,
-      (y - c.center.y) / c.s,
-      (z - c.center.z) / c.s,
-    ) * c.s
-  );
+  let dx = x - c.center.x,
+    dy = y - c.center.y,
+    dz = z - c.center.z;
+  if (c.spin) {
+    spinRotate(c.spin, dx, dy, dz, -c.spin.sin, _sv);
+    dx = _sv.x;
+    dy = _sv.y;
+    dz = _sv.z;
+  }
+  return chunkSdf(c, dx / c.s, dy / c.s, dz / c.s) * c.s;
 }
 
 // Distance over explicit lists — the one implementation behind the module
@@ -2769,7 +3154,18 @@ export function distanceToWorld(
       if (dc - c.s * (R0 + 0.25) < best) best = dc - c.s * (R0 + 0.25);
       continue;
     }
-    const d = chunkSdf(c, dx / c.s, dy / c.s, dz / c.s) * c.s;
+    // Rotating chunks (WG-12): un-rotate the probe — the SDF stays static in
+    // local space, so collision matches the rotated mesh by construction.
+    let lx = dx,
+      ly = dy,
+      lz = dz;
+    if (c.spin) {
+      spinRotate(c.spin, dx, dy, dz, -c.spin.sin, _sv);
+      lx = _sv.x;
+      ly = _sv.y;
+      lz = _sv.z;
+    }
+    const d = chunkSdf(c, lx / c.s, ly / c.s, lz / c.s) * c.s;
     if (d < best) best = d;
   }
   for (let i = 0; i < debrisList.length; i++) {
