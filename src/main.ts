@@ -100,6 +100,7 @@ import {
   game,
   placeAtSpawn,
   resetGameState,
+  type DigTool,
   type SphereDig,
   type Vec3,
 } from "./state.ts";
@@ -132,7 +133,8 @@ const ABYSS_DEPTH = 612; // flavor: depth readout at y = 0
 const PLAYER_RADIUS = 0.6; // collision clearance against the cheese
 const WORLD_LIMIT = WORLD_R + 25; // soft leash, just inside the boundary veil
 
-const DIG_RADIUS = 2.4; // carve sphere radius (world units)
+// Per-tool carve radii (WG-01): hands thread, the driller demolishes.
+const DIG_RADII: Record<DigTool, number> = { hands: 0.7, driller: 2.4 };
 const DIG_RANGE = 7; // how far the dig tool reaches
 const DIG_COOLDOWN_MS = 400;
 
@@ -257,7 +259,7 @@ async function buildWorld(rebuild = false) {
   refillOxygen();
   game.worldReady = true;
   // Replay pending digs (geometry only; audio/position already gone).
-  for (const d of game.pendingDigs) digAt(d.x, d.y, d.z, d.r ?? DIG_RADIUS);
+  for (const d of game.pendingDigs) applyDigEvent(d);
   game.pendingDigs.length = 0;
   loaderEl.classList.add("done");
 
@@ -390,11 +392,27 @@ window.addEventListener("keydown", (e) => {
     broadcastNow();
   } else if (e.code === "KeyV") {
     toggleMute();
+  } else if (e.code === "KeyT") {
+    // TEMPORARY debug toggle until M3 seeds the driller item (WG-01).
+    game.digTool = game.digTool === "hands" ? "driller" : "hands";
+    playClick();
+    showEvent(
+      game.digTool === "driller"
+        ? "🛠 [DEBUG] Tool: DRILLER (2.4 u, loud)"
+        : "⛏ [DEBUG] Tool: bare paws (0.7 u, quiet)",
+    );
   } else if (e.code === "KeyE") {
     // E key: Gouda first (can't dig with both arms full), then pickaxe.
     if (!cargoSys.use()) tryDig();
   }
 });
+
+// Replayed/remote digs go through the same hardness gate as local ones —
+// same world, same tool ⇒ same verdict on every client.
+function applyDigEvent(d: SphereDig) {
+  const tool: DigTool = d.tool ?? "hands";
+  digAt(d.x, d.y, d.z, d.r ?? DIG_RADII[tool], tool);
+}
 
 // Dig tool: SDF edits chunk voxels + marching cubes; collision tracks.
 let lastDigAt = 0;
@@ -421,12 +439,29 @@ function tryDig() {
     return;
   }
   lastDigAt = now;
-  digAt(hit.x, hit.y, hit.z, DIG_RADIUS);
+  const tool = game.digTool;
+  const r = DIG_RADII[tool];
+  const result = digAt(hit.x, hit.y, hit.z, r, tool);
+  if (!result.changed) {
+    if (result.rejected) {
+      playClick();
+      showEvent(
+        tool === "hands"
+          ? "⛏ Too hard for bare paws — this rind wants the driller."
+          : "⛏ The driller skips off — nothing opens this.",
+      );
+    }
+    return;
+  }
   playDig();
   burstAt(hit.x, hit.y, hit.z); // gas pockets tear free of the cheese
-  showEvent("⛏ You carve into the gouda");
+  showEvent(
+    tool === "driller"
+      ? "🛠 The driller chews through"
+      : "⛏ You carve into the gouda",
+  );
   if (isConnected()) {
-    sendEvent({ kind: "dig", x: hit.x, y: hit.y, z: hit.z, r: DIG_RADIUS });
+    sendEvent({ kind: "dig", x: hit.x, y: hit.y, z: hit.z, r, tool });
   }
 }
 
@@ -544,7 +579,7 @@ onEventReceived((peerId, data) => {
       game.pendingDigs.push(d);
       return;
     }
-    digAt(d.x, d.y, d.z, d.r ?? DIG_RADIUS);
+    applyDigEvent(d);
     burstAt(d.x, d.y, d.z);
     // Audible only if they're digging nearby — muffled thumps through cheese.
     const dd = Math.hypot(

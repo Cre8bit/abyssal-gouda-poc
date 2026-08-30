@@ -11,12 +11,17 @@ export interface Vec3 {
   z: number;
 }
 
+// The two carve tools (WG-01). Hands open hardness 0; the driller opens ≤ 2;
+// hardness 3 (the seals) yields to nothing.
+export type DigTool = "hands" | "driller";
+
 // One sphere carve out of the world. Also the wire shape of the "dig" event.
 export interface SphereDig {
   x: number;
   y: number;
   z: number;
   r?: number; // omitted = the sender used the default dig radius
+  tool?: DigTool; // omitted = hands (the conservative gate)
 }
 
 export interface GameState {
@@ -32,6 +37,7 @@ export interface GameState {
   velocity: Vec3;
   spawnPoint: Vec3; // bathyscaphe berth — also the O₂ recharge zone
   flashlightOn: boolean;
+  digTool: DigTool; // debug-toggled until M3 seeds the driller item
 
   // Session roles.
   hostedId: string | null; // our shareable id when we are the host
@@ -54,6 +60,7 @@ export const game: GameState = {
   velocity: { x: 0, y: 0, z: 0 },
   spawnPoint: { ...DEFAULT_SPAWN },
   flashlightOn: true,
+  digTool: "hands",
   hostedId: null,
   fishAuthority: true,
   fishAuthorityId: null,

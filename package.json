@@ -8,7 +8,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "runner": "node tools/runner.ts",
-    "test": "node tools/test-protocol.ts && node tools/test-recipes.ts",
+    "test": "node tools/test-protocol.ts && node tools/test-recipes.ts && node tools/test-worldgen.ts",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "format": "prettier --write src tools *.ts *.html",

@@ -29,6 +29,8 @@ import {
   buildLayerChunks,
   chunkDistance,
   createGoudaMaterial,
+  effectiveTunnelRadius,
+  tileFieldCovers,
   disposeWorld,
   getGoldPos,
   getSpawnPoint,
@@ -270,6 +272,7 @@ function benchDistance(x: number, y: number, z: number): number {
   for (const c of benchChunks) {
     const dc = c.center.distanceTo(_wp.set(x, y, z));
     if (dc - c.s * 1.8 > best) continue;
+    if (c.body && !tileFieldCovers(c, x, y, z)) continue;
     const d = chunkDistance(c, x, y, z);
     if (d < best) best = d;
   }
@@ -499,21 +502,37 @@ function refreshSkin(): void {
 
 // --- Part view -------------------------------------------------------------------
 
-function partMetrics(part: PartRecipe, s: number, res: number): HudLine[] {
+// Truthful clearance telemetry (WG-03): quote the radius the generator
+// actually carves — effectiveTunnelRadius, i.e. max(lattice floor,
+// difficulty-scaled base) — never raw rBase.
+function partMetrics(
+  part: PartRecipe,
+  s: number,
+  res: number,
+  difficulty: number,
+): HudLine[] {
   const lines: HudLine[] = [];
-  if (part.tunnels.rBase > 0) {
-    const cells = part.tunnels.rBase * res;
+  if (part.tunnels.rBase > 0 || part.eyes.max >= 2) {
+    const effMin = effectiveTunnelRadius(part, s, res, difficulty);
+    const effMax = effectiveTunnelRadius(
+      part,
+      s,
+      res,
+      difficulty,
+      part.tunnels.rBase + part.tunnels.rVar,
+    );
+    const cells = (effMin / s) * res;
     const crisp = cells >= 3.95; // the readable-tunnel rule, r×res ≥ 4
-    const radius = part.tunnels.rBase * s;
     lines.push([
       "tunnel r×res",
       `${cells.toFixed(1)} ${crisp ? "✓" : "✗ blobby <4"}`,
       crisp ? "ok" : "bad",
     ]);
     lines.push([
-      "tunnel radius",
-      `${radius.toFixed(2)} u ${radius >= 1.3 ? "(cargo ✓)" : radius >= 0.9 ? "(rat ✓)" : "(rat ✗)"}`,
-      radius >= 0.9 ? "ok" : "bad",
+      `tunnel r eff (d${difficulty})`,
+      `${effMin.toFixed(2)}–${effMax.toFixed(2)} u ` +
+        `${effMin >= 1.3 ? "(cargo ✓)" : effMin >= 0.9 ? "(rat ✓ cargo ✗)" : "(rat ✗)"}`,
+      effMin >= 0.9 ? "ok" : "bad",
     ]);
   }
   if (part.eyes.rBase > 0)
@@ -521,6 +540,38 @@ function partMetrics(part: PartRecipe, s: number, res: number): HudLine[] {
   if (part.noCarveWithin != null)
     lines.push(["seal amp cap", `amp ≤ thickness/3/size`]);
   return lines;
+}
+
+// Measured clearance of a built preview: the composed SDF sampled at every
+// tunnel-segment midpoint — what the generator DID, next to what the
+// formula promised.
+function measuredClearance(chunkList: Chunk[]): HudLine[] {
+  const samples: number[] = [];
+  for (const c of chunkList) {
+    for (const t of c.tunnels) {
+      const mx = c.center.x + ((t.ax + t.bx) / 2) * c.s;
+      const my = c.center.y + ((t.ay + t.by) / 2) * c.s;
+      const mz = c.center.z + ((t.az + t.bz) / 2) * c.s;
+      let d = Infinity;
+      for (const other of chunkList) {
+        if (other.body && !tileFieldCovers(other, mx, my, mz)) continue;
+        const v = chunkDistance(other, mx, my, mz);
+        if (v < d) d = v;
+      }
+      if (Number.isFinite(d)) samples.push(d);
+    }
+  }
+  if (!samples.length) return [];
+  samples.sort((a, b) => a - b);
+  const min = samples[0];
+  const median = samples[samples.length >> 1];
+  return [
+    [
+      "tunnel measured",
+      `min ${min.toFixed(2)} · med ${median.toFixed(2)} u`,
+      median >= 0.9 ? "ok" : "bad",
+    ],
+  ];
 }
 
 function rebuildPart(): void {
@@ -567,7 +618,8 @@ function rebuildPart(): void {
     ["tunnel segs", String(chunk.tunnels.length)],
     ["blast walls", String(blast.length)],
     ["size / res", `${s.toFixed(0)} u / ${view.partRes}³`],
-    ...partMetrics(part, s, view.partRes),
+    ...partMetrics(part, s, view.partRes, view.difficulty),
+    ...measuredClearance(benchChunks),
   ]);
 }
 
@@ -817,7 +869,10 @@ async function rebuildLayerWedge(
     ["triangles", Math.round(tris).toLocaleString()],
     ["carve time", `${(performance.now() - t0).toFixed(0)} ms`],
     ["blast walls", String(ctx.blastPoints.length)],
-    ...(part ? partMetrics(part, biome.sizeBase, biome.res) : []),
+    ...(part
+      ? partMetrics(part, biome.sizeBase, biome.res, view.difficulty)
+      : []),
+    ...measuredClearance(benchChunks),
   ]);
 }
 

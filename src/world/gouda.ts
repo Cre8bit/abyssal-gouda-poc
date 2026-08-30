@@ -56,7 +56,7 @@ import * as THREE from "three";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { MarchingCubes } from "three/examples/jsm/objects/MarchingCubes.js";
 import { toonMaterial } from "../render/toon.ts";
-import type { Vec3 } from "../state.ts";
+import type { DigTool, Vec3 } from "../state.ts";
 import {
   WHEEL_WORLD,
   pickPart,
@@ -149,6 +149,7 @@ export interface Chunk {
   holes: SphereCarve[];
   tunnels: Tunnel[];
   digs: SphereCarve[];
+  hardness: number; // 0 hands · 1 driller · 2 driller-slow · 3 no-dig
   field: Float32Array | null;
   mesh: THREE.Mesh | null;
   biggestEye?: SphereCarve | null; // set by makeChunkData
@@ -202,7 +203,6 @@ let goldPos: Vec3 | null = null; // where the Gouda is seeded (M1.2)
 let markerMaterial: THREE.SpriteMaterial | null = null;
 let spawnPoint: THREE.Vector3 | null = null;
 let lastCull = -1;
-let worldFrame: WorldFrame | null = null;
 let worldSpine: SpinePoint[] = [];
 let worldSoftSpots: SoftSpot[] = [];
 
@@ -566,6 +566,23 @@ function addTunnel(
   }
 }
 
+// The tunnel radius the generator ACTUALLY carves (world u): the lattice
+// floor max'd against the difficulty-scaled base. Quote this — never raw
+// rBase — in any UI (WG-03); both generator paths implement this formula.
+export function effectiveTunnelRadius(
+  part: PartRecipe,
+  s: number,
+  res: number,
+  difficulty: number,
+  base: number = part.tunnels.rBase,
+): number {
+  const tunnelScale = [1.15, 1.0, 0.85][difficulty - 1] ?? 1.0;
+  return Math.max(
+    (part.narrow ? 2.2 : 2.6) * ((2 * s) / res),
+    base * tunnelScale * s,
+  );
+}
+
 // One PartRecipe → one chunk's SDF params. `axis` (from shell placements)
 // forces a radial through-route; `ctx` carries difficulty + blast-marker sink.
 export function makeChunkData(
@@ -616,6 +633,7 @@ export function makeChunkData(
     holes: [],
     tunnels: [],
     digs: [],
+    hardness: part.hardness,
     field: null, // cached voxel field (filled at meshing, edited by digs)
     mesh: null,
   };
@@ -921,9 +939,44 @@ function remeshChunk(c: Chunk): void {
 
 // --- DIGGING ---------------------------------------------------------------------------
 
+// Hardness ceiling per tool (cheese-parts §1): hands open 0, the driller ≤ 2,
+// 3 yields to nothing.
+const TOOL_MAX_HARDNESS: Record<DigTool, number> = { hands: 0, driller: 2 };
+
+// Great Wheel exception: a dig point inside a soft spot digs as hardness 1 —
+// the geometric hook the M3 breach timer attaches to. Hulls without soft
+// spots (the melt shell, WG-08) get no exception by construction.
+function digHardness(c: Chunk, x: number, y: number, z: number): number {
+  const spots = c.body?.softSpots;
+  if (c.hardness > 1 && spots) {
+    for (const s of spots) {
+      const dx = x - s.x,
+        dy = y - s.y,
+        dz = z - s.z;
+      if (dx * dx + dy * dy + dz * dz < s.r * s.r) return 1;
+    }
+  }
+  return c.hardness;
+}
+
+export interface DigResult {
+  changed: boolean; // some chunk/debris took the carve
+  rejected: boolean; // some chunk in range bounced the tool (feedback hook)
+}
+
 // Carve sphere through chunks; update fields, re-mesh, destroy small debris.
-export function digAt(x: number, y: number, z: number, r: number): boolean {
+// Chunks harder than the tool are skipped (no field edit, no dig entry) and
+// the loop continues — one sphere can straddle soft crumb and a seal.
+export function digAt(
+  x: number,
+  y: number,
+  z: number,
+  r: number,
+  tool: DigTool,
+): DigResult {
   let changed = false;
+  let rejected = false;
+  const maxHardness = TOOL_MAX_HARDNESS[tool];
 
   for (const c of chunks) {
     const dx = x - c.center.x,
@@ -931,6 +984,10 @@ export function digAt(x: number, y: number, z: number, r: number): boolean {
       dz = z - c.center.z;
     const dc = Math.sqrt(dx * dx + dy * dy + dz * dz);
     if (dc > (c.body ? c.s * 1.74 : c.s * 1.35) + r) continue;
+    if (digHardness(c, x, y, z) > maxHardness) {
+      rejected = true;
+      continue;
+    }
 
     const lx = dx / c.s,
       ly = dy / c.s,
@@ -982,7 +1039,7 @@ export function digAt(x: number, y: number, z: number, r: number): boolean {
     }
   }
 
-  return changed;
+  return { changed, rejected };
 }
 
 // Sphere-trace along ray; return hit point or null.
@@ -1864,6 +1921,11 @@ export function buildLayerChunks(
   }
 
   // Spine doors: thread the layer between its two boundary through-points.
+  // Both adjacent layers bore to the SAME spine point, so the two half-doors
+  // are guaranteed to meet there — a mouth→eye tunnel that merely passes
+  // near p can miss its counterpart and seal the descent shut. The straight
+  // skin-crossing bore draws no rng; radius floors at 2 u so boundary crust
+  // noise cannot pinch the one critical corridor.
   const spineLink = (p: SpinePoint | null, outward: boolean): void => {
     if (!p) return;
     frameDirOf(frame, p.x, p.y, p.z, _dir);
@@ -1872,14 +1934,20 @@ export function buildLayerChunks(
     const found = nearestEye(p.x, p.y, p.z);
     if (!found) return;
     const part = specs[found.tile].part;
-    addWorldTunnel(
-      rng,
-      { x: mouth.x, y: mouth.y, z: mouth.z },
-      found.eye,
+    const r = Math.max(
       treeR(specs[found.tile], part.tunnels.rBase + part.tunnels.rVar * 0.5),
-      1,
-      tunnelsW,
+      2.0,
     );
+    tunnelsW.push({
+      ax: mouth.x,
+      ay: mouth.y,
+      az: mouth.z,
+      bx: p.x,
+      by: p.y,
+      bz: p.z,
+      r,
+    });
+    addWorldTunnel(rng, { x: p.x, y: p.y, z: p.z }, found.eye, r, 1, tunnelsW);
   };
   spineLink(opts.spineIn, true);
   spineLink(opts.spineOut, false);
@@ -1957,6 +2025,7 @@ export function buildLayerChunks(
       holes,
       tunnels,
       digs: [],
+      hardness: part.hardness,
       field: null,
       mesh: null,
       body,
@@ -2070,10 +2139,9 @@ function shareCarves(list: Chunk[]): void {
   }
 }
 
-function makeDebrisGeometry(rng: Rng): THREE.IcosahedronGeometry {
+function makeDebrisGeometry(off: number): THREE.IcosahedronGeometry {
   const geo = new THREE.IcosahedronGeometry(1, 3);
   const pos = geo.attributes.position;
-  const off = rng() * 50;
   const v = new THREE.Vector3();
   for (let i = 0; i < pos.count; i++) {
     v.fromBufferAttribute(pos, i);
@@ -2093,35 +2161,49 @@ function nextTick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
-export async function buildGoudaWorld(
-  scene: THREE.Scene,
-  onProgress: (done: number, total: number, label: string) => void = () => {},
-  opts: { seed?: number; difficulty?: number; world?: WorldRecipe } = {},
-): Promise<THREE.Group> {
-  worldSeed = (opts.seed ?? worldSeed) >>> 0;
-  difficulty = Math.min(3, Math.max(1, opts.difficulty ?? difficulty));
-  // The game always builds the shipped tables; the worldgen bench passes
-  // its live-edited WorldRecipe here to preview a layout for real.
+// One free-floating crumb, fully determined at the data phase.
+export interface DebrisSpec {
+  center: THREE.Vector3;
+  r: number; // collision radius (0.8 × scale)
+  s: number; // visual scale
+  rot: Vec3;
+  geoIndex: number; // which of the seeded crumb geometries
+}
+
+// Everything the generator decides before any triangle exists. This is the
+// WHOLE seeded stream — plan, carved chunks, debris, gold, spawn — shared by
+// the game (buildGoudaWorld), the bench, and the route verifier (WG-02).
+export interface WorldData {
+  world: WorldRecipe;
+  plan: WorldPlan;
+  chunks: Chunk[];
+  debris: DebrisSpec[];
+  debrisNoiseOffsets: number[]; // crust-noise offsets of the crumb geometries
+  goldPos: Vec3;
+  spawnPoint: Vec3;
+  blastPoints: Vec3[];
+}
+
+// The data phase of buildGoudaWorld: plan + chunks + carves, no meshing, no
+// module state. Draw order IS the world format — any reordering here changes
+// every seed's world.
+export function buildWorldData(opts: {
+  seed: number;
+  difficulty: number;
+  world?: WorldRecipe;
+}): WorldData {
   const world = opts.world ?? WHEEL_WORLD;
+  const diff = Math.min(3, Math.max(1, opts.difficulty));
 
   const errors = validateWorld(world);
   if (errors.length) throw new Error(`worldgen: ${errors.join("; ")}`);
 
-  const t0 = performance.now();
-  const rng = mulberry32(worldSeed);
-  const materials = createZoneMaterials(world);
-  const group = new THREE.Group();
-  worldGroup = group;
-  extrasGroup = new THREE.Group();
-
-  const plan = placeChunks(rng, world, difficulty);
+  const rng = mulberry32(opts.seed >>> 0);
+  const plan = placeChunks(rng, world, diff);
   const specs = plan.specs;
-  worldFrame = makeFrame(world.frame);
-  worldSpine = plan.spine;
-  worldSoftSpots = plan.softSpots;
-  const total = specs.length + 1;
-  const ctx: GenCtx = { difficulty, blastPoints };
-  let triangles = 0;
+  const frame = makeFrame(world.frame);
+  const blast: Vec3[] = [];
+  const ctx: GenCtx = { difficulty: diff, blastPoints: blast };
 
   // Phase 1 — chunk data. Layer-body biomes generate as whole layers (their
   // tiles are contiguous in spec order); everything else is per-chunk.
@@ -2139,7 +2221,7 @@ export async function buildGoudaWorld(
           if (!best || Math.abs(p.r - r) < Math.abs(best.r - r)) best = p;
         return best && Math.abs(best.r - r) < 15 ? best : null;
       };
-      const opts: LayerGenOpts =
+      const layerOpts: LayerGenOpts =
         pl.mode === "fused"
           ? {
               loopFrac: pl.loopFrac,
@@ -2148,7 +2230,12 @@ export async function buildGoudaWorld(
               spineOut: near(pl.rMin),
             }
           : { loopFrac: 0, sideExits: 0, spineIn: null, spineOut: null };
-      for (const c of buildLayerChunks(rng, specs.slice(i, j), ctx, opts)) {
+      for (const c of buildLayerChunks(
+        rng,
+        specs.slice(i, j),
+        ctx,
+        layerOpts,
+      )) {
         c.zone = spec.zone;
         pending.push(c);
       }
@@ -2172,9 +2259,102 @@ export async function buildGoudaWorld(
   // Phase 2 — compose carves across interpenetrating meshes.
   shareCarves(pending);
 
-  // Phase 3 — mesh.
-  for (let i = 0; i < pending.length; i++) {
-    const chunk = pending[i];
+  // Debris crumbs: geometry noise offsets first, then placements — the exact
+  // draw order the mesher used when this lived inline.
+  const debrisNoiseOffsets = [rng() * 50, rng() * 50, rng() * 50];
+  const debrisSpecs: DebrisSpec[] = [];
+  for (let i = 0; i < world.debrisCount; i++) {
+    for (let attempt = 0; attempt < 60; attempt++) {
+      const host = pending[Math.floor(rng() * pending.length)];
+      randDir(rng, _dir);
+      const dist = host.s * (0.75 + rng() * 0.65);
+      const p = new THREE.Vector3(
+        host.center.x + _dir.x * dist,
+        host.center.y + _dir.y * dist,
+        host.center.z + _dir.z * dist,
+      );
+      const s = 0.7 + rng() * 2.4;
+      if (distanceToWorld(pending, debrisSpecs, p.x, p.y, p.z) < s + 1.2)
+        continue;
+      const rot = {
+        x: rng() * Math.PI * 2,
+        y: rng() * Math.PI * 2,
+        z: rng() * Math.PI * 2,
+      };
+      debrisSpecs.push({ center: p, r: s * 0.8, s, rot, geoIndex: i % 3 });
+      break;
+    }
+  }
+
+  // Hide gold in random mid-radius wheel cavern (seeded, off-compass).
+  const candidates = pending.filter((c) => {
+    const r = frameRadius(frame, c.center.x, c.center.y, c.center.z);
+    return (
+      c.biggestEye &&
+      r >= world.goldBand.min &&
+      r <= world.goldBand.max &&
+      c.biggestEye.r * c.s > world.goldMinCavernR
+    );
+  });
+  const host = candidates.length
+    ? candidates[Math.floor(rng() * candidates.length)]
+    : pending[0];
+  const eye = host.biggestEye!;
+  const goldPos = {
+    x: host.center.x + eye.x * host.s,
+    y: host.center.y + eye.y * host.s,
+    z: host.center.z + eye.z * host.s,
+  };
+
+  // Spawn at drift edge; keep bathyscaphe exit corridor clear.
+  const p = new THREE.Vector3(0, 18, world.worldR + 14);
+  while (
+    (distanceToWorld(pending, debrisSpecs, p.x, p.y, p.z) < 6 ||
+      distanceToWorld(pending, debrisSpecs, p.x, p.y, p.z - 9) < 4) &&
+    p.z < world.boundaryR - 6
+  )
+    p.z += 3;
+
+  return {
+    world,
+    plan,
+    chunks: pending,
+    debris: debrisSpecs,
+    debrisNoiseOffsets,
+    goldPos,
+    spawnPoint: { x: p.x, y: p.y, z: p.z },
+    blastPoints: blast,
+  };
+}
+
+export async function buildGoudaWorld(
+  scene: THREE.Scene,
+  onProgress: (done: number, total: number, label: string) => void = () => {},
+  opts: { seed?: number; difficulty?: number; world?: WorldRecipe } = {},
+): Promise<THREE.Group> {
+  worldSeed = (opts.seed ?? worldSeed) >>> 0;
+  difficulty = Math.min(3, Math.max(1, opts.difficulty ?? difficulty));
+  // The game always builds the shipped tables; the worldgen bench passes
+  // its live-edited WorldRecipe here to preview a layout for real.
+  const world = opts.world ?? WHEEL_WORLD;
+
+  const t0 = performance.now();
+  const data = buildWorldData({ seed: worldSeed, difficulty, world });
+  const materials = createZoneMaterials(world);
+  const group = new THREE.Group();
+  worldGroup = group;
+  extrasGroup = new THREE.Group();
+
+  const specs = data.plan.specs;
+  worldSpine = data.plan.spine;
+  worldSoftSpots = data.plan.softSpots;
+  blastPoints.push(...data.blastPoints);
+  const total = specs.length + 1;
+  let triangles = 0;
+
+  // Mesh phase (consumes no rng — the stream completed in buildWorldData).
+  for (let i = 0; i < data.chunks.length; i++) {
+    const chunk = data.chunks[i];
     chunks.push(chunk);
     const mesh = meshChunk(chunk, chunk.res, materials[chunk.zone!]!);
     mesh.userData.reach = chunk.body ? chunk.s * 1.75 : chunk.s * 1.4;
@@ -2186,76 +2366,33 @@ export async function buildGoudaWorld(
   // NOTE: the MC scratch instances are deliberately KEPT — digging reuses
   // them to re-mesh chunks at runtime.
 
-  const crumbGeos = [
-    makeDebrisGeometry(rng),
-    makeDebrisGeometry(rng),
-    makeDebrisGeometry(rng),
-  ];
+  const crumbGeos = data.debrisNoiseOffsets.map(makeDebrisGeometry);
   const crumbMaterial =
     materials.scree ?? materials.drift ?? materials[world.biomes[0].id]!;
-  for (let i = 0; i < world.debrisCount; i++) {
-    for (let attempt = 0; attempt < 60; attempt++) {
-      const host = chunks[Math.floor(rng() * chunks.length)];
-      randDir(rng, _dir);
-      const dist = host.s * (0.75 + rng() * 0.65);
-      const p = new THREE.Vector3(
-        host.center.x + _dir.x * dist,
-        host.center.y + _dir.y * dist,
-        host.center.z + _dir.z * dist,
-      );
-      const s = 0.7 + rng() * 2.4;
-      if (worldDistance(p.x, p.y, p.z) < s + 1.2) continue;
-      const crumb = new THREE.Mesh(crumbGeos[i % 3], crumbMaterial);
-      crumb.position.copy(p);
-      crumb.scale.setScalar(s);
-      crumb.rotation.set(
-        rng() * Math.PI * 2,
-        rng() * Math.PI * 2,
-        rng() * Math.PI * 2,
-      );
-      crumb.castShadow = true;
-      crumb.receiveShadow = true;
-      group.add(crumb);
-      debris.push({ center: p, r: s * 0.8, mesh: crumb });
-      break;
-    }
+  for (const spec of data.debris) {
+    const crumb = new THREE.Mesh(crumbGeos[spec.geoIndex], crumbMaterial);
+    crumb.position.copy(spec.center);
+    crumb.scale.setScalar(spec.s);
+    crumb.rotation.set(spec.rot.x, spec.rot.y, spec.rot.z);
+    crumb.castShadow = true;
+    crumb.receiveShadow = true;
+    group.add(crumb);
+    debris.push({ center: spec.center, r: spec.r, mesh: crumb });
   }
 
   scene.add(group);
 
-  // Hide gold in random mid-radius wheel cavern (seeded, off-compass).
-  const candidates = chunks.filter((c) => {
-    const r = frameRadius(worldFrame, c.center.x, c.center.y, c.center.z);
-    return (
-      c.biggestEye &&
-      r >= world.goldBand.min &&
-      r <= world.goldBand.max &&
-      c.biggestEye.r * c.s > world.goldMinCavernR
-    );
-  });
-  const host = candidates.length
-    ? candidates[Math.floor(rng() * candidates.length)]
-    : chunks[0];
-  const eye = host.biggestEye!;
-  goldPos = {
-    x: host.center.x + eye.x * host.s,
-    y: host.center.y + eye.y * host.s,
-    z: host.center.z + eye.z * host.s,
-  };
+  goldPos = data.goldPos;
   // Wheel is an item (game/items.ts), world only seeds position.
   createBoundarySphere(extrasGroup, world.boundaryR);
   createBlastMarkers(extrasGroup);
   scene.add(extrasGroup);
 
-  // Spawn at drift edge; keep bathyscaphe exit corridor clear.
-  const p = new THREE.Vector3(0, 18, world.worldR + 14);
-  while (
-    (worldDistance(p.x, p.y, p.z) < 6 ||
-      worldDistance(p.x, p.y, p.z - 9) < 4) &&
-    p.z < world.boundaryR - 6
-  )
-    p.z += 3;
-  spawnPoint = p;
+  spawnPoint = new THREE.Vector3(
+    data.spawnPoint.x,
+    data.spawnPoint.y,
+    data.spawnPoint.z,
+  );
 
   onProgress(total, total, "gold");
   console.log(
@@ -2285,7 +2422,6 @@ export function disposeWorld(scene: THREE.Scene): void {
   debris.length = 0;
   blastPoints.length = 0;
   spawnPoint = null;
-  worldFrame = null;
   worldSpine = [];
   worldSoftSpots = [];
 }
@@ -2315,6 +2451,30 @@ export function getSoftSpots(): SoftSpot[] {
 
 // --- Runtime queries -----------------------------------------------------------------------
 
+// A layer tile's field (body + its distributed carves) is authoritative only
+// inside its marched box plus the carve-distribution pad — beyond that the
+// uncarved body SDF reports phantom solid where a neighbouring tile carries
+// the carve. Every world point near the body lies in some tile's box, so
+// queries skip tiles that don't cover the point. Exported for the verifier
+// and the bench (their query loops must apply the same ownership rule).
+export function tileFieldCovers(
+  c: Chunk,
+  x: number,
+  y: number,
+  z: number,
+): boolean {
+  const cellW = (2 * c.s) / c.res;
+  const pad = SMOOTH_K * c.s + 2 * cellW;
+  const lo = -(c.s - cellW) - pad;
+  const hi = c.s - 2 * cellW + pad;
+  const dx = x - c.center.x;
+  if (dx < lo || dx > hi) return false;
+  const dy = y - c.center.y;
+  if (dy < lo || dy > hi) return false;
+  const dz = z - c.center.z;
+  return dz >= lo && dz <= hi;
+}
+
 // World distance to ONE chunk's solid (world units) — exported for the
 // worldgen bench, whose part/biome previews keep their own chunk lists.
 export function chunkDistance(
@@ -2333,18 +2493,28 @@ export function chunkDistance(
   );
 }
 
-export function worldDistance(x: number, y: number, z: number): number {
+// Distance over explicit lists — the one implementation behind the module
+// query AND the data phase (debris seeding probes chunks before any mesh
+// exists). Exported for the verifier (src/world/verify.ts).
+export function distanceToWorld(
+  chunkList: Chunk[],
+  debrisList: { center: Vec3; r: number }[],
+  x: number,
+  y: number,
+  z: number,
+): number {
   let best = 1e9;
-  for (let i = 0; i < chunks.length; i++) {
-    const c = chunks[i];
+  for (let i = 0; i < chunkList.length; i++) {
+    const c = chunkList[i];
     const dx = x - c.center.x,
       dy = y - c.center.y,
       dz = z - c.center.z;
     const dc = Math.sqrt(dx * dx + dy * dy + dz * dz);
     if (c.body) {
-      // Tile of a layer body: the tile's box owns its region; the box
-      // distance is a valid lower bound outside it.
+      // Tile of a layer body: the tile's box owns its region (see
+      // tileFieldCovers) — outside it the tile must not contribute.
       if (dc - c.s * 1.74 > best) continue;
+      if (!tileFieldCovers(c, x, y, z)) continue;
       const d = chunkSdf(c, dx / c.s, dy / c.s, dz / c.s) * c.s;
       if (d < best) best = d;
       continue;
@@ -2357,8 +2527,8 @@ export function worldDistance(x: number, y: number, z: number): number {
     const d = chunkSdf(c, dx / c.s, dy / c.s, dz / c.s) * c.s;
     if (d < best) best = d;
   }
-  for (let i = 0; i < debris.length; i++) {
-    const b = debris[i];
+  for (let i = 0; i < debrisList.length; i++) {
+    const b = debrisList[i];
     const dx = x - b.center.x,
       dy = y - b.center.y,
       dz = z - b.center.z;
@@ -2366,6 +2536,10 @@ export function worldDistance(x: number, y: number, z: number): number {
     if (d < best) best = d;
   }
   return best;
+}
+
+export function worldDistance(x: number, y: number, z: number): number {
+  return distanceToWorld(chunks, debris, x, y, z);
 }
 
 const GRAD_EPS = 0.25;
