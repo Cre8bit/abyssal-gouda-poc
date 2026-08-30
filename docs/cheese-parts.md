@@ -1,20 +1,25 @@
 # Cheese Parts — the build reference
 
-The authoring companion to `idea-register.md` and `plan-mvp.md`. This is what
-you open next to `/worldgen.html` when you're pushing sliders, and it is meant
-to be enough to **build each bit from scratch**: what it is, what it looks like,
-the numbers that make it that, where it sits in the world, and what the player
-does with it.
+The authoring reference for the six-biome map. Open this next to `/worldgen.html`
+when pushing sliders; it is meant to be enough to **build each biome from
+scratch**: what it is, the verb it serves, the numbers that make it that, and
+what the generator must guarantee. Companion: `roadmap-worldgen.md` (the
+tickets).
 
-**MVP only.** Six parts, one seal, five stops. Emmental, crystal paste, aged
-crystal, smear rind and bloom are cut from this document — they were good ideas
-attached to layers that no longer exist. They come back with a band to live in,
-not before.
+**The whole game happens underwater.** There is no air-filled space anywhere —
+air pockets are localized breathable bubbles seeded inside carved voids, never a
+change of medium. There is no `airFilled` flag.
 
 ```
-OPEN WATER  →  DRIFT  →  ▮ THE GREAT WHEEL ▮  →  THE DARK VEINS  →  THE MELT  →  THE GALLERIES ◉
-              drift crumb      dark rind             roquefort         fondue      mite bore + curd
+OPEN WATER → THE DRIFT → ▮ GREAT WHEEL ▮ → THE DARK VEINS → ▮ MELT SHELL ▮ → THE MELT → THE GALLERIES → THE HEART ◉
+             emmental        dark rind       roquefort float    melt rind        fondue      mite bore     fresh curd
+             scavenge        search &        trust &            (hidden          evade &     map &         take
+             & orient        breach          navigate           entrance)        rescue      squeeze
 ```
+
+Two seals, opened two different ways: the Great Wheel is **drilled** (one soft
+spot, 20 s of noise), the melt shell is **found** (undrillable; the vein trail
+ends at its one hidden entrance).
 
 ---
 
@@ -23,616 +28,507 @@ OPEN WATER  →  DRIFT  →  ▮ THE GREAT WHEEL ▮  →  THE DARK VEINS  →  
 ### Carve radii → world units
 
 Carve radii (`eyes.rBase`, `pores.rBase`, `tunnels.rBase`, `coreEye`) are
-chunk-local, on a `[-1,1]` grid where the body surface sits near `|p| ≈ 0.6`.
+chunk-local, on a `[-1,1]` grid where the body surface sits near `|p| ≈ 0.6`:
 
 ```
 world radius (u) = r × size
 ```
 
-So `rBase 0.055` on a `size 20` chunk is a **1.1 u** tunnel radius — a 2.2 u
+So `rBase 0.055` on a `size 18` chunk is a **1.0 u** tunnel radius — a 2.0 u
 bore.
 
-The clearances that matter, from the constants in `main.ts` and
-`goldenGouda.ts`:
+### Clearances and tools
 
 | | value | source |
 |---|---|---|
 | player collision radius | **0.6 u** | `PLAYER_RADIUS` |
 | Gouda radius | **0.45 u** | `GOUDA_RADIUS` |
-| carve sphere radius | **2.4 u** | `DIG_RADIUS` — see the warning below |
+| hands carve radius | **0.7 u** | shapes a passage without erasing it; near-silent |
+| driller carve radius | **2.4 u** | fast, loud, destructive by design |
 | swim speed cap | 10 u/s | `MAX_SPEED` |
 
-So: **≥ 0.9 u** tunnel radius for a rat to pass with margin, **≥ 1.3 u** to
-haul the Gouda held in front. That second number decides whether a route is
+**≥ 0.9 u** tunnel radius for a rat to pass with margin; **≥ 1.3 u** to haul
+the Gouda held in front. That second number decides whether a route is
 haulable, and it's the one the galleries deliberately sit under.
 
-### ⚠ The dig radius is bigger than the level
+The tool split is a mechanic, not a fix: hands *thread*, the driller
+*demolishes*. The driller is **wider than a gallery bore**, so drilling through
+the maze widens it into unrecognizability instead of shortcutting it — the cost
+of using it there is losing the map you made.
 
-`DIG_RADIUS = 2.4` carves a **4.8 u sphere**. That is wider than a mite-bored
-tunnel (2.2 u), and **thicker than the entire Great Wheel crust**. One click
-currently destroys the biome it's used in, and would punch through the gate as
-though it weren't there.
+Hardness gates what each tool can touch:
 
-**Digging has to become per-tool** before any of this is authorable:
-
-| tool | carve radius | notes |
+| `hardness` | opened by | where |
 |---|---|---|
-| hands | ~0.7 u | shapes a passage without erasing it. Slow, near-silent |
-| driller | 2.4 u | the current value. Fast, loud, destructive by design |
+| 0 | hands or driller | emmental drift, fresh curd |
+| 1 | driller only | roquefort floats, fondue, mite bore; the Wheel's soft spot |
+| 3 | nothing | dark rind (except its soft spot), melt rind everywhere |
 
-That split isn't just a fix — it's the mechanic. Hands *thread*, the driller
-*demolishes*, and choosing between them is choosing whether the tunnel you came
-through still exists on the way back. It is also what stops the galleries being
-solved with a straight line: the driller is **wider than a tunnel**, so drilling
-through the maze widens it, it doesn't shortcut it. (Register X3.)
+Noise is derived — `hardness × tool`. Hands ≈ silent; the driller on the soft
+spot is the loudest thing in the game, for 20 continuous seconds.
 
-### The resolution rule — *why nothing feels tight*
+### The resolution rule
 
-Cell size is `size / res`, so the number of marching-cubes cells across a carve
-radius is:
+Cell size is `size / res`, so cells across a carve radius:
 
 ```
-cells per radius = r × res
+cells per radius = r × res      (independent of chunk size)
 ```
 
-**It doesn't depend on chunk size.** Below ~4 cells per radius, marching cubes
-plus the noise crust rounds the feature into a soft blob: your numerically
-narrow tunnel renders as a wide soft pipe.
-
-| | `r × res` | verdict |
-|---|---|---|
-| warren-hunk today | `0.038 × 64` = **2.4** | blobby — this is the bug |
-| minimum for a readable tunnel | **4.0** | |
-| comfortable | **5–6** | |
+Below ~4, marching cubes plus the crust noise rounds the feature into a soft
+blob. Minimum for a readable tunnel is **4.0**, comfortable is 5–6:
 
 ```
 res ≥ 4 × size / (desired tunnel radius in u)
 ```
 
-For a 1.1 u tunnel: `size 20 → res ≥ 73` (use 72 or 96). `size 30 → res ≥ 109`,
-which isn't in the allowed set. **Claustrophobic cheese must be built from small
-chunks at high resolution**, not from big chunks with small numbers.
+Claustrophobic cheese must be built from small chunks at high resolution, not
+big chunks with small numbers.
 
-### The other two causes of "nothing feels tight"
+### Why something feels tight (or doesn't)
 
-Narrow tunnels are necessary and not sufficient:
+- **Chambers.** Eye radius much larger than tunnel radius means you surface
+  into a room every few metres, and a room resets the feeling.
+- **Exits.** Multiple exits per chunk plus water between chunks means daylight
+  is never far. A maze wants exits only at its ends.
+- **Water between parts.** An archipelago of hollow chunks can never feel
+  enclosed. That's what `fused` placement is for: one solid body, no water
+  inside it except the carves.
 
-- **Chambers.** Eye radius much larger than tunnel radius means you surface into
-  a room every few metres, and a room resets the feeling. A maze part wants many
-  nodes and few rooms — but see the galleries, where *some* rooms are the point.
-- **Exits.** `exits: 2` per chunk plus open water between chunks means daylight
-  is never more than a few metres away. A maze formation wants exits only at its
-  ends.
-- **Water between parts.** The real one. An archipelago of hollow chunks can
-  never feel enclosed, however you carve it. That's what **`fused`** placement is
-  for: overlapping chunks whose interiors connect, with no water in between.
+### Hull closure
 
-### Shell closure
-
-For `N` chunks tiled on a surface of radius `R`, centre spacing is:
+For `N` tiles on a surface of radius `R`, centre spacing ≈ `3.54 R / √N`;
+to survive the crust eating the edges:
 
 ```
-spacing ≈ 3.54 × R / √N
+tileSize ≥ 1.6 × 3.54 × R / √N
 ```
 
-Neighbouring tiles only touch when the chunk *radius* reaches half the spacing;
-to survive the noise crust eating the edges you want ~0.8 × spacing. Since
-`size` is full width:
+Never trust the formula alone — the route verifier (flood fill / A*) is the
+law: shell closed everywhere, doors reachable, gold reachable.
 
-```
-size ≥ 1.0 × spacing     bare closure, no margin
-size ≥ 1.6 × spacing     recommended
-```
+### Seal smoothness
 
-Never trust this — **verify it**: flood-fill the water volume from the bell at
-coarse resolution at seed time. Whatever the fill reaches is the outer band. If
-it reaches the centre, the seal leaked. If it reaches no soft spot, you've
-sealed the player out. Both cases: thicken, add tiles, reseed.
-
-*(This is how X1 should have been caught: the crust at `R 155, count 48` has a
-spacing of 79 u and ships at `size 60` — it doesn't reach bare closure, let
-alone the margin. The lesson: **a big seal wants many small tiles or few
-enormous ones, and the middle is where holes live.**)*
-
----
-
-## 2. The four axes
-
-Every part carries four numbers that gameplay reads. They replace "one verb per
-biome" — the verb is what emerges from them.
-
-| Axis | Values | Reads as | Drives |
-|---|---|---|---|
-| `hardness` | `0` hands · `1` driller · `2` driller, slow · `3` no-dig | rind colour, chip particles, tool bounce | who can open it and how long |
-| `porosity` | `0`–`1` | how much void you can see into it | is there a natural route, or do you make one |
-| `odour` | `0`–`1` | wet, glossy, warm vs dry, pale, matte | passive threat pressure; digging multiplies it |
-| `noise` | derived: `hardness × tool` | — | dig noise radius. Hands ≈ silent, driller on hard ≈ a dinner bell |
-
-The coupling is the point: **the harder the wall, the louder the breach, the
-more it hunts you.**
-
-The six MVP parts were chosen to cover the corners: solid + no-dig + loud (the
-gate), solid + dark + navigable (the veins), porous + hot + open (the melt),
-solid + narrow + endless (the galleries), and porous + soft + sticky (the
-heart), with the drift as the harmless baseline you measure all of them against.
-
----
-
-## 3. The six parts
-
-Numbers are starting points for the bench, not gospel. `size` is world units;
-`r×res` is shown where it's load-bearing.
-
----
-
-### ▸ drift crumb — *bleached natural rind*
-
-**What it is.** Centuries-dead cheese, gone chalky and grey-white, tumbling
-slowly in the current. Small blocks far enough apart that you always see between
-them. **Nothing here is a wall.** The drift exists so that the Wheel resolves
-out of the fog as a horizon that doesn't stop — and so the driller has somewhere
-to be.
-
-**Look.** Matte, bone and ash, faintly powdery; edges rounded like sea glass.
-Zero specular. Slow tumble, no two rotating together. Fog reads it as
-silhouette-only past ~40 m.
-
-**Numbers.**
-```
-kind: block · size 8–16 · res 32
-hardness 0 · porosity 0.3 · odour 0
-crust  { amp 0.05, freq 1.8, depth 0.2 }
-eyes   { 1–3, rBase 0.09, rVar 0.06 }   coreEye 0
-pores  { 6–10, rBase 0.05 }
-tunnels{ rBase 0.06, bends 0 }  exits 2  deadEnds 0
-tags: hand-carve
-```
-
-**Placement.** One layer only: the **drift** (r 300→240), `count ~140`,
-`water: true`, sparse, one `wreck` prop containing the driller.
-
-**What the player does.** Orients. Finds the driller. Learns that cheese can be
-punched through, before anything punches back.
-
-**Bench check.** Can you tell it's harmless at 40 m? If it reads as structure
-rather than debris, it's too big or too dense.
-
----
-
-### ▸ dark rind — *the Great Wheel*
-
-**What it is.** The one gate. A classic wheel of cheese the size of a district:
-a squat cylinder with a rounded rim, flat top and bottom, lying tilted in the
-abyss. Aged in the dark for centuries and eaten hollow from within, so what's
-left is a **husk — a few metres of crust and nothing behind it but black water**.
-
-**Look — the change from the old wax.** No wax, no red. A **classic dark natural
-rind**: near-black at a distance, resolving up close into deep grey-brown
-mottling, dusted grey-white with old mould bloom, cracked in a fine dry web. The
-flat faces carry the **concentric ridges of the mould** and the weave of the
-cloth it was bandaged in; the rim is smoother and slightly glossy where it was
-turned. Under a chipped crack you glimpse the pale straw-ivory paste beneath —
-the only warm colour on the whole surface, and the thing that makes a soft spot
-read.
-
-The inner face is a different material entirely: pale, dry, **uniformly gnawed**
-in every direction, featureless — which is exactly why you must mark your door
-with a light stick.
-
-**Why it must be smooth.** It's a hull tile, not a chunk you explore, and it's
-thin. Surface noise displaces the face by `crust.amp × size`; at `amp 0.10` on a
-size-109 tile that's **11 u**, twice the whole crust, and your watertight gate is
-lace. Enforce for anything tagged `seal`:
+Surface noise displaces a hull face by `crust.amp × size`; on a thin husk that
+turns the gate into lace. For anything tagged `seal`:
 
 ```
 crust.amp × size < thickness / 3
 ```
 
-At `size 109, thickness 6` that caps `amp` at **0.018**. So the Wheel's
-character has to come from **colour, the cloth-weave and mould-ridge texture,
-the gnawed inner face and the soft-spot bulges — not from a lumpy silhouette.**
-This is a texturing job, not a geometry job, and the ridges/weave give you all
-the detail you need at zero displacement.
+Seal character comes from colour and texture (ridges, weave, mottling), never
+from silhouette.
+
+---
+
+## 2. The seven parts
+
+Numbers are starting points for the bench, not gospel. `size` is world units;
+`r×res` shown where load-bearing.
+
+---
+
+### ▸ emmental drift — *the Emmental Void* · verb: **scavenge & orient**
+
+**What it is.** A massive open-water void filled with floating chunks of
+bleached, centuries-dead Emmental — chalky bone-white, riddled with the big
+round holes the cheese is named for. Sparse at the outer edge, **densely
+clustered as you approach the Great Wheel**, so the map itself funnels the
+descent. Harmless on the way down: this is where the crew learns the swim
+controls, manages starting O₂, and finds the **wrecked bathyscaphe holding the
+driller**.
+
+**The mechanic.** The natural holes hide **air pockets** — topping up means
+swimming *inside* the debris, so the biome teaches "cheese has an inside"
+before anything hostile does.
+
+**Look.** Matte, bone and ash, faintly powdery; hole mouths rounded like sea
+glass; slow tumble, no two chunks rotating together. Fog reads it as
+silhouette past ~40 m.
+
+```
+kind: block · size 8–18 · res 32
+hardness 0
+crust  { amp 0.05, freq 1.8, depth 0.2 }
+eyes   { 2–4, rBase 0.18, rVar 0.06 }     ← the emmental holes; air pockets live in some
+coreEye 0
+pores  { 4–8, rBase 0.06 }
+tunnels{ rBase 0.07, bends 0 }  exits 2  deadEnds 0
+tags: hand-carve, air-pocket
+```
+
+`r×res`: hole radius `0.18 × 32 = 5.8` ✓.
+
+**Placement.** `band` r 240→300, `count ~120`, `densityGrade: "inward"`
+(sparse far out, clustered against the Wheel), slow seeded rotation. One
+`wreck` prop (the bathyscaphe with the driller) seeded mid-band on the spine.
+Budget: `airPockets ~6`, seeded at the tops of interior eyes.
+
+**Bench check.** Is it readable as harmless debris at 40 m? Can you find an
+air pocket by silhouette alone (a chunk big enough to have an inside)?
+
+---
+
+### ▸ dark rind — *the Great Wheel* · verb: **search & breach**
+
+**What it is.** The first gate. A colossal wheel of cheese lying tilted in the
+abyss: squat cylinder, rounded rim, aged black and eaten hollow — **6 u of
+crust and nothing behind it but black water**. It blocks everything. The crew
+fans out along a curved horizon to find the **single weeping soft spot**.
+
+**Look.** Near-black natural rind: deep grey-brown mottling, grey-white mould
+bloom, a fine dry crack web; concentric mould ridges and cloth weave on the
+faces, smoother rim. Pale straw paste glimpsed under chipped cracks — the only
+warm colour, and what makes the soft spot read. The **inside face is pale,
+uniformly gnawed, featureless** — which is why the crew must drop a light
+stick at the breach or lose the door from within.
 
 **Numbers.**
 ```
 kind: hull tile · size 109 (at R 233, N 150) · res 48
-thickness 6 u          ← a husk, not a fortress
-hardness 3 (no-dig) · porosity 0 · odour 0.2
-crust  { amp 0.018, freq 1.2, depth 0.3 }   ← capped by the thickness rule
-eyes 0 · coreEye 0 · pores 0 · exits 0 · deadEnds 0
+thickness 6 u
+hardness 3 (soft spot digs as 1)
+crust  { amp 0.018, freq 1.2, depth 0.3 }   ← capped: amp × 109 < 6/3
+eyes 0 · pores 0 · exits 0 · deadEnds 0
+noCarveWithin 2
 tags: seal
-constraint: no carve of any kind within the shell thickness (noCarveWithin)
 ```
 
-**Placement.** `mode: "hull"`, `surface: "wheel"` (squat cylinder + rounded
-rim), `r 233`, `hollow: true`, `sealed: true`, `softSpots: 2`. Closure:
-`size ≥ 1.6 × 3.54 × 233 / √N` → `≥ 1331/√N`; at N = 150 that's **109**.
-Validate at build time *and* with the flood fill.
+**Placement.** `hull`, `surface: "wheel"`, `radius 233`, `thickness 6`,
+`rim 26`, **`softSpots: 1`**, `softSpotR 8`, ridges on. Closure:
+`size ≥ 1331/√N` → 109 at N 150.
 
-**What the player does.** Searches a curve the size of a horizon for the one
-place the wall isn't a wall. Then makes the loudest noise in the game for twenty
-seconds. Then loses the door.
+**The soft spots.** Multiple weeping, discoloured, mite-pitted bulges scattered
+around the perimeter — paste showing through the crack web, wet sheen, each
+visible from ~15 m and invisible beyond. Finding one is a search along a curve;
+choosing which one is a question. Each digs as `hardness 1`; the breach is
+**~20 s of continuous driller** — the loudest noise in the game — opening a
+bore wide enough to haul back out through (driller radius 2.4 u). After breach
+it stays open, and only the light stick marks it.
 
-**Breach time is authored on the soft spot, not derived from thickness** — at
-6 u the driller would otherwise be through in one carve. See §4.
+**Bench check.** Walk the outer face: does the spot read at 15 m and vanish at
+30? Inside face: with no light stick, can you find the hole again? (You
+shouldn't be able to.)
 
 ---
 
-### ▸ roquefort — *the dark veins* · **two phases**
+### ▸ roquefort float — *the Dark Veins* · verb: **trust & navigate**
 
-**What it is.** Everything inside the Wheel, all the way from the breach to the
-melt. You come through the crust into **total darkness** — no ambient light, no
-horizon, no floor — and the only things in the world are faint blue vein-lights
-hanging in the black. The biome is one continuous idea (*the veins are the only
-information*) expressed twice, at two scales.
+**What it is.** Everything inside the Wheel down to the melt shell: a vast,
+**pitch-black** expanse of floating Roquefort. No solid mass, no walls, no
+floor — helmet lamps are severely choked, and the only information in the
+world is the **glowing blue mold veining on the edges of the floating
+chunks**. The trail of glows is the navigation: from each chunk you can just
+make out the next.
 
-#### Phase 1 — the drifting veins · `scatter`, in water · r 230 → 150
+**The two mechanics.**
+- **True 3D disorientation.** The trail doesn't go forward — it spirals up,
+  down, and through larger floating corridors. And because the chunks
+  **slowly rotate**, a glowing edge turns away and plunges the route into
+  total darkness until it comes back around. The dark pulses; the crew waits,
+  or trusts.
+- **The undrillable wall.** The trail ends at the melt shell (next part),
+  which cannot be dug anywhere. Lose the trail and you are swimming blind
+  against an impenetrable wall — the vein sequence is the only way to the one
+  hidden entrance, so the **trail terminus must land at the entrance** by
+  construction.
 
-Floating chunks of roquefort, dark and invisible except for the vein networks
-glowing faintly inside them. They read as **lanterns in a void**: you swim to
-one, and from it you can just make out the next. **The trail is the navigation**
-— there is nothing else, not even a wall.
-
-The chunks get **bigger and closer together as you go inward**, so the trail
-tightens on its own and the player is funnelled without ever being told. The
-last few are house-sized, and then the trail ends at a mass that fills the fog
-in every direction.
+**Look.** Near-black blue-grey paste that eats light; the veins are emissive
+blue-green filaments concentrated along chunk edges and rims, readable from
+outside the chunk at ~40 u through fog. Chunks grow from house-brick to
+house-sized as you go inward, tightening the trail on its own.
 
 ```
-kind: hunk · size 10 → 45 (graded inward) · res 56
-hardness 0 along veins / 1 across · porosity 0.35 · odour 0.5
+kind: hunk · size 10 → 40 (graded inward) · res 56
+hardness 1
 crust  { amp 0.07, freq 1.6, depth 0.22 }
-eyes   { 4–8, rBase 0.08 }   coreEye 0
+eyes   { 3–6, rBase 0.08 }   coreEye 0
 tunnels{ rBase 0.06, bends 1 }  exits 2  deadEnds 1
-veins: surface-visible, emissive, always on
-tags: fault, dark, landmark, hand-carve
+veins: edge-concentrated, emissive, always on, visible from OUTSIDE
+tags: dark, landmark
 ```
 
-Placement: `mode: "scatter"`, r 230→150, `water: true`,
-`densityGrade: "inward"`, `sizeGrade: "inward"`, `count ~70`, budgets
-`airPockets 3, essence 6, faults 8`.
+**Placement.** `band` r 100→226, `count ~90`, `densityGrade: "inward"`,
+`sizeGrade: "inward"`, `sightline: true` (each chunk placed within
+sight-range of the previous, hull-occlusion checked), slow seeded rotation.
+2–3 chunks are authored dead ends off the main line — far enough apart to
+cost a minute, not a run. Modifiers: `lightRange ×0.25`, `fogDensity ×3`.
 
-**Design rules for the trail.** Each chunk's glow must be visible from the
-previous one [N9] — that sightline *is* the level design, and it's the only
-place in the map where the game quietly leads you. Small pockets of air live
-inside a few of them, so the trail is also a reason to stop. **Two or three
-chunks are dead ends off the main line**, far enough apart to cost a minute, not
-a run.
-
-#### Phase 2 — the vein mass · `fused` · r 150 → 90
-
-The trail ends at one continuous body of roquefort and you go **inside** it. No
-more water between parts [D2]; from here to the heart you are within the cheese.
-Your lamp reaches a third as far, the water is sticky, you move at 80%. The vein
-graph is the route, the light, and the only thing hand-diggable: **follow the
-veins or drill blind.**
-
-```
-kind: hunk · size 20–30 · res 64
-hardness 0 along veins / 1 across · porosity 0.4 · odour 0.5
-crust  { amp 0.07, freq 1.6, depth 0.22 }
-eyes   { 8–14, rBase 0.07, rVar 0.04 }   coreEye 0
-tunnels{ rBase 0.05, bends 2 }  exits 2  deadEnds 4
-biome:  lightRange ×0.35, fogDensity ×2.5, drag ×1.25, veinStrength 1.0
-tags: fault, dark, hand-carve
-```
-
-Placement: `mode: "fused"`, r 150→90, `swimSpeedMul 0.8`, budgets
-`airPockets 2, essence 10, faults 14`.
-
-**The entrance matters.** The mass should have a small number of visible mouths
-where veins converge and break the surface — the same read as the Wheel's soft
-spot, at a tenth the scale, and hand-carvable rather than drilled. Finding the
-way *in* is the last beat of phase 1.
-
-**The generator change both phases need.** Veins become a **real connected
-graph** that the tunnel spanning tree follows, instead of a shader effect —
-"follow the light" has to be literally true, and in phase 1 it has to be visible
-from *outside* the chunk. Open question Q8: some proportion must dead-end, or
-the biome is a corridor with mood. Brittle vein routes that collapse behind you
-are the cheap version of the same tension; take that if the graph work overruns.
-
-**Bench check.** Kill all lights except the veins, in both phases. Can you still
-navigate? In phase 1, can you see the next chunk from the current one — with a
-lamp *off*? If not, the trail isn't a trail and the darkness is just darkness.
+**Bench check.** Lamp OFF, veins only: can you see the next chunk from the
+current one, always? Let the chunks rotate a full period: is the longest
+all-dark gap tense or unfair? Does the chain end within sight of the shell
+entrance?
 
 ---
 
-### ▸ fondue — *the melt*
+### ▸ melt rind — *the shell of the Melt* · verb: (the veins' destination)
 
-**What it is.** Thermal vents from the heart have cooked this layer soft. **It
-is still fully submerged** — there is no air-filled space anywhere in the game
-— but the water itself has changed: hot, churning, lit orange from below by
-vents in the floor, streaked with ribbons of molten cheese pouring off the
-ceiling and dispersing into the current like ink. Three or four cavernous voids
-rather than a tunnel network, so it's the one place you can see the far wall,
-the ceiling, and every teammate at once — the release valve between two hours of
-dark, the veins before it blind and tight, the galleries after it blind and
-tighter.
+**What it is.** The second seal: the outer crust of the massive central cheese
+body that contains everything from the Melt inward. **Entirely undrillable —
+`hardness 3` with no soft spot.** The crew cannot dig their own door; the only
+way in is the **single, highly obscured, hidden entrance** the vein trail
+leads to.
 
-**Space first.** This biome is defined by volume, not by geometry detail. Three
-or four chambers, each **25–40 u across**, connected by short wide throats.
-Everything dangerous here is in plain sight, and that's the deal: **open, lit
-and hazardous** against **tight, blind and empty**.
+**Look.** Scorched, vitrified rind: dark amber-brown, heat-crazed, faintly
+warm-glowing along deep cracks (the Melt bleeding light from inside). The
+entrance is a recessed, angled crevice — invisible as a silhouette, found only
+because the last vein glows point at it.
+
+```
+kind: hull tile · size ~66 (at R 91, N 60) · res 48
+thickness 5 u
+hardness 3 · no soft spots
+crust  { amp 0.02, freq 1.4, depth 0.3 }    ← capped: amp × 66 < 5/3
+eyes 0 · pores 0 · exits 0 · deadEnds 0
+noCarveWithin 2
+tags: seal
+entrance: ONE generator-carved bore, radius ≥ 1.4 u (cargo must pass on the
+way out), entering at an angle (not radial) and recessed so it never reads
+at distance; positioned on the spine crossing of this layer boundary.
+```
+
+**Placement.** `hull`, `surface: "sphere"`, `radius 91`, `thickness 5`,
+`softSpots: 0`. Closure: `size ≥ 1.6 × 3.54 × 91/√N` → 66 at N 60.
+
+**Bench check.** Sphere-orbit at 30 u: the entrance must NOT read. Follow the
+vein chain: it must. Verifier: with the entrance plugged, bell→gold must fail.
+
+---
+
+### ▸ fondue — *the Fondue Cathedral* · verb: **evade & rescue**
+
+**What it is.** The claustrophobia breaks: massive, hot, **orange-lit
+caverns** of superheated water, 25–40 u across, connected by short wide
+throats. Three or four chambers, highly rhythmic. The one place you can see
+the far wall, the ceiling, and every teammate at once — and everything
+dangerous is in plain sight.
+
+**Space first.** Volume, not geometry detail: few huge eyes, giant coreEye,
+wide throats, **no dead ends**. The generator makes rooms and gets out of the
+way.
 
 **Look.** Wet, glossy, molten orange-gold billowing off the ceiling in slow
-ropes that *dissolve into the water* rather than falling through air — think an
-underwater vent plume, not a waterfall. Cooled floes crusted on the floor in
-dull amber. Water fog stays, but thinner and warmer-tinted, and it glows instead
-of muddying. Everything strings and sags; no crisp edges anywhere. High odour:
-the loudest-smelling place in the map.
+ropes that *dissolve into the water* like ink — an underwater vent plume, not
+a waterfall. Cooled floes crusted dull amber on the floor. The fog thins,
+warms, and glows.
 
-**Numbers.**
 ```
-kind: hunk · size 28–34 · res 64                  ← big chunks, big voids
-hardness 1 · porosity 0.75 · odour 0.8
-crust  { amp 0.09, freq 1.4, depth 0.3 }          ← sagging, molten, not crisp
+kind: hunk · size 28–34 · res 64
+hardness 1
+crust  { amp 0.09, freq 1.4, depth 0.3 }
 eyes   { 3–5, rBase 0.34, rVar 0.08 }  coreEye 0.45   ← caverns, not chambers
 pores  { 4–8, rBase 0.05 }
-tunnels{ rBase 0.11, bends 0–1 }  exits 3  deadEnds 0   ← wide throats, no maze
-biome:  lightRange ×1.4, fogDensity ×0.6, temperature 1.0
-tags: air-pocket, hot, open, hand-carve
+tunnels{ rBase 0.11, bends 0–1 }  exits 3  deadEnds 0  ← wide throats, no maze
+tags: hot, open
 ```
 
-Note the inversion against every other part: **high `coreEye`, few eyes, no dead
-ends.** The melt is the one place where the generator should be making *rooms*
-and getting out of the way.
+**Placement.** `fused` r 46→88. Modifiers: `lightRange ×1.4`,
+`fogDensity ×0.6`, `temperature 1.0`. Hazard budget (seeded by the generator
+at eye ceilings/floors): `meltFalls 12, meltPools 6, vents 8`.
 
-**Placement.** `mode: "fused"`, r 90→45, `overlap` low so the caverns stay
-distinct, budgets `airPockets 8, essence 8, faults 4` — the air pockets sit
-under the ceiling here same as anywhere else (S3/D10), and there are more of
-them than in any other biome: this is still **the last generous refill in the
-run**, it's just an ordinary air pocket doing the work, not a change of medium.
+**The hazards — all in water, all telegraphed, all on a rhythm.**
 
-**The heat hazards.** All four are the same rule — visible, telegraphed, and
-usable against something else. All happen *in water*.
-
-| Hazard | Reads as | Does |
+| hazard | reads as | does |
 |---|---|---|
-| `melt_fall` ×12 | a sag, a bulge, then a rope of molten cheese billowing off the ceiling into the current | `coated` on contact; can be triggered early and dropped on a pursuer |
-| `melt_pool` ×6 | bright, roiling patch on the floor, crusting over and re-opening | `coated`; the crust supports weight for about a second before giving way |
-| `thermal_vent` ×8 | a plume of superheated water and dissolved cheese jetting from a floor crack, on a rhythm | blinds and shoves; rides you up a shaft if you time it — the underwater equivalent of a geyser |
-| `heat_zone` (ambient) | visible shimmer/distortion where hot and cold water mix | slow O₂ burn near the hottest chambers — the reason it isn't a free rest stop |
+| `melt_fall` | a sag, a bulge, then a rope of molten cheese dripping from the ceiling on a seeded cycle | `coated` on contact |
+| `melt_pool` | bright roiling patch on the floor; crusts over ~1 s, then gives way | `coated` if you fall in |
+| `thermal_vent` | superheated geyser blasting from a floor crack, on a rhythm | blinds and shoves; impassable while erupting |
 
-**Cooled floes** are the counterpart: dull amber slabs crusted grey on the
-floor, climbable footing in an otherwise open volume, and *placed by what
-already fell*. The route across a cavern floor is partly built out of its own
-hazard.
+**The rhythm is the level design.** Cycles are seeded and staggered so
+crossing a cavern is: wait for the geyser to subside → dart across a stable
+cooled floe → pause before the next ceiling drip lands. Floes are the safe
+beats between hazards.
 
-**What the player does.**
-- **Still swims.** No movement-mode change anywhere in this biome — the "biggest
-  sensory swap" is the water itself going hot, bright and orange instead of cold
-  and dark, not a swap out of water. Voice occlusion still applies as normal;
-  this biome doesn't get quieter, it gets *visible*.
-- **Reads the ceiling.** Falls are telegraphed — a sag, a bulge, then the rope
-  billowing into the water.
-- **Gets engulfed, and gets pulled out.** Being caught is **not death**:
-  `coated` — slowed, vision fouled, O₂ drain ×2. Cleared by a teammate scraping
-  it off, or by swimming through a `thermal_vent`'s cold counter-current (the
-  temperature shock cracks the coating loose). Instant death in a hazard biome
-  makes people stop moving.
-- **Weaponises it.** A fresh fall can be dropped on something following you. That
-  offensive use is why this hazard was admitted at all; a hazard that only taxes
-  you is friction.
+**Engulfment is not death.** Getting hit coats a player in molten cheese:
+severely slowed, vision fouled, **O₂ drain ×2** — until a **teammate scrapes
+them off**. Evade & rescue: the biome is built to be crossed together.
 
-**The tension to watch.** It cannot be a strong hazard *and* a strong refill. If
-players sprint through, the whole back half of the oxygen curve runs dry — cut
-fall count and pool coverage before anything else.
+**Bench check.** Walk mode: far wall visible? Every hazard readable before it
+fires? Can a coated (slowed) player be reached from anywhere in the cavern
+before their O₂ dies?
 
 ---
 
-### ▸ mite-bored paste — *the galleries*
+### ▸ mite-bored paste — *the Galleries* · verb: **map & squeeze**
 
-**What it is.** The Gouda's shell, and the last act. One colossal mass of tan
-cheese bored through by mites into thousands of holes. **Not a cave system — a
-sponge.** One-rat squeezes open without warning into chambers you could lose the
-crew in, then close again. Dead ends everywhere. Carrying the Gouda back out
-through this is the climax of the run.
+**What it is.** A colossal sponge of endless, identical tan tunnels —
+**~1.0 u clearance, one rat wide** — bored by mites. Dead ends and false
+loops everywhere; every surface looks the same in every direction. The only
+landmarks are the ones the crew makes with light sticks.
 
-**Look.** Warm mid-tan, dry, matte, drilled everywhere with small round bores;
-fine ochre dust hanging in the beam. Every surface looks the same in every
-direction, which is the whole problem. Light sticks are the only landmarks the
-player can make.
+**The relief valve.** The squeezes occasionally open into small **spherical
+gathering chambers** — regrouping points to check O₂, argue, and drop a light
+stick before the next stretch. A maze that only branches is a hedge; the
+rooms make it a place.
 
-**Numbers.**
+**The driller warning.** Everything here is `hardness 1`, so the driller
+*works* — and using it is a terrible idea: at 2.4 u it obliterates the narrow
+walls and destroys every recognizable path, including the light-stick trail's
+context. That trade is the mechanic, not a bug.
+
 ```
-kind: hunk · size 16–20 · res 72        →  r×res: 0.055 × 72 = 4.0 ✓
-hardness 1 · porosity 0.5 · odour 0.15
+kind: hunk · size 16–20 · res 72        → tunnel r×res: 0.055 × 72 = 4.0 ✓
+hardness 1
 crust  { amp 0.05, freq 2.0, depth 0.18 }
-eyes   { 26–34, rBase 0.06, rVar 0.02 }   ← barely wider than the tunnels…
+eyes   { 26–34, rBase 0.06, rVar 0.02 }   ← barely wider than the tunnels
 coreEye 0
+chambers { chance 0.12, rBase 0.28 }      ← the spherical gathering rooms, ~1 in 8 tiles
 pores  { 0–2, rBase 0.03 }
 tunnels{ rBase 0.055, rVar 0.012, bends 3 }
 exits 1  deadEnds 5  narrow true  tangle true
 tags: narrow, maze
 ```
 
-**The one authored exception:** a small number of eyes at `rBase 0.25+` —
-**chambers**, seeded maybe 1 in 8 chunks. A maze that only branches is a hedge;
-a maze that opens into rooms is a place. The rooms are where the crew regroups,
-argues, and realises nobody marked the way in.
+**Placement.** `fused` r 8→46.
 
-**Placement.** `mode: "fused"`, r 50→6, budgets `airPockets 1, essence 14`.
+**Cargo clearance — the number to watch.** `0.055 × 18 = 1.0 u`: a rat passes
+(needs 0.9), **the Gouda does not (needs 1.3)** — a deliberate 0.3 u negative
+margin. Hauling out means finding the wider seams, or drilling and destroying
+the maze you mapped. Decide the final margin in the bench with the slab in
+front of you.
 
-**Cargo clearance — the number to watch.** `0.055 × 18 = 1.0 u`: passable for a
-rat (needs 0.9), **below the 1.3 u needed to haul the Gouda**. That's a 0.3 u
-negative margin, deliberately. Either the haulable route is authored, or it's
-widened by hand on the way in — and then the crew has to remember which one it
-was. Decide that in the bench with the slab in front of you, not from the chair.
-
-**Bench check.** Swim in, try to get back out. Then do it again holding something
-1.3 u wide. Is it *lost*, or is it *annoying*? Lost is dead ends plus rooms;
-annoying is dead ends alone.
+**Bench check.** Swim in, get back out. Do it again holding something 1.3 u
+wide. Is it *lost* (dead ends + rooms) or merely *annoying* (dead ends alone)?
 
 ---
 
-### ▸ fresh curd — *the heart*
+### ▸ fresh curd — *the Heart* · verb: **take**
 
-**What it is.** One chamber at the centre, one air pocket — the last one in the
-game — and the Golden Gouda in it. Everything else in the abyss is aged; the
-centre is fresh, warm and still being made, because the Duplicator never stopped.
+**What it is.** A single, luminous, fresh chamber at the exact centre of the
+map, holding **the last air pocket in the game** and the **Golden Gouda**. The
+only moment of peace: everything else in the abyss is aged and dead; the
+centre is still being made.
 
-**Look.** White, wet, faintly luminous, still forming; whey beading off the
-walls. Warm light against everything cold you've swum through. It should look
-*alive* in a map made of corpses.
+**Look.** White, wet, faintly luminous, whey beading off the walls. Warm
+light against two hours of cold and dark. It should look *alive* in a map
+made of corpses.
 
-**Numbers.**
 ```
-kind: hunk · size 48–64 · res 96
-hardness 0 · porosity 0.6 · odour 0.4
+kind: hunk · size ~40 · res 96
+hardness 0
 crust  { amp 0.10, freq 1.3, depth 0.28 }
-eyes   { 14–20, rBase 0.10, rVar 0.14 }   coreEye 0.34
-tunnels{ rBase 0.07, bends 1 }  exits 5  deadEnds 3
-biome:  dragModifier 1.6
-tags: landmark, sticky, hand-carve
+eyes   { 2–4, rBase 0.10 }   coreEye 0.5        ← one room is the part
+tunnels{ rBase 0.07, bends 1 }  exits 2  deadEnds 0
+tags: landmark, air-pocket
 ```
 
-**Placement.** `mode: "chunk"`, r 6→0, one `air-pocket`, `golden_gouda` prop at
-the centre (D3).
+**Placement.** `center`, r 8→0. Props: one `air-pocket` (the last), the
+`golden_gouda` at the centre.
 
-**What the player does.** Takes it — and immediately discovers the drag
-modifier. The first thirty seconds of the ascent, hauling something heavy
-through sticky cheese, is the worst movement in the game, and that's the point.
-
----
-
-## 4. The seal — soft spots
-
-There is **one seal in MVP**. Soft spots are placed **on** a hull, not generated
-by its tiles.
-
-- **1–3 per seal**; the count is the main difficulty dial. Ship with 2.
-- Positioned on the **spine angle** (D19) — for a single gate, seeded once and
-  drifting downward from the bell's bearing so it's never directly below you.
-- Reads as a **weeping, discoloured, mite-pitted bulge**: the dark rind gone
-  soft and damp, pale paste showing through the crack web, fine veins converging
-  into it, a wet sheen the rest of the wheel doesn't have. **Visible from ~15 m,
-  invisible beyond that in fog** — finding it is a search along a curve (N2).
-- `hardness 1`: **~20 s of driller** — the loudest thing in the game — or ~80 s
-  of hand-carving (D22), so losing the driller is a slower run, not a dead one.
-- Opens **one rat wide** at first (N1).
-- After breach it **stays open, and the inside face is blank** (D24). Mark it
-  with a light stick or lose it. *(Fallback if that plays as infuriating rather
-  than tense: the rind slumps closed but re-drills in ~5 s.)*
+**What the player does.** Breathes. Takes it. Realises the whole map now has
+to be crossed in reverse, carrying it.
 
 ---
 
-## 5. Assembling the world
+## 3. Assembling the world
 
-The stack is data: one seeded JSON file, ordered outside-in. Recipes stay in
-`recipes.ts` keyed by `recipe`; worldgen is deterministic from `seed` + spec, so
-no geometry crosses the network.
+One seeded recipe, ordered outside-in. Worldgen is deterministic from
+`seed + tables`; no geometry crosses the network.
 
-| # | Layer | r out → r in | Mode | Part | Medium |
+| # | Layer | r out → in | Mode | Part | Notes |
 |---|---|---|---|---|---|
-| 0 | Open water | 420 → 300 | — | — | water |
-| 1 | The drift | 300 → 240 | `scatter` | drift crumb | water |
-| 2 | **The Great Wheel** | 236 → 230 (6 u) | `hull` | dark rind | — |
-| 3 | **Dark Veins — drifting** | 230 → 150 | `scatter` | roquefort, graded inward | water |
-| 4 | **Dark Veins — the mass** | 150 → 90 | `fused` | roquefort | flooded |
-| 5 | **The Melt** | 90 → 45 | `fused` | fondue | flooded, hot |
-| 6 | **The Galleries** | 45 → 6 | `fused` | mite bore | flooded |
-| 7 | The heart | 6 → 0 | `chunk` | fresh curd | flooded |
+| 0 | Open water | 420 → 300 | — | — | descent |
+| 1 | The Drift | 300 → 240 | `band`, graded inward | emmental drift | wreck + driller; air pockets in holes |
+| 2 | **Great Wheel** | 236 → 230 | `hull` wheel | dark rind | seal #1 · 1 soft spot · 20 s drill |
+| 3 | The Dark Veins | 226 → 100 | `band`, graded + sightline | roquefort float | rotating; trail = navigation |
+| 4 | **Melt shell** | 96 → 91 | `hull` sphere | melt rind | seal #2 · undrillable · 1 hidden entrance ≥ 1.4 u |
+| 5 | The Melt | 88 → 46 | `fused` | fondue | 3–4 caverns 25–40 u; rhythm hazards |
+| 6 | The Galleries | 46 → 8 | `fused` | mite bore | 1.0 u squeezes + spherical rooms |
+| 7 | The Heart | 8 → 0 | `center` | fresh curd | last air pocket + Golden Gouda |
 
-**There is no air-filled space anywhere in the game.** "Flooded" means the
-carved voids inside a fused mass are full of water, same as everywhere else —
-the game never leaves the swim/O₂ system. Air pockets are localized bubbles
-seeded per-layer (`budgets.airPockets`), not a change of medium; the melt just
-seeds more of them than any other layer, which is what makes it the run's last
-generous refill.
+Air pockets: generous in the drift (~6, inside emmental holes), **none seeded
+by default between the Wheel and the Heart**, and exactly one in the heart —
+the last in the game. If the O₂ curve proves too harsh at the gates, sparse
+pockets in the veins are the tuning knob; add them in the bench, not here.
 
 **Rules the loader enforces at seed time — fail loudly, don't warn:**
 
 | Rule | Constraint |
 |---|---|
-| Sealing | `tileSize ≥ 1.6 × 3.54 R / √tiles` — at R 233, `≥ 1331/√N`; N 150 → 109 |
-| Crust amp | `amp × tileSize < thickness / 3` — at 6 u, `amp ≤ 0.018` |
-| Resolution | `r × res ≥ 4` |
-| Clearance | tunnels ≥ 1.3 u for cargo, ≥ 0.9 u for a rat — or fail *intentionally* |
-| Reachability | flood-fill water from the bell: shell closed **and** soft spot + Gouda reachable |
-
-The full JSON schema lives in `plan-mvp.md` §M2.
-
----
-
-## 6. Fields `recipes.ts` needs
-
-### On `PartRecipe`
-
-```ts
-hardness: 0 | 1 | 2 | 3;   // hands | driller | driller-slow | no-dig
-porosity: number;          // 0–1, authored (also derivable, but author it)
-odour: number;             // 0–1
-noCarveWithin?: number;    // seal tiles: keep every carve this far from both faces
-```
-
-### On `BiomeRecipe`
-
-```ts
-budgets: {
-  airPockets: number;   // sealed O₂ bubbles seeded in this biome
-  essence: number;      // crystal deposits
-  faults: number;       // brittle vein lines (roquefort)
-  softSpots: number;    // seals only — 1–3, the difficulty dial
-};
-modifiers: {
-  lightRange: number;      // ×, W11
-  fogDensity: number;      // ×, W11
-  drag: number;            // ×
-  soundOcclusion: number;  // 0–1
-  temperature?: number;    // the melt — water heat, not a medium change
-};
-```
-
-There is no `airFilled` flag. Every layer is water; the melt is `temperature`
-turned up and a heavier `budgets.airPockets`, nothing else.
-
-### `BiomePlacement` modes
-
-```ts
-| { mode: "scatter";                 // floating parts in water
-    rMin: number; rMax: number;
-    count: number;
-    densityGrade?: "outward" | "inward" | "none";
-    sizeGrade?: "outward" | "inward" | "none";   // the drifting veins get bigger inward
-    sightline?: boolean }                        // enforce: each chunk visible from the last
-
-| { mode: "hull";                    // generalises "shell" (K8)
-    surface: "sphere" | "wheel";     // wheel = squat cylinder + rounded rim
-    radius: number; height?: number;
-    thickness: number;               // 6 for the Great Wheel — a husk
-    hollow: boolean;                 // true = open water inside, not solid
-    count: number;                   // validated against the closure formula
-    softSpots: number }
-
-| { mode: "fused";                   // K9 — overlapping, interiors connect
-    rMin: number; rMax: number;
-    count: number;
-    overlap: number }                // fraction of chunk radius; > 0 guarantees fusion
-
-| { mode: "chunk";                   // one authored piece — the heart
-    radius: number }
-```
+| Hull closure | `tileSize ≥ 1.6 × 3.54 R / √N` — both hulls |
+| Seal smoothness | `crust.amp × size < thickness / 3` — both hulls |
+| Resolution | `r × res ≥ 4` for every carve that matters |
+| Clearance | tunnels ≥ 0.9 u (rat); galleries fail 1.3 u (cargo) *intentionally*; melt entrance ≥ 1.4 u |
+| Reachability | verifier: both seals closed with doors blocked; bell → soft spot → entrance → gold reachable with them open |
+| Sightline | vein trail connected breach → entrance, ≤ 2–3 authored orphans |
 
 ---
 
-## 7. Bench checklist
+## 4. Schema — what `recipes.ts` needs
 
-When a new part looks right in `/worldgen.html`, check it against these before
-copying the numbers into `recipes.ts`:
+The as-built schema is the source of truth (the bench's copy-JSON round-trips
+it). Deltas the new map needs, and the fields it retires:
+
+### `PartRecipe`
+
+Keep: `id label kind mood desc size hardness crust eyes coreEye chambers
+pores tunnels exits deadEnds narrow tangle noCarveWithin tags`.
+
+**Retire:** `porosity`, `odour` — no consumer in the six-biome design.
+
+### `BiomePlacement`
+
+```ts
+| { mode: "center" }                       // the heart
+| { mode: "band";                          // floating parts in water
+    rMin; rMax; count; guard;
+    densityGrade?: "outward" | "inward";
+    sizeGrade?: "outward" | "inward";      // NEW — veins/drift grow inward
+    sightline?: boolean;                   // NEW — each chunk visible from the last
+    rotate?: { degPerSec: number } }       // NEW — slow seeded tumble
+| { mode: "fused";                         // one solid lattice-tiled band
+    rMin; rMax; warpAmp; warpFreq; loopFrac; sideExits }
+| { mode: "hull";                          // one closed lattice-tiled husk
+    surface: "wheel" | "sphere";
+    radius; thickness; rim;
+    softSpots; softSpotR;                  // 0 on the melt shell
+    entrance?: { r: number };              // NEW — melt shell's hidden bore
+    ridgeAmp; ridgeFreq }
+```
+
+**Retire:** `mode: "shell"` (the classic fibonacci wall) and its colossal
+params — superseded by `hull`.
+
+### `BiomeRecipe`
+
+```ts
+budgets?: {
+  airPockets: number;                      // O₂ bubbles seeded in carved voids
+  softSpots: number;                       // seals only
+  hazards?: { meltFalls: number; meltPools: number; vents: number };  // melt only
+};
+modifiers?: {
+  lightRange: number;   // ×
+  fogDensity: number;   // ×
+  drag: number;         // ×
+  soundOcclusion: number;
+  temperature?: number; // the melt — hot water, not a medium change
+};
+```
+
+**Retire:** `airFilled` (nothing is air-filled), `budgets.essence`,
+`budgets.faults` (no consumer).
+
+### `WorldRecipe`
+
+Unchanged: `worldR boundaryR goldBand goldMinCavernR debrisCount heartGuard
+frame spine parts biomes`. **Retire the old tables:** `DEFAULT_PARTS`,
+`DEFAULT_BIOMES`, `DEFAULT_WORLD`, `WORLDS.onion` — the six-biome
+`WHEEL_WORLD` is the only world.
+
+---
+
+## 5. Bench checklist
+
+Before copying numbers into `recipes.ts`:
 
 - [ ] `r × res ≥ 4` for the smallest tunnel you care about
-- [ ] Cut the camera inside — does a tunnel *feel* like a tunnel, or a pipe?
-- [ ] Is the tightest route ≥ 0.9 u (rat) and ≥ 1.3 u (cargo), and is whichever
-      it fails intentional?
-- [ ] Would one carve from the tool you expect to be used here *erase* the
-      feature you just tuned? (X3)
-- [ ] Seal tiles only: does `crust.amp × size < thickness / 3` hold?
-- [ ] Can you tell what the cheese is from 40 m, in fog, from silhouette and
-      colour alone? (U7: one trait, one colour, one consequence — six parts fit
-      that budget exactly; nine did not)
-- [ ] For hull tiles: does `size ≥ 1.6 × 3.54 × R / √N` hold, and does the flood
-      fill agree?
-- [ ] Does the part give the player something to *do* that its neighbours in the
-      stack don't?
+- [ ] Camera inside — does a tunnel *feel* like a tunnel, or a pipe?
+- [ ] Tightest route ≥ 0.9 u (rat); where it fails 1.3 u (cargo), is that intentional?
+- [ ] Would one carve from the expected tool *erase* the feature you tuned?
+- [ ] Seal tiles: `crust.amp × size < thickness / 3`, and closure formula holds
+- [ ] Both seals: verifier says closed-with-doors-blocked AND reachable-with-doors-open
+- [ ] Veins: lamp off, veins only — is the next chunk always findable? Through a rotation period?
+- [ ] Melt: every hazard readable before it fires; a coated teammate reachable in time
+- [ ] Can you tell what the cheese is from 40 m, in fog, from silhouette and colour alone?
+- [ ] Does the part give the player a verb its neighbours don't?

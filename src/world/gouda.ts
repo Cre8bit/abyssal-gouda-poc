@@ -58,7 +58,7 @@ import { MarchingCubes } from "three/examples/jsm/objects/MarchingCubes.js";
 import { toonMaterial } from "../render/toon.ts";
 import type { Vec3 } from "../state.ts";
 import {
-  DEFAULT_WORLD,
+  WHEEL_WORLD,
   pickPart,
   validateWorld,
   type BiomeMaterial,
@@ -71,8 +71,8 @@ import {
 
 // Module-scope radii read the DEFAULT tables — the game always plays the
 // shipped recipes; WorldRecipe overrides exist for the worldgen bench only.
-export const WORLD_R = DEFAULT_WORLD.worldR; // outer edge of the drift
-export const BOUNDARY_R = DEFAULT_WORLD.boundaryR; // visible map boundary veil
+export const WORLD_R = WHEEL_WORLD.worldR; // outer edge of the drift
+export const BOUNDARY_R = WHEEL_WORLD.boundaryR; // visible map boundary veil
 export const HEART_POS = { x: 0, y: 0, z: 0 }; // map center — a DECOY.
 // The Golden Gouda hides in a random cavern inside one of the mid-radius
 // wheels (goldBand) and is NOT shown on the compass. Search, listen for
@@ -2102,7 +2102,7 @@ export async function buildGoudaWorld(
   difficulty = Math.min(3, Math.max(1, opts.difficulty ?? difficulty));
   // The game always builds the shipped tables; the worldgen bench passes
   // its live-edited WorldRecipe here to preview a layout for real.
-  const world = opts.world ?? DEFAULT_WORLD;
+  const world = opts.world ?? WHEEL_WORLD;
 
   const errors = validateWorld(world);
   if (errors.length) throw new Error(`worldgen: ${errors.join("; ")}`);
