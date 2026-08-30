@@ -33,19 +33,16 @@
 // on that single chunk. Collision stays exact because the same dig list is
 // part of the chunk's SDF. The world is fully destructible.
 //
-// ONION MAP (~R 330) — nine biomes, outside → in. A run to the gold should
-// take 10–20 minutes through two sealed walls and three maze biomes:
-//   the drift     (285–330)  sparse pale blocks, first silhouettes
-//   the reef      (240–290)  fields of thin slabs with big through-holes —
-//                            weave between and through the plates
-//   the scree     (205–245)  dense belt of small cut blocks
-//   the warrens   (175–205)  speleology: long tangled narrow tunnels
-//   the crust     (~150)     SEALED WALL #1 — many giant fused hunks,
-//                            passable only through their tunnel complexes
-//   the galleries (95–130)   cathedral wheels: huge chambers, wide tunnels
-//   the bulwark   (~78)      SEALED WALL #2 — tighter, meaner
-//   the hollows   (38–58)    cramped approach wheels
-//   the heart     (0)        colossal hunk, a grand cavern — and a DECOY
+// THE MAP (cheese-parts.md §3) — six biomes, two seals, outside → in:
+//   the drift      (240–300)  emmental debris clustered against the Wheel
+//   the Great Wheel (R 233)   SEAL #1 — hull husk, drilled at a soft spot
+//   the dark veins (100–226)  sightline-chained roquefort floats; the
+//                             edge-glow trail IS the navigation
+//   the melt shell (R 91)     SEAL #2 — undrillable sphere husk with ONE
+//                             generated hidden entrance at the trail's end
+//   the melt        (46–88)   fused fondue cathedral, rhythm hazards
+//   the galleries    (8–46)   fused mite-bored sponge, 1 u squeezes
+//   the heart          (0)    one fresh-curd room, the gold
 //
 // Dead-end chambers sealed by deliberately thin walls are marked with a
 // crack-glow (getBlastPoints()) — dig or (future) blast through them.
@@ -69,8 +66,8 @@ import {
   type ZoneName,
 } from "./recipes.ts";
 
-// Module-scope radii read the DEFAULT tables — the game always plays the
-// shipped recipes; WorldRecipe overrides exist for the worldgen bench only.
+// Module-scope radii read the shipped tables — the game always plays
+// WHEEL_WORLD; WorldRecipe overrides exist for the worldgen bench only.
 export const WORLD_R = WHEEL_WORLD.worldR; // outer edge of the drift
 export const BOUNDARY_R = WHEEL_WORLD.boundaryR; // visible map boundary veil
 export const HEART_POS = { x: 0, y: 0, z: 0 }; // map center — a DECOY.
@@ -165,7 +162,6 @@ export interface ChunkSpec {
   label: string;
   zone: ZoneName;
   part: PartRecipe;
-  axis?: Vec3; // radial through-route direction (shell placements)
   body?: LayerBody; // layer-body tile (fused/hull placements)
 }
 
@@ -177,10 +173,22 @@ export interface SpinePoint {
   r: number; // frame radius of the boundary it sits on
 }
 
+// The melt shell's hidden entrance (WG-08): a single generator-carved bore,
+// angled off radial and recessed. `surface` is the point on the husk,
+// `mouth`/`inner` the bore capsule's endpoints (outside/inside).
+export interface EntranceSpec {
+  surface: Vec3;
+  mouth: Vec3;
+  inner: Vec3;
+  r: number;
+}
+
 export interface WorldPlan {
   specs: ChunkSpec[];
   spine: SpinePoint[];
   softSpots: SoftSpot[];
+  entrance: EntranceSpec | null;
+  wreckPos: Vec3 | null; // the drowned bathyscaphe + driller (WG-05/WG-11)
 }
 
 interface Debris {
@@ -290,7 +298,7 @@ function smoothMin(a: number, b: number, k: number): number {
 // --- World frame (squash + tilt) — layer-body radii are measured here ------------
 
 // Precomputed rotation (tilt about X) + vertical squash. null = identity,
-// and the identity path must not touch the numbers (classic-onion compat).
+// and the identity path must not touch the numbers.
 export interface WorldFrame {
   cos: number;
   sin: number;
@@ -355,6 +363,9 @@ export interface LayerBody {
   ridgeAmp: number;
   ridgeFreq: number;
   softSpots: SoftSpot[];
+  // Hull hidden entrance (WG-08), world-space carves owned by THIS layer —
+  // sealed tiles refuse foreign carves, but the door belongs to the seal.
+  entranceCarves?: { holes: SphereCarve[]; tunnels: Tunnel[] };
 }
 
 // The hull's FULL solid (wheel/sphere before hollowing) — the husk is
@@ -583,8 +594,8 @@ export function effectiveTunnelRadius(
   );
 }
 
-// One PartRecipe → one chunk's SDF params. `axis` (from shell placements)
-// forces a radial through-route; `ctx` carries difficulty + blast-marker sink.
+// One PartRecipe → one chunk's SDF params. `ctx` carries difficulty + the
+// blast-marker sink.
 export function makeChunkData(
   rng: Rng,
   center: THREE.Vector3,
@@ -592,7 +603,6 @@ export function makeChunkData(
   res: number,
   part: PartRecipe,
   ctx: GenCtx,
-  axis: Vec3 | null = null,
 ): Chunk {
   const cell = 2 / res;
   const minTunnelR = (part.narrow ? 2.2 : 2.6) * cell;
@@ -765,34 +775,6 @@ export function makeChunkData(
       tr(0.07 + 0.03 * rng()),
       0,
     );
-  }
-
-  // Radial through-route for wall chunks.
-  if (axis) {
-    const a = axis;
-    for (const sign of [1, -1]) {
-      let best = eyes[0],
-        bestDot = -Infinity;
-      for (const e of eyes) {
-        const dot = sign * (e.x * a.x + e.y * a.y + e.z * a.z);
-        if (dot > bestDot) {
-          bestDot = dot;
-          best = e;
-        }
-      }
-      addTunnel(
-        c,
-        rng,
-        best,
-        {
-          x: sign * a.x * (R0 + 0.28) * sx,
-          y: sign * a.y * (R0 + 0.28) * sy,
-          z: sign * a.z * (R0 + 0.28) * sz,
-        },
-        tr(0.09 + 0.03 * rng()),
-        0,
-      );
-    }
   }
 
   // Dead-end chambers behind thin marked walls (dig/blast through).
@@ -1343,36 +1325,167 @@ function computeSpine(
   return pts;
 }
 
-// BiomeRecipe placements → chunk layout, in table order (inside → out).
-// The rng stream is a pure function of the tables: sizeVar 0 and single-part
-// biomes consume no rng, so the default tables reproduce the v3 worlds.
-function placeChunks(rng: Rng, world: WorldRecipe, diff: number): WorldPlan {
+// How far (u) one vein chunk reads from the last — the sightline placement
+// budget AND the trail-validation radius (WG-07).
+export const SIGHT_RANGE = 40;
+
+// Hull LayerBody skeleton from a recipe — pure data, NO rng (the caller
+// fills nOff). Also used rng-free for placement guards and occlusion.
+function makeHullBody(
+  pl: Extract<BiomePlacement, { mode: "hull" }>,
+  frame: WorldFrame | null,
+): LayerBody {
+  const squash = frame?.squash ?? 1;
+  return {
+    kind: "hull",
+    frame,
+    nOff: 0,
+    rMin: 0,
+    rMax: pl.radius,
+    warpAmp: 0,
+    warpFreq: 0,
+    surface: pl.surface,
+    R: pl.radius,
+    halfH:
+      pl.surface === "sphere"
+        ? pl.radius
+        : Math.max(pl.radius * squash, pl.rim + pl.thickness + 6),
+    rim: pl.rim,
+    thickness: pl.thickness,
+    ridgeAmp: pl.ridgeAmp,
+    ridgeFreq: pl.ridgeFreq,
+    softSpots: [],
+  };
+}
+
+// BiomeRecipe placements → chunk layout, in table order. The rng stream is a
+// pure function of the tables — draw order is part of the world format.
+function placeChunks(rng: Rng, world: WorldRecipe, _diff: number): WorldPlan {
   const frame = makeFrame(world.frame);
   const specs: ChunkSpec[] = [];
   const softSpots: SoftSpot[] = [];
   const spine = computeSpine(rng, world, frame);
+  let entrance: EntranceSpec | null = null;
   const size = (b: BiomeRecipe) =>
     b.sizeVar > 0 ? b.sizeBase + rng() * b.sizeVar : b.sizeBase;
 
-  // Scattered band: rejection-sample against same-zone spacing (guard) and
-  // the heart; shrink the chunk when a band is too crowded to fit it.
+  // Every hull in the recipe, rng-free (hullSolidSdf never reads nOff):
+  // scattered chunks must not embed in a husk, and a sphere hull excludes
+  // its whole ball (it seals an inner sanctum). Also the occlusion targets.
+  const hullGuards = world.biomes.flatMap((b) =>
+    b.placement.mode === "hull"
+      ? [
+          {
+            body: makeHullBody(b.placement, frame),
+            sphere: b.placement.surface === "sphere",
+          },
+        ]
+      : [],
+  );
+  const guardDist = (x: number, y: number, z: number): number => {
+    let best = Infinity;
+    for (const g of hullGuards) {
+      const solid = hullSolidSdf(g.body, x, y, z);
+      const d = g.sphere ? solid : Math.max(solid, -solid - g.body.thickness);
+      if (d < best) best = d;
+    }
+    return best;
+  };
+  // Does the segment a→b cross a husk? Sphere-trace on the husk SDFs.
+  const huskBlocked = (a: Vec3, b: Vec3): boolean => {
+    if (!hullGuards.length) return false;
+    const dx = b.x - a.x,
+      dy = b.y - a.y,
+      dz = b.z - a.z;
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 1e-6) return false;
+    const ux = dx / len,
+      uy = dy / len,
+      uz = dz / len;
+    for (let t = 0; t < len; ) {
+      const px = a.x + ux * t,
+        py = a.y + uy * t,
+        pz = a.z + uz * t;
+      let d = Infinity;
+      for (const g of hullGuards) {
+        const solid = hullSolidSdf(g.body, px, py, pz);
+        const husk = Math.max(solid, -solid - g.body.thickness);
+        if (husk < d) d = husk;
+      }
+      if (d < 0.4) return true;
+      t += Math.max(0.8, d * 0.8);
+    }
+    return false;
+  };
+
+  // Scattered band: rejection-sample against same-zone spacing (guard), the
+  // heart, and the hull guards; shrink the chunk when a band is too crowded.
+  // sizeGrade (WG-06): size tracks band position, one jitter draw per chunk
+  // in the old size() slot keeps the draw order fixed. sightline (WG-07): a
+  // candidate is accepted only if an already-placed same-zone chunk (or, for
+  // the first, a hull soft spot) reads within SIGHT_RANGE, hull-occlusion
+  // checked; odd attempts sample anchor-centred instead of band-uniform so
+  // the chain can grow from a sparse anchor set — both go through the SAME
+  // acceptance checks.
   const tryBand = (
     biome: BiomeRecipe,
     pl: Extract<BiomePlacement, { mode: "band" }>,
   ) => {
-    let s = size(biome);
+    const jitter = biome.sizeVar > 0 ? rng() : 0;
     const part = pickPart(world, biome, rng);
-    for (let shrink = 0; shrink < 4; shrink++, s *= 0.9) {
+    const span = pl.rMax - pl.rMin;
+    const anchors: { x: number; y: number; z: number; pad: number }[] = [];
+    if (pl.sightline) {
+      for (const sp of specs)
+        if (sp.zone === biome.id)
+          anchors.push({
+            x: sp.center.x,
+            y: sp.center.y,
+            z: sp.center.z,
+            pad: sp.s * R0,
+          });
+      for (const sp of softSpots)
+        anchors.push({ x: sp.x, y: sp.y, z: sp.z, pad: sp.r });
+    }
+    for (let shrink = 0; shrink < 4; shrink++) {
+      const shrinkMul = 0.9 ** shrink;
       for (let attempt = 0; attempt < 500; attempt++) {
-        randDir(rng, _dir);
-        let u = rng();
-        if (pl.densityGrade === "outward") u = Math.sqrt(u);
-        else if (pl.densityGrade === "inward") u = 1 - Math.sqrt(1 - u);
-        const rad = pl.rMin + u * (pl.rMax - pl.rMin);
-        const p = frameToWorld(
-          frame,
-          new THREE.Vector3(_dir.x * rad, _dir.y * rad, _dir.z * rad),
-        );
+        let p: THREE.Vector3;
+        let rad: number;
+        if (pl.sightline && anchors.length && attempt % 2 === 1) {
+          const a = anchors[Math.floor(rng() * anchors.length)];
+          randDir(rng, _dir);
+          const reach = a.pad + rng() * SIGHT_RANGE;
+          p = new THREE.Vector3(
+            a.x + _dir.x * reach,
+            a.y + _dir.y * reach,
+            a.z + _dir.z * reach,
+          );
+          rad = frameRadius(frame, p.x, p.y, p.z);
+          if (rad < pl.rMin || rad > pl.rMax) continue;
+        } else {
+          randDir(rng, _dir);
+          let u = rng();
+          if (pl.densityGrade === "outward") u = Math.sqrt(u);
+          else if (pl.densityGrade === "inward") u = 1 - Math.sqrt(1 - u);
+          rad = pl.rMin + u * span;
+          p = frameToWorld(
+            frame,
+            new THREE.Vector3(_dir.x * rad, _dir.y * rad, _dir.z * rad),
+          );
+        }
+        let s: number;
+        if (pl.sizeGrade) {
+          const t = (rad - pl.rMin) / span;
+          const g = pl.sizeGrade === "inward" ? 1 - t : t;
+          s =
+            (biome.sizeBase + biome.sizeVar * g) *
+            (0.9 + 0.2 * jitter) *
+            shrinkMul;
+        } else {
+          s = (biome.sizeBase + jitter * biome.sizeVar) * shrinkMul;
+        }
+        if (guardDist(p.x, p.y, p.z) < s * R0 + 2) continue;
         let ok = true;
         for (const other of specs) {
           const g =
@@ -1386,54 +1499,40 @@ function placeChunks(rng: Rng, world: WorldRecipe, diff: number): WorldPlan {
             break;
           }
         }
-        if (ok) {
-          specs.push({
-            center: p,
-            s,
-            res: biome.res,
-            label: biome.label,
-            zone: biome.id,
-            part,
-          });
-          return;
+        if (!ok) continue;
+        if (pl.sightline) {
+          let seen = false;
+          for (const a of anchors) {
+            const ax = a.x - p.x,
+              ay = a.y - p.y,
+              az = a.z - p.z;
+            const dist = Math.hypot(ax, ay, az);
+            if (dist - s * R0 - a.pad > SIGHT_RANGE) continue;
+            // Trace short of the anchor's own surface — a soft spot SITS on
+            // the husk, tracing into it would occlude every candidate.
+            const cut = Math.min(dist, a.pad + 1.5) / (dist || 1);
+            const b = {
+              x: a.x - ax * cut,
+              y: a.y - ay * cut,
+              z: a.z - az * cut,
+            };
+            if (!huskBlocked({ x: p.x, y: p.y, z: p.z }, b)) {
+              seen = true;
+              break;
+            }
+          }
+          if (!seen) continue;
         }
+        specs.push({
+          center: p,
+          s,
+          res: biome.res,
+          label: biome.label,
+          zone: biome.id,
+          part,
+        });
+        return;
       }
-    }
-  };
-
-  // A fibonacci shell of fused wall chunks with radial through-routes.
-  const shell = (
-    biome: BiomeRecipe,
-    pl: Extract<BiomePlacement, { mode: "shell" }>,
-  ) => {
-    const GOLDEN = 2.399963229728653;
-    const n = pl.count + (diff - 1) * pl.perDifficulty;
-    for (let i = 0; i < n; i++) {
-      const y = 1 - (2 * (i + 0.5)) / n;
-      const r = Math.sqrt(Math.max(0, 1 - y * y));
-      const th = i * GOLDEN;
-      const axis = new THREE.Vector3(
-        Math.cos(th) * r + (rng() - 0.5) * 0.08,
-        y + (rng() - 0.5) * 0.08,
-        Math.sin(th) * r + (rng() - 0.5) * 0.08,
-      ).normalize();
-      const rad = pl.radius + (rng() - 0.5) * 4;
-      const colossal = pl.colossalEvery > 0 && i % pl.colossalEvery === 0;
-      const s = colossal
-        ? biome.sizeBase +
-          biome.sizeVar +
-          pl.colossalBonus +
-          rng() * pl.colossalVar
-        : size(biome);
-      specs.push({
-        center: axis.clone().multiplyScalar(rad),
-        s,
-        res: colossal ? pl.colossalRes : biome.res,
-        label: colossal ? `a colossal wheel` : biome.label,
-        zone: biome.id,
-        part: pickPart(world, biome, rng),
-        axis: { x: axis.x, y: axis.y, z: axis.z },
-      });
     }
   };
 
@@ -1523,8 +1622,6 @@ function placeChunks(rng: Rng, world: WorldRecipe, diff: number): WorldPlan {
         zone: biome.id,
         part: pickPart(world, biome, rng),
       });
-    } else if (pl.mode === "shell") {
-      shell(biome, pl);
     } else if (pl.mode === "band") {
       for (let i = 0; i < pl.count; i++) tryBand(biome, pl);
     } else if (pl.mode === "fused") {
@@ -1547,27 +1644,8 @@ function placeChunks(rng: Rng, world: WorldRecipe, diff: number): WorldPlan {
       };
       tileLayer(biome, body);
     } else {
-      const squash = frame?.squash ?? 1;
-      const body: LayerBody = {
-        kind: "hull",
-        frame,
-        nOff: rng() * 100,
-        rMin: 0,
-        rMax: pl.radius,
-        warpAmp: 0,
-        warpFreq: 0,
-        surface: pl.surface,
-        R: pl.radius,
-        halfH:
-          pl.surface === "sphere"
-            ? pl.radius
-            : Math.max(pl.radius * squash, pl.rim + pl.thickness + 6),
-        rim: pl.rim,
-        thickness: pl.thickness,
-        ridgeAmp: pl.ridgeAmp,
-        ridgeFreq: pl.ridgeFreq,
-        softSpots: [],
-      };
+      const body = makeHullBody(pl, frame);
+      body.nOff = rng() * 100;
       // Soft spot #1 rides the spine; the rest are seeded on the surface.
       for (let i = 0; i < pl.softSpots; i++) {
         let near: SpinePoint | null = null;
@@ -1588,11 +1666,114 @@ function placeChunks(rng: Rng, world: WorldRecipe, diff: number): WorldPlan {
         body.softSpots.push(spot);
         softSpots.push(spot);
       }
+      // WG-08: the ONE hidden entrance — bored at the terminus of the
+      // sightline trail (fallback: the spine crossing), angled 55° off
+      // radial and recessed behind a rim pocket so it never reads as a
+      // silhouette. Draws: one randDir for the bore tangent (re-drawn
+      // while degenerate against the normal).
+      if (pl.entrance) {
+        let tx = 1,
+          ty = 0,
+          tz = 0;
+        let bestD = Infinity;
+        for (const sp of specs) {
+          const b = world.biomes.find((w) => w.id === sp.zone);
+          const bpl = b?.placement;
+          if (!bpl || bpl.mode !== "band" || !bpl.sightline) continue;
+          const d = Math.abs(
+            hullSolidSdf(body, sp.center.x, sp.center.y, sp.center.z),
+          );
+          if (d < bestD) {
+            bestD = d;
+            tx = sp.center.x;
+            ty = sp.center.y;
+            tz = sp.center.z;
+          }
+        }
+        if (!Number.isFinite(bestD) || bestD === Infinity) {
+          let near: SpinePoint | null = null;
+          for (const p of spine)
+            if (
+              !near ||
+              Math.abs(p.r - pl.radius) < Math.abs(near.r - pl.radius)
+            )
+              near = p;
+          if (near) {
+            tx = near.x;
+            ty = near.y;
+            tz = near.z;
+          }
+        }
+        const fdir = frameDirOf(frame, tx, ty, tz, new THREE.Vector3());
+        const E = projectToHull(body, fdir);
+        const EPS = 0.5;
+        const n = new THREE.Vector3(
+          hullSolidSdf(body, E.x + EPS, E.y, E.z) -
+            hullSolidSdf(body, E.x - EPS, E.y, E.z),
+          hullSolidSdf(body, E.x, E.y + EPS, E.z) -
+            hullSolidSdf(body, E.x, E.y - EPS, E.z),
+          hullSolidSdf(body, E.x, E.y, E.z + EPS) -
+            hullSolidSdf(body, E.x, E.y, E.z - EPS),
+        ).normalize();
+        const tan = new THREE.Vector3();
+        do {
+          randDir(rng, tan);
+          tan.addScaledVector(n, -tan.dot(n));
+        } while (tan.lengthSq() < 0.05);
+        tan.normalize();
+        const OBLIQUE = (55 * Math.PI) / 180;
+        const axis = n
+          .clone()
+          .multiplyScalar(Math.cos(OBLIQUE))
+          .addScaledVector(tan, Math.sin(OBLIQUE))
+          .normalize();
+        const inLen = (pl.thickness + 8) / Math.cos(OBLIQUE);
+        const mouth = E.clone().addScaledVector(axis, 6);
+        const inner = E.clone().addScaledVector(axis, -inLen);
+        const r = pl.entrance.r;
+        body.entranceCarves = {
+          holes: [{ x: E.x - n.x, y: E.y - n.y, z: E.z - n.z, r: r + 0.6 }],
+          tunnels: [
+            {
+              ax: mouth.x,
+              ay: mouth.y,
+              az: mouth.z,
+              bx: inner.x,
+              by: inner.y,
+              bz: inner.z,
+              r,
+            },
+          ],
+        };
+        entrance = {
+          surface: { x: E.x, y: E.y, z: E.z },
+          mouth: { x: mouth.x, y: mouth.y, z: mouth.z },
+          inner: { x: inner.x, y: inner.y, z: inner.z },
+          r,
+        };
+      }
       tileLayer(biome, body);
     }
   }
 
-  return { specs, spine, softSpots };
+  // WG-05: the wreck (bathyscaphe + driller) sits on the spine, mid-drift.
+  // Pure function of spine + tables — no rng.
+  let wreckPos: Vec3 | null = null;
+  const driftBiome = world.biomes.find((b) => b.id === "drift");
+  if (spine.length && driftBiome && driftBiome.placement.mode === "band") {
+    const dp = driftBiome.placement;
+    const dir = frameDirOf(
+      frame,
+      spine[0].x,
+      spine[0].y,
+      spine[0].z,
+      new THREE.Vector3(),
+    );
+    const w = frameToWorld(frame, dir.multiplyScalar((dp.rMin + dp.rMax) / 2));
+    wreckPos = { x: w.x, y: w.y, z: w.z };
+  }
+
+  return { specs, spine, softSpots, entrance, wreckPos };
 }
 
 // Layout-only pass for the worldgen bench's map view: the chunk placement a
@@ -1952,6 +2133,14 @@ export function buildLayerChunks(
   spineLink(opts.spineIn, true);
   spineLink(opts.spineOut, false);
 
+  // WG-08: the hull's own hidden-entrance carves. Sealed tiles refuse only
+  // FOREIGN carves — the door belongs to this layer; shareCarves later
+  // spreads it into the interpenetrating neighbours as usual.
+  if (body.entranceCarves) {
+    holesW.push(...body.entranceCarves.holes);
+    tunnelsW.push(...body.entranceCarves.tunnels);
+  }
+
   // Distribute the world carves into every tile whose marched box they touch.
   const out: Chunk[] = [];
   for (let t = 0; t < specs.length; t++) {
@@ -2049,7 +2238,8 @@ export function buildLayerChunks(
 // Carves must compose across interpenetrating meshes: a tunnel that crosses
 // from a layer tile into an ellipsoid chunk (or into the next layer) has to
 // cut both. Sealed tiles (noCarveWithin) never receive foreign carves.
-// Pairs of plain ellipsoid chunks never share — classic-onion compat.
+// Pairs of plain ellipsoid chunks never share — scatter chunks are
+// independent bodies by design.
 function shareCarves(list: Chunk[]): void {
   const addH: SphereCarve[][] = list.map(() => []);
   const addT: Tunnel[][] = list.map(() => []);
@@ -2248,11 +2438,67 @@ export function buildWorldData(opts: {
         spec.res,
         spec.part,
         ctx,
-        spec.axis ?? null,
       );
       chunk.zone = spec.zone;
       pending.push(chunk);
       i++;
+    }
+  }
+
+  // Entrance connector (WG-08): the hidden bore must open into the inner
+  // network, not dead-end in paste — one straight corridor from the bore's
+  // inner end to the nearest big eye deeper inside the seal. Owned by that
+  // eye's chunk so shareCarves distributes it; draws no rng.
+  if (plan.entrance) {
+    const inn = plan.entrance.inner;
+    const innR = Math.hypot(inn.x, inn.y, inn.z);
+    let host: Chunk | null = null;
+    let hd = Infinity;
+    for (const c of pending) {
+      if (c.sealed || !c.biggestEye) continue;
+      const ex = c.center.x + c.biggestEye.x * c.s,
+        ey = c.center.y + c.biggestEye.y * c.s,
+        ez = c.center.z + c.biggestEye.z * c.s;
+      if (Math.hypot(ex, ey, ez) > innR + 2) continue;
+      const d = Math.hypot(ex - inn.x, ey - inn.y, ez - inn.z);
+      if (d < hd) {
+        hd = d;
+        host = c;
+      }
+    }
+    if (host) {
+      const e = host.biggestEye!;
+      const bx = host.center.x + e.x * host.s,
+        by = host.center.y + e.y * host.s,
+        bz = host.center.z + e.z * host.s;
+      const r = plan.entrance.r;
+      // Distribute into every non-sealed tile the corridor touches — same-
+      // layer tiles never exchange carves in shareCarves, so this must be
+      // spread by hand (same box + pad rule as the layer distribution).
+      for (const c of pending) {
+        if (c.sealed) continue;
+        const s = c.s;
+        const cellW = (2 * s) / c.res;
+        const pad = SMOOTH_K * s + 2 * cellW + r;
+        if (
+          Math.max(inn.x, bx) + pad < c.center.x - (s - cellW) ||
+          Math.min(inn.x, bx) - pad > c.center.x + (s - 2 * cellW) ||
+          Math.max(inn.y, by) + pad < c.center.y - (s - cellW) ||
+          Math.min(inn.y, by) - pad > c.center.y + (s - 2 * cellW) ||
+          Math.max(inn.z, bz) + pad < c.center.z - (s - cellW) ||
+          Math.min(inn.z, bz) - pad > c.center.z + (s - 2 * cellW)
+        )
+          continue;
+        c.tunnels.push({
+          ax: (inn.x - c.center.x) / s,
+          ay: (inn.y - c.center.y) / s,
+          az: (inn.z - c.center.z) / s,
+          bx: (bx - c.center.x) / s,
+          by: (by - c.center.y) / s,
+          bz: (bz - c.center.z) / s,
+          r: r / s,
+        });
+      }
     }
   }
 
@@ -2367,8 +2613,7 @@ export async function buildGoudaWorld(
   // them to re-mesh chunks at runtime.
 
   const crumbGeos = data.debrisNoiseOffsets.map(makeDebrisGeometry);
-  const crumbMaterial =
-    materials.scree ?? materials.drift ?? materials[world.biomes[0].id]!;
+  const crumbMaterial = materials.drift ?? materials[world.biomes[0].id]!;
   for (const spec of data.debris) {
     const crumb = new THREE.Mesh(crumbGeos[spec.geoIndex], crumbMaterial);
     crumb.position.copy(spec.center);

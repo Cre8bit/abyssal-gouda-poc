@@ -1,6 +1,5 @@
 // worldgen.ts — the cheese kit's authoring bench (M2), served at
-// /worldgen.html. Edits live WorldRecipe copies (persisted to localStorage,
-// one per world table: the classic onion and the Great Wheel MVP map)
+// /worldgen.html. Edits a live WorldRecipe copy (persisted to localStorage)
 // through three views, all driven by the REAL generator in world/gouda.ts:
 //
 //   part   one CheesePartType at the origin — every PartRecipe field on a
@@ -8,9 +7,10 @@
 //   biome  a representative wedge of one biome — placement density, sizes,
 //          part mix, wax material; fused/hull biomes show real lattice
 //          tiles with their inter-tile carve network
-//   map    the whole onion as instant proxies (spheres for scattered
-//          chunks, boxes for layer tiles, the hull silhouette, the spine
-//          and soft spots); or the real full build via buildGoudaWorld()
+//   map    the whole map as instant proxies (spheres for scattered
+//          chunks, boxes for layer tiles, hull silhouettes, the spine,
+//          soft spots, the vein trail chain and the shell entrance); or
+//          the real full build via buildGoudaWorld()
 //
 // The panel is CATEGORIZED: a mode row (part/biome/map + world table), a
 // generate block, a subject picker with its mood line, then per-category
@@ -46,9 +46,9 @@ import {
   type GenCtx,
   type WorldPlan,
 } from "../world/gouda.ts";
+import { traceTrail } from "../world/verify.ts";
 import {
   cloneWorld,
-  DEFAULT_WORLD,
   pickPart,
   validateWorld,
   WHEEL_WORLD,
@@ -73,9 +73,8 @@ import {
 
 const $ = (id: string) => document.getElementById(id) as HTMLElement;
 
-const STORAGE_KEY = "abyssal.worldgen.v2";
-const LEGACY_KEY = "abyssal.worldgen.v1";
-const RES_CHOICES = [32, 48, 64, 96];
+const STORAGE_KEY = "abyssal.worldgen.v3";
+const RES_CHOICES = [32, 48, 56, 64, 72, 96];
 const KINDS: PartKind[] = ["wheel", "hunk", "block", "slab", "column"];
 const HALF_RES: Record<number, number> = {
   96: 48,
@@ -86,12 +85,10 @@ const HALF_RES: Record<number, number> = {
   32: 32,
 };
 const WORLD_DEFAULTS: Record<string, WorldRecipe> = {
-  onion: DEFAULT_WORLD,
   wheel: WHEEL_WORLD,
 };
 const WORLD_LABELS: Record<string, string> = {
-  onion: "classic onion",
-  wheel: "great wheel (mvp)",
+  wheel: "great wheel",
 };
 
 // --- Working config ----------------------------------------------------------
@@ -104,32 +101,22 @@ interface Store {
 
 function freshStore(): Store {
   return {
-    v: 2,
+    v: 3,
     active: "wheel",
     worlds: {
-      onion: cloneWorld(DEFAULT_WORLD),
       wheel: cloneWorld(WHEEL_WORLD),
     },
   };
 }
 
+// Older stores (v1/v2) carried the retired classic-onion schema — they are
+// not migrated, a fresh copy of the shipped tables replaces them.
 function loadStore(): Store {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) {
       const data = JSON.parse(raw) as Store;
-      if (data.v === 2 && data.worlds?.onion && data.worlds?.wheel) return data;
-    }
-    // v1 held a single (classic) world — carry it over as "onion".
-    const legacy = localStorage.getItem(LEGACY_KEY);
-    if (legacy) {
-      const data = JSON.parse(legacy) as { v?: number; world?: WorldRecipe };
-      if (data.v === 1 && data.world?.parts?.length) {
-        const store = freshStore();
-        store.active = "onion";
-        store.worlds.onion = data.world;
-        return store;
-      }
+      if (data.v === 3 && data.worlds?.wheel) return data;
     }
   } catch {
     // fall through to defaults
@@ -653,13 +640,13 @@ async function rebuildBiome(): Promise<void> {
   const rng = mulberry32(view.seed >>> 0);
   const ctx = { difficulty: view.difficulty, blastPoints: [] as Vec3[] };
 
-  // Wedge chunk placement — same spacing rules as the real placeChunks.
+  // Wedge chunk placement — same spacing/size rules as the real placeChunks
+  // (sightline is a whole-map property; the map view draws the real chain).
   interface Placed {
     center: THREE.Vector3;
     s: number;
     res: number;
     part: PartRecipe;
-    axis: Vec3 | null;
   }
   const placed: Placed[] = [];
   const dir = new THREE.Vector3();
@@ -672,24 +659,33 @@ async function rebuildBiome(): Promise<void> {
       s: biome.sizeBase + (biome.sizeVar > 0 ? rng() * biome.sizeVar : 0),
       res: biome.res,
       part: pickPart(world, biome, rng),
-      axis: null,
     });
-  } else if (pl.mode === "band") {
+  } else {
     rMid = (pl.rMin + pl.rMax) / 2;
+    const span = pl.rMax - pl.rMin;
     want = Math.max(2, Math.round(pl.count * coneFrac));
     for (let i = 0; i < want; i++) {
-      let s =
-        biome.sizeVar > 0
-          ? biome.sizeBase + rng() * biome.sizeVar
-          : biome.sizeBase;
+      const jitter = biome.sizeVar > 0 ? rng() : 0;
       const part = pickPart(world, biome, rng);
-      placing: for (let shrink = 0; shrink < 4; shrink++, s *= 0.9) {
+      placing: for (let shrink = 0; shrink < 4; shrink++) {
+        const shrinkMul = 0.9 ** shrink;
         for (let attempt = 0; attempt < 300; attempt++) {
           randDirIn(rng, cosTheta, dir);
           let u = rng();
           if (pl.densityGrade === "outward") u = Math.sqrt(u);
           else if (pl.densityGrade === "inward") u = 1 - Math.sqrt(1 - u);
-          const rad = pl.rMin + u * (pl.rMax - pl.rMin);
+          const rad = pl.rMin + u * span;
+          let s: number;
+          if (pl.sizeGrade) {
+            const t = (rad - pl.rMin) / span;
+            const g = pl.sizeGrade === "inward" ? 1 - t : t;
+            s =
+              (biome.sizeBase + biome.sizeVar * g) *
+              (0.9 + 0.2 * jitter) *
+              shrinkMul;
+          } else {
+            s = (biome.sizeBase + jitter * biome.sizeVar) * shrinkMul;
+          }
           const p = new THREE.Vector3(dir.x * rad, dir.y * rad, dir.z * rad);
           let ok = true;
           for (const other of placed)
@@ -698,43 +694,12 @@ async function rebuildBiome(): Promise<void> {
               break;
             }
           if (ok) {
-            placed.push({ center: p, s, res: biome.res, part, axis: null });
+            placed.push({ center: p, s, res: biome.res, part });
             break placing;
           }
         }
       }
     }
-  } else {
-    // Shell: the real fibonacci lattice, filtered to the wedge cone.
-    rMid = pl.radius;
-    const n = pl.count + (view.difficulty - 1) * pl.perDifficulty;
-    const GOLDEN = 2.399963229728653;
-    for (let i = 0; i < n; i++) {
-      const y = 1 - (2 * (i + 0.5)) / n;
-      const r = Math.sqrt(Math.max(0, 1 - y * y));
-      const th = i * GOLDEN;
-      const axis = new THREE.Vector3(
-        Math.cos(th) * r + (rng() - 0.5) * 0.08,
-        y + (rng() - 0.5) * 0.08,
-        Math.sin(th) * r + (rng() - 0.5) * 0.08,
-      ).normalize();
-      if (axis.z < cosTheta) continue;
-      const colossal = pl.colossalEvery > 0 && i % pl.colossalEvery === 0;
-      const s = colossal
-        ? biome.sizeBase +
-          biome.sizeVar +
-          pl.colossalBonus +
-          rng() * pl.colossalVar
-        : biome.sizeBase + rng() * biome.sizeVar;
-      placed.push({
-        center: axis.clone().multiplyScalar(pl.radius + (rng() - 0.5) * 4),
-        s,
-        res: colossal ? pl.colossalRes : biome.res,
-        part: pickPart(world, biome, rng),
-        axis: { x: axis.x, y: axis.y, z: axis.z },
-      });
-    }
-    want = placed.length || 1;
   }
 
   const group = new THREE.Group();
@@ -749,7 +714,7 @@ async function rebuildBiome(): Promise<void> {
     await tick();
     if (token !== buildToken) return; // superseded by a newer rebuild
     const c = placed[i];
-    const chunk = makeChunkData(rng, c.center, c.s, c.res, c.part, ctx, c.axis);
+    const chunk = makeChunkData(rng, c.center, c.s, c.res, c.part, ctx);
     const mesh = meshChunk(chunk, c.res, mat);
     chunk.field = null;
     // Walk collision runs in world coords — bake the wedge recentre in.
@@ -768,15 +733,10 @@ async function rebuildBiome(): Promise<void> {
   const extent =
     pl.mode === "center"
       ? biome.sizeBase * 2.1
-      : pl.mode === "band"
-        ? Math.max(
-            pl.rMax - pl.rMin + biome.sizeBase * 2 + 30,
-            1.6 * pl.rMax * sinTheta,
-          )
-        : Math.max(
-            (biome.sizeBase + biome.sizeVar) * 2.6,
-            1.6 * pl.radius * sinTheta,
-          );
+      : Math.max(
+          pl.rMax - pl.rMin + biome.sizeBase * 2 + 30,
+          1.6 * pl.rMax * sinTheta,
+        );
   clipScale = extent * 0.5;
   gridSmall.position.y = -extent * 0.45;
   frameCamera(Math.min(extent * 1.1, 700));
@@ -876,7 +836,7 @@ async function rebuildLayerWedge(
   ]);
 }
 
-// --- Map view (the onion arranging itself) -----------------------------------------
+// --- Map view (the whole map arranging itself) ---------------------------------
 
 const proxyGeo = new THREE.SphereGeometry(1, 14, 10);
 const boxGeo = new THREE.BoxGeometry(2, 2, 2);
@@ -982,6 +942,49 @@ function rebuildMapProxies(): void {
     }
   }
 
+  // The vein trail chain (WG-07): linking hops green, out-of-range red.
+  const trail = traceTrail(world, plan);
+  if (trail) {
+    const draw = (ok: boolean, color: number) => {
+      const pts: THREE.Vector3[] = [];
+      for (const e of trail.edges)
+        if (e.ok === ok)
+          pts.push(
+            new THREE.Vector3(e.a.x, e.a.y, e.a.z),
+            new THREE.Vector3(e.b.x, e.b.y, e.b.z),
+          );
+      if (!pts.length) return;
+      const geo = new THREE.BufferGeometry().setFromPoints(pts);
+      const mat = new THREE.LineBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.75,
+      });
+      disposables.push(geo, mat);
+      group.add(new THREE.LineSegments(geo, mat));
+    };
+    draw(true, 0x4ade80);
+    draw(false, 0xef4444);
+  }
+  // The melt-shell entrance (WG-08) + the wreck (WG-05).
+  if (plan.entrance) {
+    const em = new THREE.MeshBasicMaterial({ color: 0x34e5e5 });
+    disposables.push(em);
+    const e = plan.entrance;
+    const marker = new THREE.Mesh(proxyGeo, em);
+    marker.position.set(e.surface.x, e.surface.y, e.surface.z);
+    marker.scale.setScalar(3);
+    group.add(marker);
+  }
+  if (plan.wreckPos) {
+    const wm = new THREE.MeshBasicMaterial({ color: 0x9ca3af });
+    disposables.push(wm);
+    const marker = new THREE.Mesh(proxyGeo, wm);
+    marker.position.set(plan.wreckPos.x, plan.wreckPos.y, plan.wreckPos.z);
+    marker.scale.setScalar(3);
+    group.add(marker);
+  }
+
   // World radii: gold band (gold), world edge + boundary veil (teal).
   const rings: [number, number, number][] = [
     [world.goldBand.min, 0xffd24a, 0.1],
@@ -1021,6 +1024,13 @@ function rebuildMapProxies(): void {
   ];
   if (plan.spine.length)
     lines.push(["spine", plan.spine.map((p) => p.r.toFixed(0)).join(" → ")]);
+  if (trail)
+    lines.push([
+      "trail",
+      `${trail.linked} linked, ${trail.orphans} orphans, ` +
+        `entrance ${trail.reachesEntrance ? "✓" : "✗"}`,
+      trail.reachesEntrance && trail.orphans <= 3 ? "ok" : "bad",
+    ]);
   for (const biome of world.biomes)
     lines.push([biome.id, String(counts.get(biome.id) ?? 0)]);
   setHud("map · layout proxies", lines);
@@ -1034,12 +1044,7 @@ async function buildRealWorld(): Promise<void> {
   // Optional res downshift so full-world iteration stays quick.
   const buildWorld = cloneWorld(world);
   if (view.buildHalfRes)
-    for (const biome of buildWorld.biomes) {
-      biome.res = HALF_RES[biome.res] ?? 32;
-      if (biome.placement.mode === "shell")
-        biome.placement.colossalRes =
-          HALF_RES[biome.placement.colossalRes] ?? 32;
-    }
+    for (const biome of buildWorld.biomes) biome.res = HALF_RES[biome.res] ?? 32;
 
   const t0 = performance.now();
   try {
@@ -1575,12 +1580,6 @@ function buildPartCat(panel: HTMLElement, cat: string): void {
       }, 0),
     );
   markOn(hardBtns, String(part.hardness));
-  sliderRow(axes, "porosity", 0, 1, 0.05, part.porosity, (v) =>
-    edit(() => (part.porosity = v), 400),
-  );
-  sliderRow(axes, "odour", 0, 1, 0.05, part.odour, (v) =>
-    edit(() => (part.odour = v), 400),
-  );
 
   const text = section(panel, "Mood & description").parentElement!;
   textRow(
@@ -1646,7 +1645,7 @@ function buildBiomeCat(panel: HTMLElement, cat: string): void {
       const gradeRow = place.querySelector(".row") as HTMLElement;
       const gradeBtns: Record<string, HTMLButtonElement> = {};
       for (const g of ["none", "outward", "inward"])
-        gradeBtns[g] = button(gradeRow, g, () =>
+        gradeBtns[g] = button(gradeRow, `den ${g}`, () =>
           edit(() => {
             if (g === "none") delete pl.densityGrade;
             else pl.densityGrade = g as "outward" | "inward";
@@ -1654,57 +1653,24 @@ function buildBiomeCat(panel: HTMLElement, cat: string): void {
           }, 0),
         );
       markOn(gradeBtns, pl.densityGrade ?? "none");
-    } else if (pl.mode === "shell") {
-      sliderRow(
-        place,
-        "radius",
-        20,
-        400,
-        1,
-        pl.radius,
-        (v) => edit(() => (pl.radius = v)),
-        int,
+      const sizeBtns: Record<string, HTMLButtonElement> = {};
+      for (const g of ["none", "outward", "inward"])
+        sizeBtns[g] = button(gradeRow, `size ${g}`, () =>
+          edit(() => {
+            if (g === "none") delete pl.sizeGrade;
+            else pl.sizeGrade = g as "outward" | "inward";
+            markOn(sizeBtns, g);
+          }, 0),
+        );
+      markOn(sizeBtns, pl.sizeGrade ?? "none");
+      const sightBtn = button(gradeRow, "sightline", (b) =>
+        edit(() => {
+          if (pl.sightline) delete pl.sightline;
+          else pl.sightline = true;
+          b.classList.toggle("on", !!pl.sightline);
+        }, 0),
       );
-      sliderRow(
-        place,
-        "count",
-        4,
-        96,
-        1,
-        pl.count,
-        (v) => edit(() => (pl.count = v)),
-        int,
-      );
-      sliderRow(
-        place,
-        "+/difficulty",
-        0,
-        12,
-        1,
-        pl.perDifficulty,
-        (v) => edit(() => (pl.perDifficulty = v)),
-        int,
-      );
-      sliderRow(
-        place,
-        "colossal Nth",
-        0,
-        24,
-        1,
-        pl.colossalEvery,
-        (v) => edit(() => (pl.colossalEvery = v)),
-        int,
-      );
-      sliderRow(
-        place,
-        "colossal +u",
-        0,
-        40,
-        1,
-        pl.colossalBonus,
-        (v) => edit(() => (pl.colossalBonus = v)),
-        int,
-      );
+      sightBtn.classList.toggle("on", !!pl.sightline);
     } else if (pl.mode === "fused") {
       rangePair(
         place,
@@ -1782,6 +1748,20 @@ function buildBiomeCat(panel: HTMLElement, cat: string): void {
       );
       sliderRow(place, "ridge freq", 0.05, 2, 0.05, pl.ridgeFreq, (v) =>
         edit(() => (pl.ridgeFreq = v)),
+      );
+      sliderRow(
+        place,
+        "entrance r",
+        0,
+        3,
+        0.1,
+        pl.entrance?.r ?? 0,
+        (v) =>
+          edit(() => {
+            if (v < 1.4) delete pl.entrance; // the ≥1.4 u cargo law
+            else pl.entrance = { r: v };
+          }),
+        (v) => (v < 1.4 ? "off" : v.toFixed(1)),
       );
     }
 
@@ -1870,7 +1850,7 @@ function buildBiomeCat(panel: HTMLElement, cat: string): void {
   }
 
   if (cat === "game") {
-    biome.budgets ??= { airPockets: 0, essence: 0, faults: 0, softSpots: 0 };
+    biome.budgets ??= { airPockets: 0, softSpots: 0 };
     biome.modifiers ??= {
       lightRange: 1,
       fogDensity: 1,
@@ -1887,15 +1867,9 @@ function buildBiomeCat(panel: HTMLElement, cat: string): void {
       save();
     });
     fishBtn.classList.toggle("on", biome.fishMayEnter);
-    const airBtn = button(flagsRow, "air-filled", (b) => {
-      biome.airFilled = !biome.airFilled;
-      if (!biome.airFilled) delete biome.airFilled;
-      b.classList.toggle("on", !!biome.airFilled);
-      save();
-    });
-    airBtn.classList.toggle("on", !!biome.airFilled);
 
-    const budgets = section(panel, "Budgets (M3 seeds)").parentElement!;
+    const budgets = section(panel, "Budgets (seeded props)").parentElement!;
+    const budgetsRow = budgets.querySelector(".row") as HTMLElement;
     sliderRow(
       budgets,
       "air pockets",
@@ -1911,30 +1885,67 @@ function buildBiomeCat(panel: HTMLElement, cat: string): void {
     );
     sliderRow(
       budgets,
-      "essence",
+      "soft spots",
       0,
-      20,
+      3,
       1,
-      bud.essence,
+      bud.softSpots,
       (v) => {
-        bud.essence = v;
+        bud.softSpots = v;
         save();
       },
       int,
     );
-    sliderRow(
-      budgets,
-      "faults",
-      0,
-      20,
-      1,
-      bud.faults,
-      (v) => {
-        bud.faults = v;
-        save();
-      },
-      int,
-    );
+    const hazBtn = button(budgetsRow, "hazards", (b) => {
+      if (bud.hazards) delete bud.hazards;
+      else bud.hazards = { meltFalls: 12, meltPools: 6, vents: 8 };
+      b.classList.toggle("on", !!bud.hazards);
+      save();
+      buildCatBody();
+    });
+    hazBtn.classList.toggle("on", !!bud.hazards);
+    if (bud.hazards) {
+      const haz = bud.hazards;
+      sliderRow(
+        budgets,
+        "melt falls",
+        0,
+        24,
+        1,
+        haz.meltFalls,
+        (v) => {
+          haz.meltFalls = v;
+          save();
+        },
+        int,
+      );
+      sliderRow(
+        budgets,
+        "melt pools",
+        0,
+        12,
+        1,
+        haz.meltPools,
+        (v) => {
+          haz.meltPools = v;
+          save();
+        },
+        int,
+      );
+      sliderRow(
+        budgets,
+        "vents",
+        0,
+        12,
+        1,
+        haz.vents,
+        (v) => {
+          haz.vents = v;
+          save();
+        },
+        int,
+      );
+    }
 
     const mods = section(panel, "Modifiers (senses)").parentElement!;
     sliderRow(mods, "light ×", 0.1, 2, 0.05, mod.lightRange, (v) => {
@@ -2120,21 +2131,9 @@ function buildMapCat(panel: HTMLElement, cat: string): void {
           (v) => edit(() => (pl.radius = v)),
           int,
         );
-        if (pl.mode === "shell")
-          sliderRow(
-            box,
-            "count",
-            4,
-            96,
-            1,
-            pl.count,
-            (v) => edit(() => (pl.count = v)),
-            int,
-          );
-        else
-          sliderRow(box, "thickness", 2, 30, 0.5, pl.thickness, (v) =>
-            edit(() => (pl.thickness = v)),
-          );
+        sliderRow(box, "thickness", 2, 30, 0.5, pl.thickness, (v) =>
+          edit(() => (pl.thickness = v)),
+        );
       }
       sliderRow(
         box,

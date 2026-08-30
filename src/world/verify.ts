@@ -1,7 +1,12 @@
-// verify.ts — the route verifier (WG-02): "one test, two answers". Proves,
-// per seed, that the run is SEALED (no route bell → gold while every seal is
-// intact) and REACHABLE (breaching the Great Wheel's soft spots opens a route
-// a rat can swim), and reports the cargo bottleneck along the solved path.
+// verify.ts — the route verifier (WG-02/WG-07/WG-08): "one test, two
+// answers". Proves, per seed, that the run is SEALED — seal #1 (the Great
+// Wheel) contains a flood started outside the melt shell's entrance, and
+// seal #2 (the melt shell) contains a gold-side flood with that entrance
+// plugged and the wheel breached — and REACHABLE (breaching the soft spots
+// opens a route a rat can swim), reports the cargo bottleneck along the
+// solved path, measures the entrance bore's clearance (≥ 1.4 u law), and
+// validates the sightline trail chain breach → entrance (traceTrail, also
+// used by the bench's map overlay).
 //
 // Pure data module: builds the world through buildWorldData() (no meshing,
 // no module state, no render imports) and searches the same SDF the game
@@ -22,10 +27,12 @@ import {
   buildWorldData,
   chunkDistance,
   R0,
+  SIGHT_RANGE,
   tileFieldCovers,
   type Chunk,
   type DebrisSpec,
   type WorldData,
+  type WorldPlan,
 } from "./gouda.ts";
 import { WHEEL_WORLD, type WorldRecipe, type ZoneName } from "./recipes.ts";
 import type { Vec3 } from "../state.ts";
@@ -35,14 +42,26 @@ import type { Vec3 } from "../state.ts";
 // minClearance saturates here — bottlenecks are far below it).
 const OPEN = 3;
 
+export interface TrailInfo {
+  nodes: number; // sightline-placed chunks in the plan
+  linked: number; // reachable by SIGHT_RANGE hops from the breach
+  orphans: number; // trail chunks the chain cannot reach
+  reachesEntrance: boolean; // the chain ends within sight of the entrance
+  edges: { a: Vec3; b: Vec3; ok: boolean }[]; // linking hops (ok = in range)
+}
+
 export interface VerifyResult {
-  sealed: boolean; // undug world: no gold → bell route at rat clearance
+  sealed: boolean; // both seals hold on the undug world
+  sealedWheel: boolean; // seal #1: flood outside the shell stays inside the wheel
+  sealedShell: boolean; // seal #2: gold flood stays in with the entrance plugged
   reachable: boolean; // soft spots breached: a rat route exists
   path: Vec3[]; // the solved route, bell → gold (empty if unreachable)
   minClearance: number; // bottleneck world distance along the path
   bottleneck: Vec3 | null; // where the path is tightest
   bottleneckZone: ZoneName | null;
-  visited: number; // lattice cells expanded across both searches
+  entranceClearance: number | null; // min water along the entrance bore (≥ 1.4 u law)
+  trail: TrailInfo | null; // sightline chain verdict (null: no sightline biome)
+  visited: number; // lattice cells expanded across all searches
   ms: number;
 }
 
@@ -59,6 +78,30 @@ interface Grid {
   buckets: Map<number, number[]>; // packed cell → chunk indices (then debris)
   chunks: Chunk[];
   debris: DebrisSpec[];
+  // Solid capsule plugged over the melt-shell entrance for the seal-#2 run.
+  plug: { a: Vec3; b: Vec3; r: number } | null;
+}
+
+function segDist(
+  px: number,
+  py: number,
+  pz: number,
+  a: Vec3,
+  b: Vec3,
+): number {
+  const abx = b.x - a.x,
+    aby = b.y - a.y,
+    abz = b.z - a.z;
+  const apx = px - a.x,
+    apy = py - a.y,
+    apz = pz - a.z;
+  let t =
+    (apx * abx + apy * aby + apz * abz) / (abx * abx + aby * aby + abz * abz);
+  t = Math.max(0, Math.min(1, t));
+  const dx = apx - abx * t,
+    dy = apy - aby * t,
+    dz = apz - abz * t;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
 }
 
 const GRID_CELL = 24;
@@ -75,6 +118,7 @@ function buildGrid(data: WorldData): Grid {
     buckets: new Map(),
     chunks: data.chunks,
     debris: data.debris,
+    plug: null,
   };
   const insert = (idx: number, c: Vec3, reach: number) => {
     const lo = (v: number) => Math.floor((v - reach) / GRID_CELL);
@@ -102,6 +146,11 @@ function buildGrid(data: WorldData): Grid {
 // worldDistance over the bucket's chunks only — same per-chunk bounds as
 // gouda.ts's distanceToWorld, saturating at OPEN.
 function distanceAt(g: Grid, x: number, y: number, z: number): number {
+  let best = OPEN;
+  if (g.plug) {
+    const d = segDist(x, y, z, g.plug.a, g.plug.b) - g.plug.r;
+    if (d < best) best = d;
+  }
   const bucket = g.buckets.get(
     cellKey(
       Math.floor(x / g.cell),
@@ -109,8 +158,7 @@ function distanceAt(g: Grid, x: number, y: number, z: number): number {
       Math.floor(z / g.cell),
     ),
   );
-  if (!bucket) return OPEN;
-  let best = OPEN;
+  if (!bucket) return best;
   for (let i = 0; i < bucket.length; i++) {
     const idx = bucket[i];
     if (idx >= g.chunks.length) {
@@ -502,6 +550,137 @@ function breachSoftSpots(data: WorldData): void {
   }
 }
 
+// --- The sightline trail (WG-07) --------------------------------------------------
+
+// Chain check over pure plan data, shared by verifyWorld and the bench's
+// map overlay: greedily hop unvisited trail chunks within SIGHT_RANGE
+// (surface-to-surface) starting from the hull soft spots — the breach —
+// then ask whether the chain reads the melt-shell entrance.
+export function traceTrail(
+  world: WorldRecipe,
+  plan: WorldPlan,
+): TrailInfo | null {
+  const zones = new Set(
+    world.biomes
+      .filter((b) => b.placement.mode === "band" && b.placement.sightline)
+      .map((b) => b.id as string),
+  );
+  if (!zones.size) return null;
+  interface Node {
+    x: number;
+    y: number;
+    z: number;
+    pad: number;
+  }
+  const nodes: Node[] = plan.specs
+    .filter((sp) => zones.has(sp.zone))
+    .map((sp) => ({
+      x: sp.center.x,
+      y: sp.center.y,
+      z: sp.center.z,
+      pad: sp.s * R0,
+    }));
+  const anchors: Node[] = plan.softSpots.map((s) => ({
+    x: s.x,
+    y: s.y,
+    z: s.z,
+    pad: s.r,
+  }));
+  const gap = (a: Node, b: Node) =>
+    Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z) - a.pad - b.pad;
+
+  const visited = new Array<boolean>(nodes.length).fill(false);
+  const edges: TrailInfo["edges"] = [];
+  let linked = 0;
+  let grew = true;
+  while (grew) {
+    grew = false;
+    for (let i = 0; i < nodes.length; i++) {
+      if (visited[i]) continue;
+      let from: Node | null = null;
+      let bd = Infinity;
+      for (const a of anchors) {
+        const d = gap(nodes[i], a);
+        if (d <= SIGHT_RANGE && d < bd) {
+          bd = d;
+          from = a;
+        }
+      }
+      for (let j = 0; j < nodes.length; j++) {
+        if (!visited[j]) continue;
+        const d = gap(nodes[i], nodes[j]);
+        if (d <= SIGHT_RANGE && d < bd) {
+          bd = d;
+          from = nodes[j];
+        }
+      }
+      if (from) {
+        visited[i] = true;
+        linked++;
+        grew = true;
+        edges.push({
+          a: { x: from.x, y: from.y, z: from.z },
+          b: { x: nodes[i].x, y: nodes[i].y, z: nodes[i].z },
+          ok: true,
+        });
+      }
+    }
+  }
+
+  let orphans = 0;
+  for (let i = 0; i < nodes.length; i++) {
+    if (visited[i]) continue;
+    orphans++;
+    let from: Node | null = null;
+    let bd = Infinity;
+    for (let j = 0; j < nodes.length; j++) {
+      if (i === j || !visited[j]) continue;
+      const d = gap(nodes[i], nodes[j]);
+      if (d < bd) {
+        bd = d;
+        from = nodes[j];
+      }
+    }
+    for (const a of anchors) {
+      const d = gap(nodes[i], a);
+      if (d < bd) {
+        bd = d;
+        from = a;
+      }
+    }
+    if (from)
+      edges.push({
+        a: { x: from.x, y: from.y, z: from.z },
+        b: { x: nodes[i].x, y: nodes[i].y, z: nodes[i].z },
+        ok: false,
+      });
+  }
+
+  let reachesEntrance = false;
+  if (plan.entrance) {
+    const e: Node = { ...plan.entrance.surface, pad: plan.entrance.r + 1 };
+    let from: Node | null = null;
+    let bd = Infinity;
+    for (let i = 0; i < nodes.length; i++) {
+      if (!visited[i]) continue;
+      const d = gap(nodes[i], e);
+      if (d < bd) {
+        bd = d;
+        from = nodes[i];
+      }
+    }
+    reachesEntrance = bd <= SIGHT_RANGE;
+    if (from)
+      edges.push({
+        a: { x: from.x, y: from.y, z: from.z },
+        b: { x: e.x, y: e.y, z: e.z },
+        ok: reachesEntrance,
+      });
+  }
+
+  return { nodes: nodes.length, linked, orphans, reachesEntrance, edges };
+}
+
 // --- The verifier ---------------------------------------------------------------
 
 export function verifyWorld(
@@ -520,39 +699,89 @@ export function verifyWorld(
   const bound = data.world.boundaryR;
   const gold = data.goldPos;
   const bell = data.spawnPoint;
-  // The outermost seal's enclosing WORLD radius: a flood cell past this is
-  // in ocean that connects to the bell (scatter bands are clutter, not
-  // seals). A wheel hull's corners stick out to R·√(1+squash²).
+  const ent = data.plan.entrance;
+  // Seal-enclosing WORLD radii: a flood cell past one is in water that
+  // connects onward (scatter bands are clutter, not seals). A wheel hull's
+  // corners stick out to R·√(1+squash²).
   const squash = data.world.frame?.squash ?? 1;
-  let escapeR = 0;
+  let escapeR = 0; // outermost seal (the Great Wheel)
+  let shellEscapeR = 0; // the entrance-bearing hull (the melt shell)
   for (const b of data.world.biomes) {
     const pl = b.placement;
-    if (pl.mode === "hull")
-      escapeR = Math.max(escapeR, pl.radius * Math.sqrt(1 + squash * squash));
-    else if (pl.mode === "fused") escapeR = Math.max(escapeR, pl.rMax);
+    if (pl.mode === "hull") {
+      const r =
+        pl.surface === "sphere"
+          ? pl.radius
+          : pl.radius * Math.sqrt(1 + squash * squash);
+      escapeR = Math.max(escapeR, r);
+      if (pl.entrance) shellEscapeR = r;
+    } else if (pl.mode === "fused") escapeR = Math.max(escapeR, pl.rMax);
   }
   escapeR += 20;
 
-  // Sealed: both seals intact (soft spots are solid rind until drilled) —
-  // gold → bell must be unreachable. An exhaustive flood from the gold at a
-  // coarser step (the hill-climb reach scales with it, so passability stays
-  // continuum-based) either escapes past the outermost seal (not sealed) or
-  // drains the interior and proves the seal.
-  const sealedRun = search(
+  // Seal #1 — the Great Wheel. Flood from OUTSIDE the melt shell (the
+  // entrance mouth; the gold when there is no entrance): it fills the water
+  // between the seals at a coarse step (hill-climb reach scales with step,
+  // so passability stays continuum-based) and must never escape past the
+  // wheel. Starting outside the shell keeps the verdict independent of
+  // whether the coarse lattice threads the narrow entrance bore.
+  const wheelRun = search(
     grid,
-    gold,
+    ent ? ent.mouth : gold,
     bell,
     bound,
-    step * 1.6,
+    step * 2,
     clearance,
     maxVisited,
     false,
     { mode: "exhaust", escapeR },
   );
-  const sealed = !sealedRun.found && !sealedRun.capped;
+  const sealedWheel = !wheelRun.found && !wheelRun.capped;
 
-  // Reachable: drill the soft spots, search again, record the route.
+  // Entrance bore clearance (WG-08 law: ≥ 1.4 u so cargo passes outbound),
+  // sampled along the bore axis on the undug world.
+  let entranceClearance: number | null = null;
+  if (ent) {
+    let mn = Infinity;
+    const N = 24;
+    for (let i = 0; i <= N; i++) {
+      const t = i / N;
+      const d = distanceAt(
+        grid,
+        ent.mouth.x + (ent.inner.x - ent.mouth.x) * t,
+        ent.mouth.y + (ent.inner.y - ent.mouth.y) * t,
+        ent.mouth.z + (ent.inner.z - ent.mouth.z) * t,
+      );
+      if (d < mn) mn = d;
+    }
+    entranceClearance = mn;
+  }
+
+  // Seal #2 — the melt shell. Wheel breached, entrance plugged: a gold-side
+  // flood must drain the shell's interior without ever getting out.
   breachSoftSpots(data);
+  let sealedShell = true;
+  let shellVisited = 0;
+  if (ent) {
+    grid.plug = { a: ent.mouth, b: ent.inner, r: ent.r + 1.5 };
+    const shellRun = search(
+      grid,
+      gold,
+      bell,
+      bound,
+      step * 1.28,
+      clearance,
+      maxVisited,
+      false,
+      { mode: "exhaust", escapeR: shellEscapeR ? shellEscapeR + 15 : escapeR },
+    );
+    grid.plug = null;
+    sealedShell = !shellRun.found && !shellRun.capped;
+    shellVisited = shellRun.visited;
+  }
+
+  // Reachable: both doors open (spots drilled, entrance unplugged) — record
+  // the route.
   const openRun = search(
     grid,
     gold,
@@ -588,13 +817,17 @@ export function verifyWorld(
   }
 
   return {
-    sealed,
+    sealed: sealedWheel && sealedShell,
+    sealedWheel,
+    sealedShell,
     reachable: openRun.found,
     path,
     minClearance: Number.isFinite(minClearance) ? minClearance : 0,
     bottleneck,
     bottleneckZone: bottleneck ? zoneAt(grid, bottleneck) : null,
-    visited: sealedRun.visited + openRun.visited,
+    entranceClearance,
+    trail: traceTrail(data.world, data.plan),
+    visited: wheelRun.visited + shellVisited + openRun.visited,
     ms: Date.now() - t0,
   };
 }

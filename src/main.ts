@@ -925,7 +925,7 @@ function drawGoudaBearing(
 
 // --- Run won (M1.3, placeholder) -------------------------------------------
 // The Gouda crossed the bell's hatch radius. M5.4 turns this into a real run
-// summary (time, essence, who died, who dropped it); for now it just has to
+// summary (time, who died, who dropped it); for now it just has to
 // be unmistakable that the run ENDED, and that you won it.
 function showWin(carrier: string) {
   const mine = carrier === getMyId() || getPeerIds().indexOf(carrier) === -1;

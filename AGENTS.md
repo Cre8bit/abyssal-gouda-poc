@@ -108,29 +108,32 @@ tools/               node-run (node 24 strips types natively)
 World generation is split in two on purpose:
 
 - **`world/recipes.ts` holds every number** — `PartRecipe` (one kind of
-  cheese chunk + the gameplay axes hardness/porosity/odour + mood/desc
-  authoring text), `BiomeRecipe` (placement, sizes, weighted part mix, wax
-  material, budgets, modifiers), `WorldRecipe` (the ordered onion + world
+  cheese chunk + the hardness gameplay axis + mood/desc authoring text),
+  `BiomeRecipe` (placement, sizes, weighted part mix, wax material,
+  budgets, modifiers), `WorldRecipe` (the ordered biome list + world
   radii + optional `frame`/`spine`). Pure data, no three.js, checked by
   `tools/test-recipes.ts`, and `validateWorld()` holds the seed-time rules
   (hull lace cap, fused sizeVar 0…) — the generator throws on violations.
 - **`world/gouda.ts` holds every implementation** — the SDF shape families,
   chunk placement modes, meshing, digging, queries. `buildGoudaWorld()`
   takes an optional `world: WorldRecipe` override; the game itself always
-  plays `DEFAULT_WORLD`.
+  plays `WHEEL_WORLD`.
 
-**Two shipped worlds** live in `recipes.ts` (`WORLDS`): `DEFAULT_WORLD`
-(the classic onion the game plays) and `WHEEL_WORLD` (the cheese-parts.md
-MVP map — six parts, one seal, five stops). Swapping the game onto the
-wheel map is a one-line change once it's tuned.
+**One shipped world** lives in `recipes.ts` (`WORLDS.wheel`): the
+cheese-parts.md six-biome map — seven parts, TWO seals (the drilled Great
+Wheel, the found melt shell), one route. The classic onion and the `shell`
+placement mode were retired in WG-04.
 
 **Placement modes come in two families:**
 
-- *Per-chunk bodies* — `center | band | shell`: every chunk is its own
-  closed ellipsoid SDF. `band` supports `densityGrade` (outward/inward).
+- *Per-chunk bodies* — `center | band`: every chunk is its own closed
+  ellipsoid SDF. `band` supports `densityGrade`/`sizeGrade`
+  (outward/inward) and `sightline` (each chunk placed within sight of the
+  already-placed trail — the dark veins).
 - *Layer bodies* — `fused | hull`: ONE analytic body per biome (a radial
-  band of solid cheese, or the Great Wheel's rounded-cylinder husk with
-  soft-spot bulges), meshed by lattice-aligned cube tiles. Tile spacing is
+  band of solid cheese; the Great Wheel's rounded-cylinder husk with
+  soft-spot bulges; the melt shell's sphere husk with its one generated
+  `entrance` bore), meshed by lattice-aligned cube tiles. Tile spacing is
   `2s(res-3)/res` — exactly the marched extent of three's MarchingCubes —
   so adjacent tiles sample identical world points and abut seam-free. Tile
   scale/res come from `sizeBase`/`res` (`sizeVar` must be 0). Carves are
@@ -169,13 +172,13 @@ Adding a new cheese part type or biome = a new table entry in `recipes.ts`
 grammar* (a new `PartKind`, a new placement mode, a new hull surface) is a
 `gouda.ts` change.
 
-⚠ The seeded rng stream is a pure function of the tables: biomes with
-`sizeVar: 0` and single-entry part lists consume no rng, which is what keeps
-the default tables reproducing the pre-recipe worlds byte-for-byte (verified
-old-vs-new by fingerprinting chunk layouts, vertex counts, gold and spawn
-across 4 seeds × 3 difficulties). Editing a table changes every seed's world
-— that's expected; just don't reorder the `biomes` array casually, since
-generation order is part of the contract.
+⚠ The seeded rng stream is a pure function of the tables: draw order is part
+of the world format, and `tools/test-worldgen.ts` pins the wheel-world
+fingerprint (perf tickets must keep it exact; content tickets rebase it in
+the same commit and say so). Editing a table changes every seed's world —
+that's expected; just don't reorder the `biomes` array casually: generation
+order is a contract (the Wheel's soft spots must exist before the veins
+place, and the veins before the melt shell picks its entrance terminus).
 
 ⚠ Wheel-world build cost: the fused layers are honest solid volumes — ~900
 chunks, ~7.5M tris, ~80 s at full res in node. That is an authoring-time

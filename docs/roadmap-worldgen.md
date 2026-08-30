@@ -94,7 +94,8 @@ are currently void.
 5. `digAt` returns whether it was rejected (tool-bounce feedback later).
 
 **AC.** Hands never mark either hull; driller opens only the Wheel's soft
-spot; a hands carve in the galleries is 1.4 u across; replayed digs converge
+spot; a hands carve in the drift is 1.4 u across (the galleries are
+hardness 1 — driller only, per the table); replayed digs converge
 across clients; undug-world fingerprint unchanged.
 
 ### WG-02 · Route verifier: bell → breach → entrance → gold — ~1.5 d

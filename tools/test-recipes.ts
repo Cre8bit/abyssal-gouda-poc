@@ -1,9 +1,8 @@
 #!/usr/bin/env node
-// test-recipes.ts — sanity checks over the default worldgen tables
-// (src/world/recipes.ts), for BOTH shipped worlds: the classic onion and
-// the Great Wheel MVP map. Pure data, runs in node with no DOM/GL.
+// test-recipes.ts — sanity checks over the shipped worldgen tables
+// (src/world/recipes.ts): the six-biome Great Wheel map. Pure data, runs in
+// node with no DOM/GL.
 import {
-  DEFAULT_WORLD,
   WHEEL_WORLD,
   partById,
   validateWorld,
@@ -74,15 +73,6 @@ function checkWorld(tag: string, world: WorldRecipe): void {
         pl.rMin < pl.rMax && pl.rMax <= world.worldR,
         `${pl.rMin}–${pl.rMax} vs worldR ${world.worldR}`,
       );
-    } else if (pl.mode === "shell") {
-      check(
-        `${tag}: biome ${biome.id} shell inside the world`,
-        pl.radius > 0 && pl.radius < world.worldR,
-      );
-      check(
-        `${tag}: biome ${biome.id} shell colossal res valid`,
-        VALID_RES.includes(pl.colossalRes),
-      );
     } else if (pl.mode === "hull") {
       check(
         `${tag}: biome ${biome.id} hull inside the world`,
@@ -124,13 +114,8 @@ function checkWorld(tag: string, world: WorldRecipe): void {
     );
     check(`${tag}: part ${part.id} crust depth positive`, part.crust.depth > 0);
     check(
-      `${tag}: part ${part.id} axes in range`,
-      part.hardness >= 0 &&
-        part.hardness <= 3 &&
-        part.porosity >= 0 &&
-        part.porosity <= 1 &&
-        part.odour >= 0 &&
-        part.odour <= 1,
+      `${tag}: part ${part.id} hardness in range`,
+      part.hardness >= 0 && part.hardness <= 3,
     );
     check(
       `${tag}: part ${part.id} has mood + desc`,
@@ -153,7 +138,6 @@ function checkWorld(tag: string, world: WorldRecipe): void {
   );
 }
 
-checkWorld("onion", DEFAULT_WORLD);
 checkWorld("wheel", WHEEL_WORLD);
 
 // The wheel world's authored intent, pinned so a careless edit shows up.
@@ -162,38 +146,93 @@ check(
   !!WHEEL_WORLD.frame && WHEEL_WORLD.frame.squash < 1,
 );
 check("wheel: has a spine", !!WHEEL_WORLD.spine);
+
+// Generation order IS the contract (recipes.ts header): the Wheel's soft
+// spots must exist before the veins place (sightline anchors), and the veins
+// before the melt shell (its entrance sits at the trail terminus).
 check(
-  "wheel: exactly one hull (the Great Wheel)",
-  WHEEL_WORLD.biomes.filter((b) => b.placement.mode === "hull").length === 1,
+  "wheel: biome generation order pinned",
+  WHEEL_WORLD.biomes.map((b) => b.id).join(",") ===
+    "heart,galleries,melt,great-wheel,veins,melt-shell,drift",
+  WHEEL_WORLD.biomes.map((b) => b.id).join(","),
+);
+
+// Two seals, opened two different ways.
+const wheelHull = WHEEL_WORLD.biomes.find((b) => b.id === "great-wheel")!;
+const shellHull = WHEEL_WORLD.biomes.find((b) => b.id === "melt-shell")!;
+check(
+  "wheel: the Great Wheel is a wheel hull with soft spots",
+  wheelHull.placement.mode === "hull" &&
+    wheelHull.placement.surface === "wheel" &&
+    wheelHull.placement.softSpots >= 1 &&
+    !wheelHull.placement.entrance,
 );
 check(
-  "wheel: three fused layers (veins, melt, galleries)",
-  WHEEL_WORLD.biomes.filter((b) => b.placement.mode === "fused").length === 3,
+  "wheel: the melt shell is a sphere hull, no soft spots, entrance ≥ 1.4 u",
+  shellHull.placement.mode === "hull" &&
+    shellHull.placement.surface === "sphere" &&
+    shellHull.placement.softSpots === 0 &&
+    (shellHull.placement.entrance?.r ?? 0) >= 1.4,
 );
 check(
-  "wheel: the seal part is no-dig",
-  WHEEL_WORLD.parts.find((p) => p.id === "dark-rind")?.hardness === 3,
+  "wheel: both seal parts are no-dig",
+  WHEEL_WORLD.parts.find((p) => p.id === "dark-rind")?.hardness === 3 &&
+    WHEEL_WORLD.parts.find((p) => p.id === "melt-rind")?.hardness === 3,
+);
+
+// The veins are a sightline-chained scatter, graded inward — no fused body.
+const veins = WHEEL_WORLD.biomes.find((b) => b.id === "veins")!;
+check(
+  "wheel: veins are a graded sightline band",
+  veins.placement.mode === "band" &&
+    veins.placement.sightline === true &&
+    veins.placement.densityGrade === "inward" &&
+    veins.placement.sizeGrade === "inward",
+);
+check(
+  "wheel: two fused layers (melt, galleries)",
+  WHEEL_WORLD.biomes.filter((b) => b.placement.mode === "fused").length === 2,
+);
+
+// Budgets follow the WG-04 schema.
+const drift = WHEEL_WORLD.biomes.find((b) => b.id === "drift")!;
+const melt = WHEEL_WORLD.biomes.find((b) => b.id === "melt")!;
+const heart = WHEEL_WORLD.biomes.find((b) => b.id === "heart")!;
+check("wheel: drift seeds 6 air pockets", drift.budgets?.airPockets === 6);
+check("wheel: heart seeds the last air pocket", heart.budgets?.airPockets === 1);
+check(
+  "wheel: melt hazard budget seeded",
+  melt.budgets?.hazards?.meltFalls === 12 &&
+    melt.budgets?.hazards?.meltPools === 6 &&
+    melt.budgets?.hazards?.vents === 8,
 );
 check(
   "wheel: gold band sits at the heart",
   WHEEL_WORLD.goldBand.min === 0 && WHEEL_WORLD.goldBand.max < 20,
 );
 
-// The resolution rule (r × res ≥ 4) for the parts whose tunnels matter.
-for (const world of [DEFAULT_WORLD, WHEEL_WORLD])
-  for (const biome of world.biomes) {
-    const pl = biome.placement;
-    if (pl.mode !== "fused") continue;
-    for (const entry of biome.parts) {
-      const part = partById(world, entry.part);
-      const cells = part.tunnels.rBase * biome.res;
-      check(
-        `r×res: ${biome.id}/${part.id} tunnels ≥ 3 cells`,
-        cells >= 3,
-        `${cells.toFixed(1)}`,
-      );
-    }
+// The emmental holes stay readable: r × res ≥ 4 (cheese-parts §1).
+const emmental = WHEEL_WORLD.parts.find((p) => p.id === "emmental-drift")!;
+check(
+  "r×res: emmental holes ≥ 4 cells",
+  emmental.eyes.rBase * drift.res >= 4,
+  `${(emmental.eyes.rBase * drift.res).toFixed(1)}`,
+);
+
+// The resolution rule (r × res ≥ 3 floor) for fused-layer tunnels.
+for (const biome of WHEEL_WORLD.biomes) {
+  const pl = biome.placement;
+  if (pl.mode !== "fused") continue;
+  for (const entry of biome.parts) {
+    const part = partById(WHEEL_WORLD, entry.part);
+    const cells = part.tunnels.rBase * biome.res;
+    check(
+      `r×res: ${biome.id}/${part.id} tunnels ≥ 3 cells`,
+      cells >= 3,
+      `${cells.toFixed(1)}`,
+    );
   }
+}
 
 if (failures) {
   console.error(`\n${failures} recipe check(s) failed.`);
