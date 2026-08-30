@@ -24,8 +24,11 @@
 //    silently falls back to the reliable channel.
 //
 // RESILIENCE — per-peer ping/pong over the events channel measures RTT
-// (exposed via getRtt/getWorstRtt) and doubles as a keep-alive.
+// (exposed via getRtt/getWorstRtt) and doubles as a keep-alive. Pongs also
+// carry the responder's world-clock stamp (net/clock.ts): pongs from the
+// HOST are the samples every other peer syncs its shared clock from.
 import Peer, { type DataConnection } from "peerjs";
+import { noteClockSample, resetWorldClock, worldNow } from "./clock.ts";
 
 const STATE_CHANNEL_ID = 99; // negotiated id — clear of PeerJS's own channel
 const PING_INTERVAL_MS = 2000;
@@ -205,6 +208,7 @@ function createPeer({
 export async function hostGame(): Promise<string> {
   const p = await createPeer();
   amHost = true;
+  resetWorldClock(); // our clock is now the authority — offset back to 0
   return p.id;
 }
 
@@ -356,21 +360,32 @@ function handleInternalEvent(peerId: string, data: EventPayload): void {
     }
   } else if (data.kind === "__ping") {
     const rec = peers.get(peerId);
-    if (rec) rawSend(rec, { type: "event", kind: "__pong", t: data.t });
+    if (rec) {
+      rawSend(rec, { type: "event", kind: "__pong", t: data.t, w: worldNow() });
+    }
   } else if (data.kind === "__pong") {
     const rec = peers.get(peerId);
     if (rec && typeof data.t === "number") {
-      rec.rtt = Math.round(performance.now() - data.t);
+      const rtt = performance.now() - data.t;
+      rec.rtt = Math.round(rtt);
+      // Clock samples are trusted from the clock source alone (the host).
+      if (peerId === hostId && typeof data.w === "number") {
+        noteClockSample(data.w, rtt);
+      }
     }
   }
 }
 
 function startPing(rec: PeerRecord): void {
-  rec.pingTimer = setInterval(() => {
+  const ping = () => {
     if (rec.conn.open) {
       rawSend(rec, { type: "event", kind: "__ping", t: performance.now() });
     }
-  }, PING_INTERVAL_MS);
+  };
+  // First ping immediately: a joiner's world clock locks on the first pong,
+  // well before its world build finishes — no visible rotation snap later.
+  ping();
+  rec.pingTimer = setInterval(ping, PING_INTERVAL_MS);
 }
 
 // --- Raw unreliable state channel -----------------------------------------

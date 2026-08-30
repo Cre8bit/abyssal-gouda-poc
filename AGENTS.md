@@ -16,6 +16,8 @@ src/
     mesh.ts            PeerJS full-mesh topology, channels, RTT
     sync.ts            packet dispatch, seq dedup, broadcast, events
     interpolation.ts   remote-pose snapshot buffers
+    clock.ts           shared world clock (host-authoritative, NTP over
+                       ping/pong) — the time base for rotation/hazard phase
   audio/
     ambience.ts        procedural abyss soundscape + SFX (Web Audio)
     voice.ts           proximity voice chat (PeerJS calls + HRTF panners)

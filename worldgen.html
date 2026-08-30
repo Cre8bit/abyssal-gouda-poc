@@ -138,6 +138,29 @@
         border-color: #4fb3e0;
       }
 
+      #validate-badge {
+        display: none;
+        margin-bottom: 8px;
+        padding: 4px 8px;
+        border: 1px solid #b91c1c;
+        border-radius: 4px;
+        background: rgba(127, 29, 29, 0.35);
+        color: #f8b4b4;
+        line-height: 1.4;
+      }
+
+      #perf {
+        position: fixed;
+        right: 12px;
+        top: 12px;
+        width: 210px;
+        background: rgba(3, 16, 24, 0.82);
+        border: 1px solid #1d4457;
+        border-radius: 8px;
+        padding: 8px 12px 10px 12px;
+        backdrop-filter: blur(6px);
+      }
+
       .mood {
         margin-top: 8px;
         padding: 6px 8px;
@@ -315,6 +338,7 @@
           <a class="on" href="./worldgen.html">world gen</a>
         </div>
         <h1>ABYSSAL · WORLD GEN</h1>
+        <div id="validate-badge"></div>
         <div class="row" id="modes"></div>
         <div id="generate"></div>
         <div id="subject"></div>
@@ -343,6 +367,8 @@
       <div class="title" id="hud-title">—</div>
       <div id="hud-body"></div>
     </div>
+
+    <div id="perf"></div>
 
     <div id="walk-hud">
       WASD swim · mouse look · space ↑ · C ↓ · shift boost · esc exit

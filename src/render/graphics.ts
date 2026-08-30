@@ -22,6 +22,7 @@ import {
   getSpawnPoint,
 } from "../world/gouda.ts";
 import { mountBathyscaphe, updateBathyscaphe } from "../world/bathyscaphe.ts";
+import { worldNow } from "../net/clock.ts";
 import { ImprovedNoise } from "three/examples/jsm/math/ImprovedNoise.js";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import {
@@ -1407,9 +1408,12 @@ export function renderLoop(onFrame?: (delta: number) => void): void {
 
     animateFlashlight();
     if (onFrame) onFrame(delta);
-    // Update atmosphere, world, rig animation, then render
+    // Update atmosphere, world, rig animation, then render.
+    // The gouda runs on the SHARED clock (net/clock.ts): rotation phase is
+    // rate × time, so feeding worldNow() is what syncs the tumble (and the
+    // vein shimmer) across peers. Everything else above stays on local time.
     const visibility = updateAtmosphere(delta);
-    updateGouda(elapsed, camera.position, visibility);
+    updateGouda(worldNow(), camera.position, visibility);
     updateBathyscaphe(elapsed);
     updateLocalBody(delta);
     for (const player of players.values()) updateRemoteDiver(player, delta);

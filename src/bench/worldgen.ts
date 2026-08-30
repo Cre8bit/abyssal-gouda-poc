@@ -10,7 +10,15 @@
 //   map    the whole map as instant proxies (spheres for scattered
 //          chunks, boxes for layer tiles, hull silhouettes, the spine,
 //          soft spots, the vein trail chain and the shell entrance); or
-//          the real full build via buildGoudaWorld()
+//          the real full build via buildGoudaWorld(). Both map modes carry
+//          the same overlay: labelled per-biome radius rings, spine, soft
+//          spots, entrance, wreck, seeded props — and the route verifier
+//          (WG-14) runs in a worker after every (re)build, drawing the
+//          solved bell → gold path with its door pass-throughs and posting
+//          the SEALED / REACHABLE / bottleneck verdict into the HUD.
+//
+// A perf overlay (WG-18) sits top-right in every mode: rolling FPS,
+// renderer.info, scene-triangle census by biome, last build wall time.
 //
 // The panel is CATEGORIZED: a mode row (part/biome/map + world table), a
 // generate block, a subject picker with its mood line, then per-category
@@ -40,6 +48,7 @@ import {
   makeFrame,
   meshChunk,
   mulberry32,
+  nearestSpinePoint,
   planWorldLayout,
   R0,
   updateGouda,
@@ -48,12 +57,13 @@ import {
   type GenCtx,
   type SeededProp,
   type SeededPropKind,
+  type WorldData,
   type WorldPlan,
 } from "../world/gouda.ts";
-import { traceTrail } from "../world/verify.ts";
+import { traceTrail, type VerifyResult } from "../world/verify.ts";
+import type { VerifyReply, VerifyRequest } from "./verifyWorker.ts";
 import {
   cloneWorld,
-  pickPart,
   validateWorld,
   WHEEL_WORLD,
   type BiomeMaterial,
@@ -133,6 +143,42 @@ let world: WorldRecipe = store.worlds[store.active];
 
 function save(): void {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+  // WG-17b/c: every edit funnels through here — recheck the seed-time rules
+  // (badge in ALL views) and the edited-vs-shipped dot on the world picker.
+  scheduleValidate();
+  refreshWorldPicker();
+}
+
+// WG-17c: the world picker marks tables that drift from the shipped copy.
+let worldPicker: ReturnType<typeof selectRow> | null = null;
+
+function worldOptions(): { value: string; label: string }[] {
+  return Object.keys(WORLD_DEFAULTS).map((k) => {
+    const edited =
+      JSON.stringify(store.worlds[k]) !== JSON.stringify(WORLD_DEFAULTS[k]);
+    return { value: k, label: (edited ? "● " : "") + (WORLD_LABELS[k] ?? k) };
+  });
+}
+
+function refreshWorldPicker(): void {
+  worldPicker?.refresh(worldOptions());
+  worldPicker?.set(store.active);
+}
+
+// WG-17b: validateWorld on every edit (debounced like the rebuild), surfaced
+// as a red badge in every view — not just the map's build tab.
+let validateTimer = 0;
+function scheduleValidate(): void {
+  clearTimeout(validateTimer);
+  validateTimer = window.setTimeout(() => {
+    const errors = validateWorld(world);
+    const badge = $("validate-badge");
+    badge.style.display = errors.length ? "block" : "none";
+    badge.textContent = errors.length
+      ? `✗ ${errors.length} rule violation${errors.length > 1 ? "s" : ""} — ${errors[0]}`
+      : "";
+    badge.title = errors.join("\n");
+  }, 150);
 }
 
 type Mode = "part" | "biome" | "map";
@@ -375,7 +421,7 @@ function updateWalk(dt: number): void {
 // --- Content lifecycle ---------------------------------------------------------
 
 let content: THREE.Group | null = null;
-let disposables: (THREE.BufferGeometry | THREE.Material)[] = [];
+let disposables: { dispose(): void }[] = [];
 let buildToken = 0;
 
 function setLoading(text: string | null): void {
@@ -398,6 +444,8 @@ function disposeContent(): void {
   disposables = [];
   benchChunks = [];
   clearProps();
+  cancelVerify();
+  mapHud = null;
   setLoading(null);
 }
 
@@ -412,7 +460,7 @@ const PROP_COLORS: Record<SeededPropKind, number> = {
 };
 
 let propsGroup: THREE.Group | null = null;
-let propDisposables: (THREE.BufferGeometry | THREE.Material)[] = [];
+let propDisposables: { dispose(): void }[] = [];
 
 function clearProps(): void {
   if (propsGroup) scene.remove(propsGroup);
@@ -421,25 +469,27 @@ function clearProps(): void {
   propDisposables = [];
 }
 
-// Compute the prop list for the current view: the built world's own list, or
-// a fresh data build (no meshing, ~50 ms) matching what a build would seed.
-function computeProps(): SeededProp[] {
-  if (view.built) return getSeededProps();
+// One data build for the proxies overlay (no meshing, ~50 ms): the plan the
+// specs came from, plus the REAL seeded props / spawn / gold — the same
+// values a full build would land on. null on an invalid recipe (dataErr).
+let dataErr: string | null = null;
+function computeWorldData(): WorldData | null {
+  dataErr = null;
   try {
     return buildWorldData({
       seed: view.seed,
       difficulty: view.difficulty,
       world,
-    }).plan.props;
-  } catch {
-    return [];
+    });
+  } catch (err) {
+    dataErr = (err as Error).message;
+    return null;
   }
 }
 
 // Redraw the marker overlay; returns the prop list for HUD counting.
-function drawProps(): SeededProp[] {
+function drawProps(props: SeededProp[]): SeededProp[] {
   clearProps();
-  const props = computeProps();
   const group = new THREE.Group();
   const mats = new Map<SeededPropKind, THREE.MeshBasicMaterial>();
   for (const p of props) {
@@ -508,6 +558,375 @@ function propHudLines(props: SeededProp[]): HudLine[] {
   return lines;
 }
 
+// --- Route verifier overlay (WG-14) ------------------------------------------------
+
+const verifyState = {
+  worker: null as Worker | null,
+  token: 0, // stamps requests; replies with older stamps are dropped
+  running: false,
+  result: null as VerifyResult | null,
+  error: null as string | null,
+};
+let routeGroup: THREE.Group | null = null;
+let routeDisposables: { dispose(): void }[] = [];
+
+function clearRoute(): void {
+  if (routeGroup) scene.remove(routeGroup);
+  routeGroup = null;
+  for (const d of routeDisposables) d.dispose();
+  routeDisposables = [];
+}
+
+function cancelVerify(): void {
+  verifyState.token++;
+  verifyState.running = false;
+  verifyState.result = null;
+  verifyState.error = null;
+  verifyState.worker?.terminate();
+  verifyState.worker = null;
+  clearRoute();
+}
+
+// Kick a verifier pass for the current map content. Runs in a worker on the
+// FULL-res edited tables (half-res is a preview shortcut; the verdict must
+// match what ships), so the bench stays interactive through the search.
+function startVerify(plan: WorldPlan): void {
+  cancelVerify();
+  const token = verifyState.token;
+  verifyState.running = true;
+  const w = new Worker(new URL("./verifyWorker.ts", import.meta.url), {
+    type: "module",
+  });
+  verifyState.worker = w;
+  w.onmessage = (e: MessageEvent<VerifyReply>) => {
+    if (e.data.token !== verifyState.token) return; // superseded mid-run
+    verifyState.running = false;
+    verifyState.result = e.data.result ?? null;
+    verifyState.error = e.data.error ?? null;
+    w.terminate();
+    verifyState.worker = null;
+    if (verifyState.result) drawRoute(verifyState.result, plan);
+    refreshMapHud();
+  };
+  const msg: VerifyRequest = {
+    token,
+    seed: view.seed,
+    difficulty: view.difficulty,
+    world,
+  };
+  w.postMessage(msg);
+  refreshMapHud();
+}
+
+// The solved route bell → gold, drawn through everything (no depth test):
+// the polyline, a ring on each door the path threads, and the bottleneck.
+function drawRoute(r: VerifyResult, plan: WorldPlan): void {
+  clearRoute();
+  if (!r.path.length) return;
+  const group = new THREE.Group();
+  const pts = r.path.map((p) => new THREE.Vector3(p.x, p.y, p.z));
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat = new THREE.LineBasicMaterial({
+    color: 0xff7ad9,
+    transparent: true,
+    opacity: 0.9,
+    depthTest: false,
+  });
+  routeDisposables.push(geo, mat);
+  const line = new THREE.Line(geo, mat);
+  line.renderOrder = 8;
+  group.add(line);
+
+  const doorMat = new THREE.MeshBasicMaterial({
+    color: 0x86ffbe,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.8,
+    depthTest: false,
+  });
+  routeDisposables.push(doorMat);
+  const doors: { x: number; y: number; z: number; r: number }[] = [
+    ...plan.softSpots,
+  ];
+  if (plan.entrance) {
+    doors.push({ ...plan.entrance.surface, r: plan.entrance.r + 1.5 });
+  }
+  for (const d of doors) {
+    let near = Infinity;
+    for (const p of pts) {
+      const v = Math.hypot(p.x - d.x, p.y - d.y, p.z - d.z);
+      if (v < near) near = v;
+    }
+    if (near > d.r + 6) continue; // the route didn't pass through this door
+    const m = new THREE.Mesh(proxyGeo, doorMat);
+    m.position.set(d.x, d.y, d.z);
+    m.scale.setScalar(d.r + 2);
+    m.renderOrder = 8;
+    group.add(m);
+  }
+
+  if (r.bottleneck) {
+    const bm = new THREE.MeshBasicMaterial({
+      color: 0xf87171,
+      depthTest: false,
+    });
+    routeDisposables.push(bm);
+    const b = new THREE.Mesh(proxyGeo, bm);
+    b.position.set(r.bottleneck.x, r.bottleneck.y, r.bottleneck.z);
+    b.scale.setScalar(2);
+    b.renderOrder = 9;
+    group.add(b);
+  }
+
+  scene.add(group);
+  routeGroup = group;
+}
+
+// Map HUD = verifier verdict block + the view's own base lines; the verdict
+// refreshes in place when the worker lands without rebuilding anything.
+let mapHud: { title: string; lines: HudLine[] } | null = null;
+
+function setMapHud(title: string, lines: HudLine[]): void {
+  mapHud = { title, lines };
+  refreshMapHud();
+}
+
+function verifyHudLines(): HudLine[] {
+  if (verifyState.running) return [["verifier", "running…"]];
+  if (verifyState.error) return [["verifier", verifyState.error, "bad"]];
+  const r = verifyState.result;
+  if (!r) return [];
+  const lines: HudLine[] = [
+    [
+      "sealed",
+      `wheel ${r.sealedWheel ? "✓" : "✗"} · shell ${r.sealedShell ? "✓" : "✗"}`,
+      r.sealed ? "ok" : "bad",
+    ],
+    ["reachable", r.reachable ? "✓" : "✗", r.reachable ? "ok" : "bad"],
+  ];
+  if (r.reachable)
+    lines.push([
+      "bottleneck",
+      `${r.minClearance.toFixed(2)} u @ ${r.bottleneckZone ?? "?"}`,
+      r.minClearance >= 0.5 ? "ok" : "bad",
+    ]);
+  if (r.entranceClearance != null)
+    lines.push([
+      "entrance clear",
+      `${r.entranceClearance.toFixed(2)} u`,
+      r.entranceClearance >= 1.4 ? "ok" : "bad",
+    ]);
+  lines.push(["verify time", `${(r.ms / 1000).toFixed(1)} s`]);
+  return lines;
+}
+
+function refreshMapHud(): void {
+  if (view.mode !== "map" || !mapHud) return;
+  setHud(mapHud.title, [...verifyHudLines(), ...mapHud.lines]);
+}
+
+// --- Shared map overlay (WG-15) -----------------------------------------------------
+
+// A flat circle of radius r in the group's local XZ plane.
+function ringLine(radius: number, color: number, opacity: number): THREE.Line {
+  const pts: THREE.Vector3[] = [];
+  for (let i = 0; i <= 96; i++) {
+    const a = (i / 96) * Math.PI * 2;
+    pts.push(new THREE.Vector3(Math.cos(a) * radius, 0, Math.sin(a) * radius));
+  }
+  const geo = new THREE.BufferGeometry().setFromPoints(pts);
+  const mat = new THREE.LineBasicMaterial({
+    color,
+    transparent: true,
+    opacity,
+  });
+  disposables.push(geo, mat);
+  return new THREE.Line(geo, mat);
+}
+
+// A small always-facing text label (biome ids on the radius rings).
+function labelSprite(text: string, color: number): THREE.Sprite {
+  const canvas = document.createElement("canvas");
+  const font = "600 28px ui-monospace, Menlo, monospace";
+  const measure = canvas.getContext("2d")!;
+  measure.font = font;
+  canvas.width = Math.ceil(measure.measureText(text).width) + 16;
+  canvas.height = 40;
+  const c = canvas.getContext("2d")!; // resizing reset the context state
+  c.font = font;
+  c.fillStyle = `#${color.toString(16).padStart(6, "0")}`;
+  c.fillText(text, 8, 30);
+  const tex = new THREE.CanvasTexture(canvas);
+  const mat = new THREE.SpriteMaterial({
+    map: tex,
+    transparent: true,
+    depthTest: false,
+  });
+  disposables.push(tex, mat);
+  const sprite = new THREE.Sprite(mat);
+  // Sized for the map camera (~2× worldR away) — smaller drowns at 800 u.
+  sprite.scale.set((canvas.width / canvas.height) * 18, 18, 1);
+  sprite.renderOrder = 7;
+  return sprite;
+}
+
+// A tiny tin-bell glyph at the spawn berth (dome + open skirt).
+function bellGlyph(pos: Vec3): THREE.Group {
+  const g = new THREE.Group();
+  const mat = new THREE.MeshBasicMaterial({
+    color: 0xa8d8cf,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.9,
+  });
+  const domeGeo = new THREE.SphereGeometry(
+    3,
+    12,
+    6,
+    0,
+    Math.PI * 2,
+    0,
+    Math.PI / 2,
+  );
+  const skirtGeo = new THREE.CylinderGeometry(3, 3.8, 3, 12, 1, true);
+  disposables.push(mat, domeGeo, skirtGeo);
+  const dome = new THREE.Mesh(domeGeo, mat);
+  const skirt = new THREE.Mesh(skirtGeo, mat);
+  skirt.position.y = -1.5;
+  g.add(dome, skirt);
+  g.position.set(pos.x, pos.y, pos.z);
+  return g;
+}
+
+// Everything the map should always show, proxies AND real build: labelled
+// per-biome radius rings (the layer ladder), world radii, the spine, hull
+// soft spots, the sightline trail, the shell entrance, the wreck. Returns
+// the trail verdict for the HUD.
+function drawMapOverlay(
+  plan: WorldPlan,
+  group: THREE.Group,
+): ReturnType<typeof traceTrail> {
+  // The layer ladder, in the tilted frame (layer radii are frame-metric).
+  const frame = makeFrame(world.frame);
+  const rings = new THREE.Group();
+  if (frame) rings.rotation.x = -Math.asin(frame.sin);
+  for (const [i, biome] of world.biomes.entries()) {
+    const pl = biome.placement;
+    let radii: number[] = [];
+    if (pl.mode === "band" || pl.mode === "fused") radii = [pl.rMin, pl.rMax];
+    else if (pl.mode === "hull") radii = [pl.radius];
+    if (!radii.length) continue; // center mode — a point, not a band
+    const color = biome.material.rind;
+    for (const r of radii) rings.add(ringLine(r, color, 0.45));
+    const rOut = Math.max(...radii);
+    const label = labelSprite(biome.id, color);
+    // Staggered azimuth so near-coincident radii don't stack their labels.
+    const az = Math.PI / 4 + i * 0.7;
+    label.position.set(Math.cos(az) * rOut, 0, Math.sin(az) * rOut);
+    rings.add(label);
+  }
+  group.add(rings);
+
+  // World radii: gold band (gold), world edge + boundary veil (teal).
+  const shells: [number, number, number][] = [
+    [world.goldBand.min, 0xffd24a, 0.1],
+    [world.goldBand.max, 0xffd24a, 0.1],
+    [world.worldR, 0x2a7da5, 0.08],
+    [world.boundaryR, 0x1d4457, 0.1],
+  ];
+  for (const [radius, color, opacity] of shells) {
+    if (radius <= 0) continue;
+    const m = new THREE.MeshBasicMaterial({
+      color,
+      wireframe: true,
+      transparent: true,
+      opacity,
+    });
+    disposables.push(m);
+    const mesh = new THREE.Mesh(shellGeo, m);
+    mesh.scale.setScalar(radius);
+    group.add(mesh);
+  }
+
+  // Spine (the descent route) + hull soft spots.
+  if (plan.spine.length) {
+    const sm = new THREE.MeshBasicMaterial({ color: 0xffe08a });
+    disposables.push(sm);
+    const pts: THREE.Vector3[] = [];
+    for (const p of plan.spine) {
+      const marker = new THREE.Mesh(proxyGeo, sm);
+      marker.position.set(p.x, p.y, p.z);
+      marker.scale.setScalar(3.5);
+      group.add(marker);
+      pts.push(new THREE.Vector3(p.x, p.y, p.z));
+    }
+    const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
+    const lineMat = new THREE.LineBasicMaterial({
+      color: 0xffe08a,
+      transparent: true,
+      opacity: 0.6,
+    });
+    disposables.push(lineGeo, lineMat);
+    group.add(new THREE.Line(lineGeo, lineMat));
+  }
+  if (plan.softSpots.length) {
+    const om = new THREE.MeshBasicMaterial({ color: 0xff8a4a });
+    disposables.push(om);
+    for (const sp of plan.softSpots) {
+      const marker = new THREE.Mesh(proxyGeo, om);
+      marker.position.set(sp.x, sp.y, sp.z);
+      marker.scale.setScalar(sp.r * 0.8);
+      group.add(marker);
+    }
+  }
+
+  // The vein trail chain (WG-07): linking hops green, out-of-range red.
+  const trail = traceTrail(world, plan);
+  if (trail) {
+    const draw = (ok: boolean, color: number) => {
+      const pts: THREE.Vector3[] = [];
+      for (const e of trail.edges)
+        if (e.ok === ok)
+          pts.push(
+            new THREE.Vector3(e.a.x, e.a.y, e.a.z),
+            new THREE.Vector3(e.b.x, e.b.y, e.b.z),
+          );
+      if (!pts.length) return;
+      const geo = new THREE.BufferGeometry().setFromPoints(pts);
+      const mat = new THREE.LineBasicMaterial({
+        color,
+        transparent: true,
+        opacity: 0.75,
+      });
+      disposables.push(geo, mat);
+      group.add(new THREE.LineSegments(geo, mat));
+    };
+    draw(true, 0x4ade80);
+    draw(false, 0xef4444);
+  }
+
+  // The melt-shell entrance (WG-08) + the wreck (WG-05).
+  if (plan.entrance) {
+    const em = new THREE.MeshBasicMaterial({ color: 0x34e5e5 });
+    disposables.push(em);
+    const e = plan.entrance;
+    const marker = new THREE.Mesh(proxyGeo, em);
+    marker.position.set(e.surface.x, e.surface.y, e.surface.z);
+    marker.scale.setScalar(3);
+    group.add(marker);
+  }
+  if (plan.wreckPos) {
+    const wm = new THREE.MeshBasicMaterial({ color: 0x9ca3af });
+    disposables.push(wm);
+    const marker = new THREE.Mesh(proxyGeo, wm);
+    marker.position.set(plan.wreckPos.x, plan.wreckPos.y, plan.wreckPos.z);
+    marker.scale.setScalar(3);
+    group.add(marker);
+  }
+
+  return trail;
+}
+
 function mount(group: THREE.Group): void {
   content = group;
   scene.add(group);
@@ -564,6 +983,7 @@ let rebuildTimer = 0;
 function scheduleRebuild(delay = 120): void {
   clearTimeout(rebuildTimer);
   rebuildTimer = window.setTimeout(() => void rebuild(), delay);
+  syncUrl(); // seed/difficulty rerolls keep the address bar shareable
 }
 
 async function rebuild(): Promise<void> {
@@ -599,11 +1019,23 @@ function skinSource(): BiomeMaterial {
 function refreshSkin(): void {
   if (!content || view.mode === "map") return;
   const mat = makeSkinMaterial(skinSource());
+  const replaced = new Set<THREE.Material>();
   content.traverse((o) => {
     const m = o as THREE.Mesh;
-    if (m.isMesh && (m.material as THREE.MeshToonMaterial).userData.__toon)
+    if (m.isMesh && (m.material as THREE.MeshToonMaterial).userData.__toon) {
+      replaced.add(m.material as THREE.Material);
       m.material = mat;
+    }
   });
+  // WG-17e: the replaced skins are dead the moment every mesh points at the
+  // new one — dispose NOW, or a color-slider drag piles up one compiled
+  // program per input event until the next rebuild.
+  for (const old of replaced) {
+    if (old === mat) continue;
+    old.dispose();
+    const i = disposables.indexOf(old);
+    if (i >= 0) disposables.splice(i, 1);
+  }
   applyWire();
 }
 
@@ -700,8 +1132,10 @@ function rebuildPart(): void {
   );
   const tGen = performance.now();
   const mesh = meshChunk(chunk, view.partRes, makeSkinMaterial(skinSource()));
+  mesh.userData.zone = part.id;
   chunk.field = null; // the bench never digs; drop the cached voxels
   const tMesh = performance.now();
+  notePerfBuild("part gen+mesh", tMesh - t0);
   disposables.push(mesh.geometry);
   benchChunks = [chunk];
 
@@ -732,19 +1166,6 @@ function rebuildPart(): void {
 
 // --- Biome view ------------------------------------------------------------------
 
-function randDirIn(
-  rng: () => number,
-  cosTheta: number,
-  out: THREE.Vector3,
-): THREE.Vector3 {
-  // Uniform direction inside the +Z cone (the wedge).
-  const cosA = 1 - rng() * (1 - cosTheta);
-  const sinA = Math.sqrt(Math.max(0, 1 - cosA * cosA));
-  const phi = rng() * Math.PI * 2;
-  out.set(Math.cos(phi) * sinA, Math.sin(phi) * sinA, cosA);
-  return out;
-}
-
 async function rebuildBiome(): Promise<void> {
   const token = buildToken;
   const biome = currentBiome();
@@ -760,67 +1181,28 @@ async function rebuildBiome(): Promise<void> {
   const rng = mulberry32(view.seed >>> 0);
   const ctx = { difficulty: view.difficulty, blastPoints: [] as Vec3[] };
 
-  // Wedge chunk placement — same spacing/size rules as the real placeChunks
-  // (sightline is a whole-map property; the map view draws the real chain).
-  interface Placed {
-    center: THREE.Vector3;
-    s: number;
-    res: number;
-    part: PartRecipe;
+  // WG-16: no re-implemented placement — the preview IS the real layout,
+  // filtered by zone + wedge cone (as the fused path already does). Carves
+  // still come from a bench-local stream: the real one interleaves every
+  // biome, so per-chunk carves can't be replayed in isolation.
+  let plan: WorldPlan;
+  try {
+    plan = planWorldLayout(view.seed, view.difficulty, world);
+  } catch (err) {
+    setHud("invalid recipe", [["error", (err as Error).message, "bad"]]);
+    return;
   }
-  const placed: Placed[] = [];
-  const dir = new THREE.Vector3();
-  let want = 1;
-  let rMid = 0;
-
-  if (pl.mode === "center") {
-    placed.push({
-      center: new THREE.Vector3(0, 0, 0),
-      s: biome.sizeBase + (biome.sizeVar > 0 ? rng() * biome.sizeVar : 0),
-      res: biome.res,
-      part: pickPart(world, biome, rng),
-    });
-  } else {
-    rMid = (pl.rMin + pl.rMax) / 2;
-    const span = pl.rMax - pl.rMin;
-    want = Math.max(2, Math.round(pl.count * coneFrac));
-    for (let i = 0; i < want; i++) {
-      const jitter = biome.sizeVar > 0 ? rng() : 0;
-      const part = pickPart(world, biome, rng);
-      placing: for (let shrink = 0; shrink < 4; shrink++) {
-        const shrinkMul = 0.9 ** shrink;
-        for (let attempt = 0; attempt < 300; attempt++) {
-          randDirIn(rng, cosTheta, dir);
-          let u = rng();
-          if (pl.densityGrade === "outward") u = Math.sqrt(u);
-          else if (pl.densityGrade === "inward") u = 1 - Math.sqrt(1 - u);
-          const rad = pl.rMin + u * span;
-          let s: number;
-          if (pl.sizeGrade) {
-            const t = (rad - pl.rMin) / span;
-            const g = pl.sizeGrade === "inward" ? 1 - t : t;
-            s =
-              (biome.sizeBase + biome.sizeVar * g) *
-              (0.9 + 0.2 * jitter) *
-              shrinkMul;
-          } else {
-            s = (biome.sizeBase + jitter * biome.sizeVar) * shrinkMul;
-          }
-          const p = new THREE.Vector3(dir.x * rad, dir.y * rad, dir.z * rad);
-          let ok = true;
-          for (const other of placed)
-            if (p.distanceTo(other.center) < (s + other.s) * pl.guard) {
-              ok = false;
-              break;
-            }
-          if (ok) {
-            placed.push({ center: p, s, res: biome.res, part });
-            break placing;
-          }
-        }
-      }
-    }
-  }
+  const zoneSpecs = plan.specs.filter((sp) => sp.zone === biome.id);
+  let placed =
+    pl.mode === "center"
+      ? zoneSpecs
+      : zoneSpecs.filter((sp) => {
+          const len = sp.center.length() || 1;
+          return sp.center.z / len >= cosTheta;
+        });
+  if (!placed.length)
+    placed = zoneSpecs.slice(0, Math.min(8, zoneSpecs.length));
+  const rMid = pl.mode === "band" ? (pl.rMin + pl.rMax) / 2 : 0;
 
   const group = new THREE.Group();
   group.position.z = -rMid; // recentre the wedge on the origin
@@ -836,6 +1218,7 @@ async function rebuildBiome(): Promise<void> {
     const c = placed[i];
     const chunk = makeChunkData(rng, c.center, c.s, c.res, c.part, ctx);
     const mesh = meshChunk(chunk, c.res, mat);
+    mesh.userData.zone = biome.id;
     chunk.field = null;
     // Walk collision runs in world coords — bake the wedge recentre in.
     chunk.center = c.center.clone().add(group.position);
@@ -846,6 +1229,7 @@ async function rebuildBiome(): Promise<void> {
   }
   setLoading(null);
   applyWire();
+  notePerfBuild("wedge build", performance.now() - t0);
 
   // The wedge spreads laterally by ~2·r·sin(θ) — frame for that, not just
   // the band's radial depth.
@@ -863,10 +1247,7 @@ async function rebuildBiome(): Promise<void> {
 
   setHud(`biome · ${biome.id}`, [
     ["wedge", `${view.wedgeDeg}° (${(coneFrac * 100).toFixed(1)}% of shell)`],
-    [
-      "chunks",
-      `${placed.length} of ${pl.mode === "band" ? pl.count : want} total`,
-    ],
+    ["chunks", `${placed.length} of ${zoneSpecs.length} total`],
     ["triangles", Math.round(tris).toLocaleString()],
     ["carve time", `${(performance.now() - t0).toFixed(0)} ms`],
     ["blast walls", String(ctx.blastPoints.length)],
@@ -905,8 +1286,12 @@ async function rebuildLayerWedge(
   const chunks = buildLayerChunks(rng, use, ctx, {
     loopFrac: pl.mode === "fused" ? pl.loopFrac : 0,
     sideExits: pl.mode === "fused" ? pl.sideExits : 0,
-    spineIn: null,
-    spineOut: null,
+    // WG-16: the REAL spine doors, so the wedge preview shows the door
+    // tunnels that will pierce this layer in the full build.
+    spineIn:
+      pl.mode === "fused" ? nearestSpinePoint(plan.spine, pl.rMax) : null,
+    spineOut:
+      pl.mode === "fused" ? nearestSpinePoint(plan.spine, pl.rMin) : null,
   });
 
   const rMid = pl.mode === "fused" ? (pl.rMin + pl.rMax) / 2 : pl.radius;
@@ -923,6 +1308,7 @@ async function rebuildLayerWedge(
     if (token !== buildToken) return;
     const chunk = chunks[i];
     const mesh = meshChunk(chunk, chunk.res, mat);
+    mesh.userData.zone = biome.id;
     chunk.field = null;
     chunk.center = chunk.center.clone().add(group.position);
     benchChunks.push(chunk);
@@ -932,6 +1318,7 @@ async function rebuildLayerWedge(
   }
   setLoading(null);
   applyWire();
+  notePerfBuild("wedge build", performance.now() - t0);
 
   const sinTheta = Math.sin((view.wedgeDeg * Math.PI) / 180);
   const extent = Math.max(
@@ -964,13 +1351,14 @@ const shellGeo = new THREE.SphereGeometry(1, 40, 24);
 
 function rebuildMapProxies(): void {
   const t0 = performance.now();
-  let plan: WorldPlan;
-  try {
-    plan = planWorldLayout(view.seed, view.difficulty, world);
-  } catch (err) {
-    setHud("invalid recipe", [["error", (err as Error).message, "bad"]]);
+  // Full data build (~50 ms, no meshing): the plan for the proxies, plus the
+  // REAL seeded props / spawn / gold instead of approximations.
+  const data = computeWorldData();
+  if (!data) {
+    setHud("invalid recipe", [["error", dataErr ?? "?", "bad"]]);
     return;
   }
+  const plan = data.plan;
   const group = new THREE.Group();
 
   const zoneMats = new Map<string, THREE.MeshBasicMaterial>();
@@ -1030,118 +1418,35 @@ function rebuildMapProxies(): void {
     group.add(sil);
   }
 
-  // Spine (the descent route) + hull soft spots.
-  if (plan.spine.length) {
-    const sm = new THREE.MeshBasicMaterial({ color: 0xffe08a });
-    disposables.push(sm);
-    const pts: THREE.Vector3[] = [];
-    for (const p of plan.spine) {
-      const marker = new THREE.Mesh(proxyGeo, sm);
-      marker.position.set(p.x, p.y, p.z);
-      marker.scale.setScalar(3.5);
-      group.add(marker);
-      pts.push(new THREE.Vector3(p.x, p.y, p.z));
-    }
-    const lineGeo = new THREE.BufferGeometry().setFromPoints(pts);
-    const lineMat = new THREE.LineBasicMaterial({
-      color: 0xffe08a,
-      transparent: true,
-      opacity: 0.6,
-    });
-    disposables.push(lineGeo, lineMat);
-    group.add(new THREE.Line(lineGeo, lineMat));
-  }
-  if (plan.softSpots.length) {
-    const om = new THREE.MeshBasicMaterial({ color: 0xff8a4a });
-    disposables.push(om);
-    for (const sp of plan.softSpots) {
-      const marker = new THREE.Mesh(proxyGeo, om);
-      marker.position.set(sp.x, sp.y, sp.z);
-      marker.scale.setScalar(sp.r * 0.8);
-      group.add(marker);
-    }
-  }
+  // Rings, spine, soft spots, trail, entrance, wreck — shared with the real
+  // build view (WG-15).
+  const trail = drawMapOverlay(plan, group);
 
-  // The vein trail chain (WG-07): linking hops green, out-of-range red.
-  const trail = traceTrail(world, plan);
-  if (trail) {
-    const draw = (ok: boolean, color: number) => {
-      const pts: THREE.Vector3[] = [];
-      for (const e of trail.edges)
-        if (e.ok === ok)
-          pts.push(
-            new THREE.Vector3(e.a.x, e.a.y, e.a.z),
-            new THREE.Vector3(e.b.x, e.b.y, e.b.z),
-          );
-      if (!pts.length) return;
-      const geo = new THREE.BufferGeometry().setFromPoints(pts);
-      const mat = new THREE.LineBasicMaterial({
-        color,
-        transparent: true,
-        opacity: 0.75,
-      });
-      disposables.push(geo, mat);
-      group.add(new THREE.LineSegments(geo, mat));
-    };
-    draw(true, 0x4ade80);
-    draw(false, 0xef4444);
-  }
-  // The melt-shell entrance (WG-08) + the wreck (WG-05).
-  if (plan.entrance) {
-    const em = new THREE.MeshBasicMaterial({ color: 0x34e5e5 });
-    disposables.push(em);
-    const e = plan.entrance;
-    const marker = new THREE.Mesh(proxyGeo, em);
-    marker.position.set(e.surface.x, e.surface.y, e.surface.z);
-    marker.scale.setScalar(3);
-    group.add(marker);
-  }
-  if (plan.wreckPos) {
-    const wm = new THREE.MeshBasicMaterial({ color: 0x9ca3af });
-    disposables.push(wm);
-    const marker = new THREE.Mesh(proxyGeo, wm);
-    marker.position.set(plan.wreckPos.x, plan.wreckPos.y, plan.wreckPos.z);
-    marker.scale.setScalar(3);
-    group.add(marker);
-  }
-
-  // World radii: gold band (gold), world edge + boundary veil (teal).
-  const rings: [number, number, number][] = [
-    [world.goldBand.min, 0xffd24a, 0.1],
-    [world.goldBand.max, 0xffd24a, 0.1],
-    [world.worldR, 0x2a7da5, 0.08],
-    [world.boundaryR, 0x1d4457, 0.1],
-  ];
-  for (const [radius, color, opacity] of rings) {
-    if (radius <= 0) continue;
-    const m = new THREE.MeshBasicMaterial({
-      color,
-      wireframe: true,
-      transparent: true,
-      opacity,
-    });
-    disposables.push(m);
-    const mesh = new THREE.Mesh(shellGeo, m);
-    mesh.scale.setScalar(radius);
-    group.add(mesh);
-  }
-
-  // Spawn approximation (the real point needs the meshed world).
+  // Real spawn (data build) + bell glyph + real gold.
   const spawnMat = new THREE.MeshBasicMaterial({ color: 0x66ff99 });
   disposables.push(spawnMat);
   const spawn = new THREE.Mesh(proxyGeo, spawnMat);
-  spawn.position.set(0, 18, world.worldR + 14);
-  spawn.scale.setScalar(4);
+  spawn.position.set(data.spawnPoint.x, data.spawnPoint.y, data.spawnPoint.z);
+  spawn.scale.setScalar(3);
   group.add(spawn);
+  group.add(bellGlyph(data.spawnPoint));
+  const goldMat = new THREE.MeshBasicMaterial({ color: 0xffd24a });
+  disposables.push(goldMat);
+  const gold = new THREE.Mesh(proxyGeo, goldMat);
+  gold.position.set(data.goldPos.x, data.goldPos.y, data.goldPos.z);
+  gold.scale.setScalar(3);
+  group.add(gold);
 
   mount(group);
   frameCamera(world.worldR * 2.05);
   clipScale = world.worldR;
 
-  const props = drawProps();
+  const planMs = performance.now() - t0;
+  notePerfBuild("map data build", planMs);
+  const props = drawProps(plan.props);
   const lines: HudLine[] = [
     ["chunks", String(plan.specs.length)],
-    ["planned in", `${(performance.now() - t0).toFixed(0)} ms`],
+    ["planned in", `${planMs.toFixed(0)} ms`],
   ];
   if (plan.spine.length)
     lines.push(["spine", plan.spine.map((p) => p.r.toFixed(0)).join(" → ")]);
@@ -1155,7 +1460,8 @@ function rebuildMapProxies(): void {
   lines.push(...propHudLines(props));
   for (const biome of world.biomes)
     lines.push([biome.id, String(counts.get(biome.id) ?? 0)]);
-  setHud("map · layout proxies", lines);
+  setMapHud("map · layout proxies", lines);
+  startVerify(plan);
 }
 
 async function buildRealWorld(): Promise<void> {
@@ -1166,7 +1472,8 @@ async function buildRealWorld(): Promise<void> {
   // Optional res downshift so full-world iteration stays quick.
   const buildWorld = cloneWorld(world);
   if (view.buildHalfRes)
-    for (const biome of buildWorld.biomes) biome.res = HALF_RES[biome.res] ?? 32;
+    for (const biome of buildWorld.biomes)
+      biome.res = HALF_RES[biome.res] ?? 32;
 
   const t0 = performance.now();
   try {
@@ -1188,9 +1495,17 @@ async function buildRealWorld(): Promise<void> {
   view.built = true;
   setLoading(null);
   clipScale = world.worldR;
+  const buildMs = performance.now() - t0;
+  notePerfBuild("world build", buildMs);
+  syncUrl(); // &build=1 — a built find is shareable (WG-17a)
 
-  // Gold + spawn markers over the real build.
+  // Overlay over the real build: same ladder/spine/trail/doors as proxies
+  // (WG-15) — re-planned from the recipe the build actually used, so the
+  // markers land on the meshed geometry.
   const markers = new THREE.Group();
+  const plan = planWorldLayout(view.seed, view.difficulty, buildWorld);
+  const trail = drawMapOverlay(plan, markers);
+
   const gold = getGoldPos();
   if (gold) {
     const m = new THREE.MeshBasicMaterial({ color: 0xffd24a });
@@ -1207,13 +1522,14 @@ async function buildRealWorld(): Promise<void> {
   spawn.position.set(sp.x, sp.y, sp.z);
   spawn.scale.setScalar(3);
   markers.add(spawn);
+  markers.add(bellGlyph(sp));
   mount(markers);
 
-  const props = drawProps();
-  setHud("map · real build", [
+  const props = drawProps(getSeededProps());
+  const lines: HudLine[] = [
     ["seed / diff", `${view.seed} / d${view.difficulty}`],
     ["res", view.buildHalfRes ? "half" : "full"],
-    ["built in", `${((performance.now() - t0) / 1000).toFixed(1)} s`],
+    ["built in", `${(buildMs / 1000).toFixed(1)} s`],
     [
       "gold",
       gold
@@ -1221,9 +1537,17 @@ async function buildRealWorld(): Promise<void> {
         : "—",
     ],
     ["gold radius", gold ? Math.hypot(gold.x, gold.y, gold.z).toFixed(0) : "—"],
-    ...propHudLines(props),
-    ["walk it", "press F"],
-  ]);
+  ];
+  if (trail)
+    lines.push([
+      "trail",
+      `${trail.linked} linked, ${trail.orphans} orphans, ` +
+        `entrance ${trail.reachesEntrance ? "✓" : "✗"}`,
+      trail.reachesEntrance && trail.orphans <= 3 ? "ok" : "bad",
+    ]);
+  lines.push(...propHudLines(props), ["walk it", "press F"]);
+  setMapHud("map · real build", lines);
+  startVerify(plan);
 }
 
 // --- Copy helpers ------------------------------------------------------------------
@@ -1897,7 +2221,8 @@ function buildBiomeCat(panel: HTMLElement, cat: string): void {
         pl.entrance?.r ?? 0,
         (v) =>
           edit(() => {
-            if (v < 1.4) delete pl.entrance; // the ≥1.4 u cargo law
+            if (v < 1.4)
+              delete pl.entrance; // the ≥1.4 u cargo law
             else pl.entrance = { r: v };
           }),
         (v) => (v < 1.4 ? "off" : v.toFixed(1)),
@@ -2317,7 +2642,7 @@ function buildMapCat(panel: HTMLElement, cat: string): void {
         view.propKinds[kind] = !view.propKinds[kind];
         b.classList.toggle("on", view.propKinds[kind]);
         // Built worlds only redraw the overlay — never tear down the build.
-        if (view.built) drawProps();
+        if (view.built) drawProps(getSeededProps());
         else scheduleRebuild(0);
       });
       btn.classList.toggle("on", view.propKinds[kind]);
@@ -2365,12 +2690,19 @@ function buildMapCat(panel: HTMLElement, cat: string): void {
 
 // --- Panel assembly --------------------------------------------------------------------
 
+// WG-17a: the URL always names the exact thing on screen — world, subject,
+// seed, difficulty, build — so a rerolled find is shareable by copy-paste.
 function syncUrl(): void {
   const q = new URLSearchParams();
   q.set("world", store.active);
   if (view.mode === "part") q.set("part", view.partId);
   else if (view.mode === "biome") q.set("biome", view.biomeId);
-  else q.set("map", "1");
+  else {
+    q.set("map", "1");
+    if (view.built) q.set("build", "1");
+  }
+  q.set("seed", String(view.seed));
+  if (view.difficulty !== 1) q.set("d", String(view.difficulty));
   history.replaceState(null, "", `?${q}`);
 }
 
@@ -2399,6 +2731,79 @@ function switchWorld(key: string): void {
   scheduleRebuild(0);
 }
 
+// --- Perf HUD (WG-18) -------------------------------------------------------------
+
+const perf = {
+  on: true,
+  frames: 0,
+  timeAcc: 0,
+  fps: 0,
+  lastBuildLabel: "last build",
+  lastBuildMs: 0,
+};
+
+function notePerfBuild(label: string, ms: number): void {
+  perf.lastBuildLabel = label;
+  perf.lastBuildMs = ms;
+}
+
+const fmtTris = (n: number) =>
+  n >= 1e6
+    ? `${(n / 1e6).toFixed(2)}M`
+    : n >= 1000
+      ? `${(n / 1000).toFixed(0)}k`
+      : String(Math.round(n));
+
+// Rebuilt every refresh tick (2 Hz): renderer.info plus a scene triangle
+// census grouped by the zone tag every world/bench mesh carries.
+function refreshPerfHud(): void {
+  const el = $("perf");
+  if (!perf.on) {
+    el.style.display = "none";
+    return;
+  }
+  el.style.display = "block";
+  const info = renderer.info;
+  const byZone = new Map<string, number>();
+  let total = 0;
+  scene.traverse((o) => {
+    const m = o as THREE.Mesh;
+    if (!m.isMesh || !m.visible) return;
+    const geo = m.geometry as THREE.BufferGeometry | undefined;
+    if (!geo?.attributes?.position) return;
+    const tris =
+      (geo.index ? geo.index.count : geo.attributes.position.count) / 3;
+    total += tris;
+    const zone = m.userData.zone as string | undefined;
+    if (zone) byZone.set(zone, (byZone.get(zone) ?? 0) + tris);
+  });
+  const lines: [string, string][] = [
+    ["fps", perf.fps.toFixed(0)],
+    ["draw calls", String(info.render.calls)],
+    ["tris drawn", fmtTris(info.render.triangles)],
+    ["tris in scene", fmtTris(total)],
+    ["programs", String(info.programs?.length ?? 0)],
+    ["geom / tex", `${info.memory.geometries} / ${info.memory.textures}`],
+    [
+      perf.lastBuildLabel,
+      perf.lastBuildMs >= 1000
+        ? `${(perf.lastBuildMs / 1000).toFixed(1)} s`
+        : `${perf.lastBuildMs.toFixed(0)} ms`,
+    ],
+  ];
+  for (const [zone, tris] of [...byZone.entries()].sort((a, b) => b[1] - a[1]))
+    lines.push([`· ${zone}`, fmtTris(tris)]);
+  el.innerHTML = "";
+  for (const [k, v] of lines) {
+    const div = document.createElement("div");
+    div.className = "hud-line";
+    div.innerHTML = `<span class="k"></span><span class="v"></span>`;
+    (div.querySelector(".k") as HTMLElement).textContent = k;
+    (div.querySelector(".v") as HTMLElement).textContent = v;
+    el.appendChild(div);
+  }
+}
+
 // --- Global UI -------------------------------------------------------------------
 
 const modeBtns: Record<string, HTMLButtonElement> = {};
@@ -2408,16 +2813,14 @@ for (const m of ["part", "biome", "map"] as Mode[])
     buildToolUI();
     scheduleRebuild(0);
   });
-selectRow(
+worldPicker = selectRow(
   $("modes"),
   "table",
-  Object.keys(WORLD_DEFAULTS).map((k) => ({
-    value: k,
-    label: WORLD_LABELS[k] ?? k,
-  })),
+  worldOptions(),
   store.active,
   switchWorld,
 );
+refreshWorldPicker();
 
 const viewToggles = $("view-toggles");
 const toggle = (
@@ -2465,6 +2868,10 @@ toggle("fog", view.fogOn, (on) => {
 toggle("headlamp", view.lamp, (on) => {
   view.lamp = on;
   lamp.visible = on;
+});
+toggle("perf", perf.on, (on) => {
+  perf.on = on;
+  refreshPerfHud();
 });
 toggle("spin", view.spin, (on) => (view.spin = on));
 toggle("clip", view.clipOn, (on) => {
@@ -2553,8 +2960,10 @@ addEventListener("resize", () => {
 
 const clock = new THREE.Clock();
 let elapsed = 0;
+let perfTimer = 0;
 renderer.setAnimationLoop(() => {
-  const dt = Math.min(clock.getDelta(), 0.05);
+  const raw = clock.getDelta();
+  const dt = Math.min(raw, 0.05);
   elapsed += dt;
   updateGouda(elapsed); // vein pulse/shimmer time for every gouda material
   if (walk.on) {
@@ -2565,6 +2974,16 @@ renderer.setAnimationLoop(() => {
     controls.update();
   }
   renderer.render(scene, camera);
+  perf.frames++;
+  perf.timeAcc += raw;
+  perfTimer += raw;
+  if (perfTimer >= 0.5) {
+    perf.fps = perf.timeAcc > 0 ? perf.frames / perf.timeAcc : 0;
+    perf.frames = 0;
+    perf.timeAcc = 0;
+    perfTimer = 0;
+    refreshPerfHud();
+  }
 });
 
 const params = new URLSearchParams(location.search);
@@ -2588,8 +3007,11 @@ if (partParam && world.parts.some((p) => p.id === partParam)) {
   view.mode = "map";
 }
 if (params.has("seed")) view.seed = Number(params.get("seed")) >>> 0;
+if (params.has("d"))
+  view.difficulty = Math.min(3, Math.max(1, Number(params.get("d")) || 1));
 
 buildToolUI();
+scheduleValidate(); // badge reflects a stored-but-invalid table immediately
 void rebuild().then(async () => {
   // ?build=1 deep-links straight into the real full build (map mode).
   if (params.has("build") && view.mode === "map") await buildRealWorld();

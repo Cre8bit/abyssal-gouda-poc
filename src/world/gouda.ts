@@ -217,11 +217,7 @@ export interface EntranceSpec {
 // ceilings, melt hazards at cavern ceilings/floors, the wreck. Positions are
 // consumed by M5/M6 game systems; replicated for free (same seed, same list).
 export type SeededPropKind =
-  | "airPocket"
-  | "wreck"
-  | "melt_fall"
-  | "melt_pool"
-  | "thermal_vent";
+  "airPocket" | "wreck" | "melt_fall" | "melt_pool" | "thermal_vent";
 
 export interface SeededProp {
   kind: SeededPropKind;
@@ -1455,6 +1451,10 @@ export function updateGouda(
     markerMaterial.opacity = 0.35 + 0.22 * Math.sin(elapsed * 2.6);
   }
 
+  // `elapsed` may step backwards once when the shared clock locks to a
+  // younger host — resync the cull timer instead of stalling until it
+  // catches back up.
+  if (elapsed < lastCull) lastCull = elapsed - 1;
   if (cameraPos && worldGroup && elapsed - lastCull > 0.25) {
     lastCull = elapsed;
     const cullDist = Math.min(Math.max(visibility * 1.25, 80), 720);
@@ -1614,7 +1614,7 @@ function placeChunks(
     const ux = dx / len,
       uy = dy / len,
       uz = dz / len;
-    for (let t = 0; t < len; ) {
+    for (let t = 0; t < len;) {
       const px = a.x + ux * t,
         py = a.y + uy * t,
         pz = a.z + uz * t;
@@ -1997,6 +1997,19 @@ function placeChunks(
   }
 
   return { specs, spine, softSpots, entrance, wreckPos, props: [] };
+}
+
+// The spine through-point serving a layer boundary at frame radius r, if one
+// sits close enough to belong to it. Shared by buildWorldData and the bench's
+// fused/hull wedge preview (WG-16) so both pick the same door.
+export function nearestSpinePoint(
+  spine: SpinePoint[],
+  r: number,
+): SpinePoint | null {
+  let best: SpinePoint | null = null;
+  for (const p of spine)
+    if (!best || Math.abs(p.r - r) < Math.abs(best.r - r)) best = p;
+  return best && Math.abs(best.r - r) < 15 ? best : null;
 }
 
 // Layout-only pass for the worldgen bench's map view: the chunk placement a
@@ -2622,7 +2635,11 @@ function seedProps(
   const dist = (x: number, y: number, z: number) =>
     distanceToWorld(chunkList, [], x, y, z);
 
-  const snapToSurface = (from: Vec3, dirY: 1 | -1, maxT: number): Vec3 | null => {
+  const snapToSurface = (
+    from: Vec3,
+    dirY: 1 | -1,
+    maxT: number,
+  ): Vec3 | null => {
     if (dist(from.x, from.y, from.z) < PROP_SNAP) return null;
     let lo = 0;
     for (let t = 0.25; t <= maxT; t += 0.25) {
@@ -2764,20 +2781,14 @@ export function buildWorldData(opts: {
       while (j < specs.length && specs[j].body === spec.body) j++;
       const biome = world.biomes.find((b) => b.id === spec.zone)!;
       const pl = biome.placement;
-      const near = (r: number): SpinePoint | null => {
-        let best: SpinePoint | null = null;
-        for (const p of plan.spine)
-          if (!best || Math.abs(p.r - r) < Math.abs(best.r - r)) best = p;
-        return best && Math.abs(best.r - r) < 15 ? best : null;
-      };
       const eyeSink: SphereCarve[] = [];
       const layerOpts: LayerGenOpts =
         pl.mode === "fused"
           ? {
               loopFrac: pl.loopFrac,
               sideExits: pl.sideExits,
-              spineIn: near(pl.rMax),
-              spineOut: near(pl.rMin),
+              spineIn: nearestSpinePoint(plan.spine, pl.rMax),
+              spineOut: nearestSpinePoint(plan.spine, pl.rMin),
               eyesOut: eyeSink,
             }
           : {
@@ -2979,6 +2990,7 @@ export async function buildGoudaWorld(
     chunks.push(chunk);
     const mesh = meshChunk(chunk, chunk.res, materials[chunk.zone!]!);
     mesh.userData.reach = chunk.body ? chunk.s * 1.75 : chunk.s * 1.4;
+    mesh.userData.zone = chunk.zone; // bench perf HUD groups triangles by this
     triangles += mesh.geometry.attributes.position.count / 3;
     group.add(mesh);
     onProgress(i + 1, total, specs[i].label);
@@ -2991,6 +3003,7 @@ export async function buildGoudaWorld(
   const crumbMaterial = materials.drift ?? materials[world.biomes[0].id]!;
   for (const spec of data.debris) {
     const crumb = new THREE.Mesh(crumbGeos[spec.geoIndex], crumbMaterial);
+    crumb.userData.zone = "debris";
     crumb.position.copy(spec.center);
     crumb.scale.setScalar(spec.s);
     crumb.rotation.set(spec.rot.x, spec.rot.y, spec.rot.z);
