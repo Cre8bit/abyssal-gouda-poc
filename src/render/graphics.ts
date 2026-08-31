@@ -77,6 +77,17 @@ interface BreathState {
   seed: number;
 }
 
+interface ChipState {
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  age: number;
+  life: number;
+}
+
 interface Flashlight {
   group: THREE.Group;
   spot: THREE.SpotLight;
@@ -153,6 +164,9 @@ const BURST_PARTICLES = 24;
 const PLANKTON_COUNT = 320;
 const PLANKTON_RADIUS = 26;
 const BREATH_COUNT = 18; // your own exhaled bubbles
+const CHIP_COUNT = 120; // cheese crumbs thrown by the driller
+const CHIP_DRAG = 2.6; // 1/s — water eats the throw fast
+const CHIP_SINK = 1.1; // u/s² — crumbs are heavier than water
 
 const FLASHLIGHT_INTENSITY = 260;
 const SPILL_INTENSITY = 32;
@@ -184,6 +198,12 @@ let plankton: THREE.Points<THREE.BufferGeometry, THREE.ShaderMaterial>;
 let breath: {
   points: THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial>;
   states: BreathState[];
+  cursor: number;
+};
+// { points, states } — cheese crumbs, sprayed out of a fresh drill wound
+let chips: {
+  points: THREE.Points<THREE.BufferGeometry, THREE.ShaderMaterial>;
+  states: ChipState[];
   cursor: number;
 };
 let flashlight: Flashlight; // { group, spot, spill, beam, halo, on } — helmet-mounted
@@ -351,6 +371,7 @@ export function initGraphics(container: HTMLElement): HTMLCanvasElement {
   createBursts();
   createPlankton();
   createBreath();
+  createChips();
 
   window.addEventListener("resize", onResize);
 
@@ -1065,6 +1086,112 @@ function updateBreath(delta: number): void {
   positions.needsUpdate = true;
 }
 
+// Cheese crumbs: opaque gold flecks torn out of the rind, thrown outward,
+// then dragged to a stop by the water and sinking away.
+function createChips(): void {
+  const positions = new Float32Array(CHIP_COUNT * 3);
+  const alphas = new Float32Array(CHIP_COUNT);
+  const seeds = new Float32Array(CHIP_COUNT);
+  for (let i = 0; i < CHIP_COUNT; i++) {
+    positions[i * 3 + 1] = -9999;
+    seeds[i] = Math.random();
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("aAlpha", new THREE.BufferAttribute(alphas, 1));
+  geometry.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 1));
+
+  const material = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    uniforms: { uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) } },
+    vertexShader: /* glsl */ `
+      uniform float uPixelRatio;
+      attribute float aAlpha;
+      attribute float aSeed;
+      varying float vAlpha;
+      void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_PointSize = (2.0 + aSeed * 3.5) * uPixelRatio * (16.0 / -mv.z);
+        vAlpha = aAlpha * smoothstep(34.0, 2.0, -mv.z);
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      varying float vAlpha;
+      void main() {
+        float d = distance(gl_PointCoord, vec2(0.5));
+        float a = smoothstep(0.5, 0.18, d) * vAlpha;
+        gl_FragColor = vec4(0.86, 0.70, 0.32, a);
+      }
+    `,
+  });
+
+  const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+  scene.add(points);
+
+  const states: ChipState[] = [];
+  for (let i = 0; i < CHIP_COUNT; i++) {
+    states.push({ x: 0, y: -9999, z: 0, vx: 0, vy: 0, vz: 0, age: 9, life: 1 });
+  }
+  chips = { points, states, cursor: 0 };
+}
+
+// Spray crumbs out of a carve. `speed` scales the throw — the driller
+// demolishes, bare paws only crumble.
+export function chipsAt(
+  x: number,
+  y: number,
+  z: number,
+  count: number = 18,
+  speed: number = 3.4,
+): void {
+  if (!chips) return;
+  for (let n = 0; n < count; n++) {
+    const s = chips.states[chips.cursor];
+    chips.cursor = (chips.cursor + 1) % CHIP_COUNT;
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(2 * Math.random() - 1);
+    const v = speed * (0.35 + Math.random() * 0.65);
+    s.x = x;
+    s.y = y;
+    s.z = z;
+    s.vx = Math.sin(phi) * Math.cos(theta) * v;
+    s.vy = Math.cos(phi) * v;
+    s.vz = Math.sin(phi) * Math.sin(theta) * v;
+    s.age = 0;
+    s.life = 0.9 + Math.random() * 0.9;
+  }
+}
+
+function updateChips(delta: number): void {
+  const positions = chips.points.geometry.attributes.position;
+  const alphas = chips.points.geometry.attributes.aAlpha;
+  const drag = Math.max(0, 1 - CHIP_DRAG * delta);
+  for (let i = 0; i < CHIP_COUNT; i++) {
+    const s = chips.states[i];
+    if (s.age >= s.life) {
+      if (alphas.getX(i) !== 0) {
+        alphas.setX(i, 0);
+        positions.setXYZ(i, 0, -9999, 0);
+      }
+      continue;
+    }
+    s.age += delta;
+    s.vx *= drag;
+    s.vy = s.vy * drag - CHIP_SINK * delta;
+    s.vz *= drag;
+    s.x += s.vx * delta;
+    s.y += s.vy * delta;
+    s.z += s.vz * delta;
+    positions.setXYZ(i, s.x, s.y, s.z);
+    alphas.setX(i, Math.max(0, 1 - s.age / s.life));
+  }
+  positions.needsUpdate = true;
+  alphas.needsUpdate = true;
+}
+
 // Current drift: Perlin-driven with gusts; returns reused object
 const _drift = { x: 0, z: 0 };
 function currentDrift(): { x: number; z: number } {
@@ -1447,6 +1574,7 @@ export function renderLoop(onFrame?: (delta: number) => void): void {
     wrapAroundCamera(plankton, PLANKTON_RADIUS, -0.015, delta, drift);
     updateBursts(delta);
     updateBreath(delta);
+    updateChips(delta);
 
     animateFlashlight();
     if (onFrame) onFrame(delta);

@@ -894,6 +894,7 @@ function buildDriller(gltf: GLTF | null): BenchInstance {
     gltf ? prepareDrillerTemplate(gltf) : null,
   );
   let held = false;
+  let drilling = false;
 
   // Diver stand-in at cargo hold offset (test carry pose)
   const stand = new THREE.Mesh(
@@ -907,6 +908,7 @@ function buildDriller(gltf: GLTF | null): BenchInstance {
   return {
     group: driller.group,
     update(_dt: number, t: number) {
+      if (drilling) driller.strike(); // held fire: one bite per frame
       driller.update(t, held);
     },
     ui(panel: HTMLElement) {
@@ -916,20 +918,29 @@ function buildDriller(gltf: GLTF | null): BenchInstance {
         stand.visible = held;
         b.classList.toggle("on", held);
       });
+      button(parts, "drilling", (b) => {
+        drilling = !drilling;
+        b.classList.toggle("on", drilling);
+      });
       const note = document.createElement("div");
       note.className = "hint";
       note.textContent =
         `driller length ${DRILLER_LENGTH} u — one per run, seeded in the ` +
         'drift wreck (M3.1). "held" shows a stand-in diver at the carry ' +
         "offset (same HOLD_* rig the Golden Gouda rides); the model has no " +
-        "rig of its own, just a bounding-box scale-fit.";
+        'rig of its own, just a bounding-box scale-fit. "drilling" holds the ' +
+        "bit's throttle open — in game one dig does that for half a second.";
       panel.appendChild(note);
     },
     action() {
       held = !held;
       stand.visible = held;
     },
-    lines: () => [["held", held ? "yes" : "no"]],
+    lines: () => [
+      ["held", held ? "yes" : "no"],
+      ["bit", driller.bit ? "found" : "MISSING"],
+      ["spin", `${driller.spinRate().toFixed(1)} rad/s`],
+    ],
   };
 }
 

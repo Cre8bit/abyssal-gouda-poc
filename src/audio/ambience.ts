@@ -437,6 +437,69 @@ export function playDig() {
   }
 }
 
+// The driller biting rind: a motor winding up under a broadband grind, and
+// a spit of gas out of the wound. Runs ~0.6 s — just over the dig cooldown,
+// so held fire reads as one continuous chew.
+export function playDrill() {
+  if (!ctx) return;
+  // The motor, loaded and labouring.
+  tone({
+    duration: 0.62,
+    type: "sawtooth",
+    from: 105,
+    to: 168,
+    gain: 0.03,
+    attack: 0.07,
+    vibrato: 14,
+  });
+  tone({
+    duration: 0.55,
+    type: "square",
+    from: 58,
+    to: 88,
+    gain: 0.02,
+    attack: 0.08,
+    vibrato: 20,
+  });
+  // The bit chewing: bright grind over a low tear.
+  noiseBurst({
+    duration: 0.6,
+    from: 900,
+    to: 2400,
+    q: 0.9,
+    gain: 0.045,
+    reverb: 0.35,
+    attack: 0.06,
+  });
+  noiseBurst({
+    duration: 0.55,
+    type: "lowpass",
+    from: 340,
+    to: 130,
+    gain: 0.05,
+    color: "brown",
+    reverb: 0.6,
+    attack: 0.04,
+  });
+  // Gas boiling out of the cut, faster and thicker than a hand dig.
+  for (let i = 0; i < 6; i++) {
+    setTimeout(
+      () => {
+        if (!ctx) return;
+        const f0 = 450 + Math.random() * 900;
+        tone({
+          duration: 0.07,
+          from: f0,
+          to: f0 * 2.3,
+          gain: 0.007,
+          attack: 0.004,
+        });
+      },
+      40 + i * 65,
+    );
+  }
+}
+
 // A catfish snapping at you: sharp jaw-clap + guttural growl.
 export function playBite() {
   if (!ctx) return;

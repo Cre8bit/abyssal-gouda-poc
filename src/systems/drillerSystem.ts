@@ -64,6 +64,9 @@ export interface DrillerSystem extends GameSystem {
   use(): boolean;
   // Deliberate drop (G key). Returns false (no-op) if you aren't holding it.
   drop(reason?: string): boolean;
+  // One bite of cheese: spin the bit up, whoever is holding it. Driven by
+  // the dig path in main.ts, local digs and replayed remote ones alike.
+  strike(): void;
   // Re-pose a carried driller AFTER physics has moved the diver this frame —
   // same reason as cargoSystem.followCarrier: posing it pre-physics leaves
   // it a frame behind the camera.
@@ -318,6 +321,10 @@ export function createDrillerSystem({
 
     use,
     drop,
+
+    strike() {
+      getMountedDriller()?.strike();
+    },
 
     followCarrier() {
       const item = getItem(DRILLER_ID);

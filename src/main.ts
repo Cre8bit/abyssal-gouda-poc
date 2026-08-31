@@ -20,6 +20,7 @@ import {
   rebuildWorld,
   emitBreath,
   burstAt,
+  chipsAt,
   setFlashlight,
 } from "./render/graphics.ts";
 import {
@@ -27,6 +28,7 @@ import {
   updateAbyssAudio,
   setExhaleListener,
   playDig,
+  playDrill,
   playClick,
   playWhoosh,
 } from "./audio/ambience.ts";
@@ -492,6 +494,33 @@ function applyDigEvent(d: SphereDig) {
   else digAt(d.x, d.y, d.z, r, tool);
 }
 
+// The sight and sound of a carve, shared by local digs and replayed remote
+// ones. `audible` is false for a dig too far away to hear through the cheese.
+function digFx(
+  x: number,
+  y: number,
+  z: number,
+  tool: DigTool,
+  audible: boolean,
+): void {
+  burstAt(x, y, z); // gas pockets tear free of the cheese
+  if (tool !== "driller") {
+    chipsAt(x, y, z, 8, 1.8);
+    if (audible) playDig();
+    return;
+  }
+  // The bit throws a far wider spray, and a second vent opens beside it.
+  drillerSys.strike();
+  chipsAt(x, y, z, 26, 4.6);
+  const r = DIG_RADII.driller * 0.6;
+  burstAt(
+    x + (Math.random() - 0.5) * r,
+    y + (Math.random() - 0.5) * r,
+    z + (Math.random() - 0.5) * r,
+  );
+  if (audible) playDrill();
+}
+
 // Dig tool: SDF edits chunk voxels + marching cubes; collision tracks.
 let lastDigAt = 0;
 function tryDig() {
@@ -531,8 +560,7 @@ function tryDig() {
     }
     return;
   }
-  playDig();
-  burstAt(hit.x, hit.y, hit.z); // gas pockets tear free of the cheese
+  digFx(hit.x, hit.y, hit.z, tool, true);
   showEvent(
     tool === "driller"
       ? "🛠 The driller chews through"
@@ -685,14 +713,13 @@ onEventReceived((peerId, data) => {
     const w = d.c != null ? chunkLocalToWorld(d.c, d) : d;
     applyDigEvent(d);
     if (w) {
-      burstAt(w.x, w.y, w.z);
       // Audible only if they're digging nearby — muffled thumps through cheese.
       const dd = Math.hypot(
         w.x - game.localPosition.x,
         w.y - game.localPosition.y,
         w.z - game.localPosition.z,
       );
-      if (dd < 45) playDig();
+      digFx(w.x, w.y, w.z, d.tool ?? "hands", dd < 45);
     }
   } else if (
     data.kind === "seed" &&
