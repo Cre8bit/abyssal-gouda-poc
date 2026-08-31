@@ -34,7 +34,7 @@
         position: fixed;
         top: 12px;
         left: 12px;
-        width: 252px;
+        width: 352px;
         max-height: calc(100vh - 24px);
         overflow-y: auto;
         background: rgba(3, 16, 24, 0.82);
@@ -121,10 +121,21 @@
         width: 40px;
         text-align: right;
         color: #d6f1ff;
+        cursor: text;
       }
-      .slider-row input {
+      .slider-row input[type="range"] {
         flex: 1;
         accent-color: #4fb3e0;
+      }
+      .slider-row .val-edit {
+        width: 40px;
+        font: inherit;
+        color: #d6f1ff;
+        background: #0a2635;
+        border: 1px solid #1d4457;
+        border-radius: 4px;
+        padding: 1px 4px;
+        text-align: right;
       }
       .hint {
         margin-top: 10px;

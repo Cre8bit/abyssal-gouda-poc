@@ -19,12 +19,16 @@ import {
   GLTFLoader,
   type GLTF,
 } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { TransformControls } from "three/examples/jsm/controls/TransformControls.js";
 import {
   prepareDiverTemplate,
   createDiverRig,
   updateDiverRig,
+  applyArmPoseSides,
   fpBodyPitch,
   configureFpBody,
+  type ArmPose,
+  type DiverRig,
 } from "../entities/diverRig.ts";
 import { prepareCatfishTemplate } from "../entities/catfish.ts";
 import { toonMaterial } from "../render/toon.ts";
@@ -896,6 +900,563 @@ function buildDriller(gltf: GLTF | null): BenchInstance {
   };
 }
 
+// --- Arm-joint gizmo rig, shared by the pose editor below ------------------
+// Each posable joint owns 2-3 ArmPose fields (see diverRig.ts's
+// applyArmPoseSides). A gizmo proxy is kept in lockstep with those fields via
+// a fixed `base` quaternion — rest∘(template axes → standard basis) — chosen
+// so a LOCAL-space TransformControls rotate handle's X/Y/Z rings correspond
+// exactly to the joint's aX/aY/aZ template axes: dragging one ring right-
+// multiplies a standard-axis rotation onto the proxy, and decomposing the
+// proxy's rotation (relative to `base`) via THREE.Euler in the same order
+// pose()/poseAdd() compose in recovers the field values directly. Order and
+// the L/R sign flip mirror applyArmPoseSides exactly.
+type ArmJointKind = "upperarm" | "forearm" | "hand";
+const ARM_JOINT_ORDER: Record<ArmJointKind, THREE.EulerOrder> = {
+  upperarm: "YXZ",
+  forearm: "YXZ",
+  hand: "XYZ",
+};
+const ARM_JOINT_COLOR: Record<ArmJointKind, number> = {
+  upperarm: 0x5ce8ff,
+  forearm: 0x8fe05c,
+  hand: 0xffc23d,
+};
+const TARGET_SELECTED = 0xff5c8a;
+const TOOL_COLOR = 0xffffff;
+
+interface ArmJoint {
+  kind: ArmJointKind;
+  side: "L" | "R";
+  proxy: THREE.Object3D;
+  marker: THREE.Mesh;
+  material: THREE.MeshBasicMaterial;
+  base: THREE.Quaternion;
+}
+// The held tool itself: no proxy/basis remap needed — the gizmo drives
+// `driller.group`'s own position/rotation directly (translate AND rotate,
+// unlike the arm joints, which are rotate-only about template axes).
+interface ToolJoint {
+  kind: "tool";
+  marker: THREE.Mesh;
+  material: THREE.MeshBasicMaterial;
+}
+type GizmoTarget = ArmJoint | ToolJoint;
+function targetColor(t: GizmoTarget): number {
+  return t.kind === "tool" ? TOOL_COLOR : ARM_JOINT_COLOR[t.kind];
+}
+
+// ArmPose fields → this joint's rest-relative Euler (and back). Order/signs
+// match applyArmPoseSides's pose()/poseAdd() composition exactly.
+function jointEuler(
+  kind: ArmJointKind,
+  side: "L" | "R",
+  p: ArmPose,
+): THREE.Euler {
+  const s = side === "L" ? -1 : 1;
+  const order = ARM_JOINT_ORDER[kind];
+  if (kind === "upperarm") return new THREE.Euler(p.ux, s * p.uy, 0, order);
+  if (kind === "forearm")
+    return new THREE.Euler(p.fx, s * p.fy, s * p.fz, order);
+  return new THREE.Euler(p.hx, s * p.hy, s * p.hz, order);
+}
+function jointWritePose(
+  kind: ArmJointKind,
+  side: "L" | "R",
+  e: THREE.Euler,
+  out: ArmPose,
+): void {
+  const s = side === "L" ? -1 : 1;
+  if (kind === "upperarm") {
+    out.ux = e.x;
+    out.uy = s * e.y;
+  } else if (kind === "forearm") {
+    out.fx = e.x;
+    out.fy = s * e.y;
+    out.fz = s * e.z;
+  } else {
+    out.hx = e.x;
+    out.hy = s * e.y;
+    out.hz = s * e.z;
+  }
+}
+// Copy just the fields `kind` owns from one pose to another (mirroring).
+function jointCopyFields(kind: ArmJointKind, from: ArmPose, to: ArmPose): void {
+  if (kind === "upperarm") {
+    to.ux = from.ux;
+    to.uy = from.uy;
+  } else if (kind === "forearm") {
+    to.fx = from.fx;
+    to.fy = from.fy;
+    to.fz = from.fz;
+  } else {
+    to.hx = from.hx;
+    to.hy = from.hy;
+    to.hz = from.hz;
+  }
+}
+
+function buildArmJoints(rig: DiverRig): ArmJoint[] {
+  const specs: { bone: string; side: "L" | "R"; kind: ArmJointKind }[] = [
+    { bone: "L_Upperarm", side: "L", kind: "upperarm" },
+    { bone: "R_Upperarm", side: "R", kind: "upperarm" },
+    { bone: "L_Forearm", side: "L", kind: "forearm" },
+    { bone: "R_Forearm", side: "R", kind: "forearm" },
+    { bone: "L_Hand", side: "L", kind: "hand" },
+    { bone: "R_Hand", side: "R", kind: "hand" },
+  ];
+  const joints: ArmJoint[] = [];
+  for (const s of specs) {
+    const bone = rig.bones.get(s.bone);
+    const d = rig.data.get(s.bone);
+    if (!bone || !d || !bone.parent) continue;
+    const basis = new THREE.Quaternion().setFromRotationMatrix(
+      new THREE.Matrix4().makeBasis(d.aX, d.aY, d.aZ),
+    );
+    const base = d.rest.clone().multiply(basis);
+    const proxy = new THREE.Group();
+    proxy.position.copy(bone.position);
+    bone.parent.add(proxy);
+    const material = new THREE.MeshBasicMaterial({
+      color: ARM_JOINT_COLOR[s.kind],
+      depthTest: false,
+      transparent: true,
+    });
+    const marker = new THREE.Mesh(
+      new THREE.SphereGeometry(0.035, 12, 8),
+      material,
+    );
+    marker.visible = false;
+    bone.add(marker);
+    joints.push({ side: s.side, kind: s.kind, proxy, marker, material, base });
+  }
+  return joints;
+}
+
+// --- Mode: driller hold-pose editor -------------------------------------------
+// Author a held-tool pose by hand: per-side ArmPose sliders lock the diver's
+// arms (applyArmPoseSides overrides whatever updateDiverRig's swim blend
+// just wrote), a "mirror L/R" toggle collapses them to one symmetric set
+// when arms don't need to differ, a "gizmo select" mode lets any of the 6
+// posable joints be grabbed straight off the model with a rotate handle
+// instead of hunting sliders, and 6 more sliders place the tool in the
+// diver's own root frame. Generic by construction — swap createDrillerVisual
+// for any other held prop (gouda, light stick) and the same rig +
+// tool-transform sliders still apply.
+function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
+  const template = diverTemplateFrom(gltf);
+  const rig = createDiverRig(template);
+  const driller = createDrillerVisual();
+  rig.root.add(driller.group);
+
+  const group = new THREE.Group();
+  group.add(rig.root);
+
+  const zeroPose = (): ArmPose => ({
+    uy: 0,
+    ux: 0,
+    fy: 0,
+    fx: 0,
+    fz: 0,
+    hx: 0,
+    hy: 0,
+    hz: 0,
+  });
+  const poseL = zeroPose();
+  const poseR = zeroPose();
+  let mirror = true;
+  const tool = { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0 };
+  const vel = new THREE.Vector3();
+  let exportStr = '(click "Export Pose")';
+
+  const armJoints = buildArmJoints(rig);
+  const toolMaterial = new THREE.MeshBasicMaterial({
+    color: TOOL_COLOR,
+    depthTest: false,
+    transparent: true,
+  });
+  const toolMarker = new THREE.Mesh(
+    new THREE.SphereGeometry(0.05, 12, 8),
+    toolMaterial,
+  );
+  toolMarker.visible = false;
+  driller.group.add(toolMarker);
+  const toolJoint: ToolJoint = {
+    kind: "tool",
+    marker: toolMarker,
+    material: toolMaterial,
+  };
+  const targets: GizmoTarget[] = [...armJoints, toolJoint];
+
+  const gizmo = new TransformControls(camera, renderer.domElement);
+  gizmo.size = 0.7;
+  const gizmoHelper = gizmo.getHelper();
+  gizmoHelper.visible = false;
+  scene.add(gizmoHelper);
+
+  let gizmoOn = false;
+  let toolMode: "translate" | "rotate" = "translate";
+  let selected: GizmoTarget | null = null;
+  let dragging = false;
+  let hoveredMarker: THREE.Mesh | null = null;
+  let constrainAxis: "x" | "y" | "z" | null = null;
+
+  gizmo.addEventListener("dragging-changed", (e) => {
+    dragging = !!e.value;
+    controls.enabled = !dragging;
+  });
+
+  const sliderHandles = new Map<string, ReturnType<typeof sliderRow>>();
+  const refreshSliders = () => {
+    for (const [key, handle] of sliderHandles) {
+      const [side, field] = key.split(".") as ["L" | "R", keyof ArmPose];
+      handle.set((side === "L" ? poseL : poseR)[field]);
+    }
+  };
+  const toolSliderHandles = new Map<
+    keyof typeof tool,
+    ReturnType<typeof sliderRow>
+  >();
+  const refreshToolSliders = () => {
+    for (const [key, handle] of toolSliderHandles) handle.set(tool[key]);
+  };
+
+  function syncProxyFromPose(j: ArmJoint) {
+    const p = j.side === "L" ? poseL : poseR;
+    j.proxy.quaternion
+      .copy(j.base)
+      .multiply(
+        new THREE.Quaternion().setFromEuler(jointEuler(j.kind, j.side, p)),
+      );
+  }
+  function syncPoseFromProxy(j: ArmJoint) {
+    const e = new THREE.Euler().setFromQuaternion(
+      j.base.clone().invert().multiply(j.proxy.quaternion),
+      ARM_JOINT_ORDER[j.kind],
+    );
+    const mine = j.side === "L" ? poseL : poseR;
+    jointWritePose(j.kind, j.side, e, mine);
+    if (mirror) jointCopyFields(j.kind, mine, j.side === "L" ? poseR : poseL);
+    refreshSliders();
+  }
+  function syncToolFromGizmo() {
+    tool.px = driller.group.position.x;
+    tool.py = driller.group.position.y;
+    tool.pz = driller.group.position.z;
+    tool.rx = driller.group.rotation.x;
+    tool.ry = driller.group.rotation.y;
+    tool.rz = driller.group.rotation.z;
+    refreshToolSliders();
+  }
+  function setToolMode(m: "translate" | "rotate") {
+    toolMode = m;
+    if (selected?.kind === "tool") gizmo.setMode(m);
+  }
+  function selectTarget(t: GizmoTarget | null) {
+    if (selected) {
+      selected.material.color.setHex(targetColor(selected));
+      // Reset marker scale when deselecting (unless still hovered)
+      if (selected.marker !== hoveredMarker) {
+        selected.marker.scale.setScalar(1);
+      }
+    }
+    selected = t;
+    constrainAxis = null; // Reset axis constraint when switching targets
+    if (!t) {
+      gizmo.detach();
+      gizmoHelper.visible = false;
+      return;
+    }
+    if (t.kind === "tool") {
+      gizmo.setSpace("world");
+      gizmo.showX = gizmo.showY = gizmo.showZ = true;
+      gizmo.setMode(toolMode);
+      gizmo.attach(driller.group);
+    } else {
+      syncProxyFromPose(t);
+      gizmo.setSpace("local");
+      gizmo.setMode("rotate"); // arm joints only rotate, about their own template axes
+      gizmo.showZ = t.kind !== "upperarm"; // upperarm has no roll axis
+      gizmo.attach(t.proxy);
+    }
+    gizmoHelper.visible = true;
+    t.material.color.setHex(TARGET_SELECTED);
+  }
+
+  const raycaster = new THREE.Raycaster();
+  const ndc = new THREE.Vector2();
+
+  // Hover feedback on markers
+  renderer.domElement.addEventListener("pointermove", (ev) => {
+    if (ACTIVE_DEF.id !== "driller-pose" || !gizmoOn) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    ndc.set(
+      ((ev.clientX - rect.left) / rect.width) * 2 - 1,
+      -((ev.clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    raycaster.setFromCamera(ndc, camera);
+    const hits = raycaster.intersectObjects(targets.map((j) => j.marker));
+    const hovered = hits.length > 0 ? (hits[0].object as THREE.Mesh) : null;
+    if (hoveredMarker !== hovered) {
+      if (hoveredMarker && hoveredMarker !== selected?.marker) {
+        hoveredMarker.scale.setScalar(1);
+      }
+      hoveredMarker = hovered;
+      if (hoveredMarker && hoveredMarker !== selected?.marker) {
+        hoveredMarker.scale.setScalar(1.5);
+      }
+    }
+  });
+
+  renderer.domElement.addEventListener("pointerdown", (ev) => {
+    if (ACTIVE_DEF.id !== "driller-pose" || !gizmoOn || gizmo.dragging) return;
+    const rect = renderer.domElement.getBoundingClientRect();
+    ndc.set(
+      ((ev.clientX - rect.left) / rect.width) * 2 - 1,
+      -((ev.clientY - rect.top) / rect.height) * 2 + 1,
+    );
+    raycaster.setFromCamera(ndc, camera);
+    const hit = raycaster.intersectObjects(targets.map((j) => j.marker))[0];
+    selectTarget(hit ? targets.find((j) => j.marker === hit.object)! : null);
+  });
+
+  // Keyboard controls for gizmo mode switching and axis constraints
+  const handleGizmoKeys = (e: KeyboardEvent) => {
+    if (ACTIVE_DEF.id !== "driller-pose" || !gizmoOn) return;
+    if (e.target instanceof HTMLInputElement) return; // Don't override text input
+
+    const lower = e.key.toLowerCase();
+
+    if (lower === "escape" && selected) {
+      e.preventDefault();
+      selectTarget(null);
+      return;
+    }
+
+    if (!selected) return;
+
+    if (lower === "t" && selected.kind === "tool") {
+      e.preventDefault();
+      setToolMode("translate");
+    } else if (lower === "r" && selected.kind === "tool") {
+      e.preventDefault();
+      setToolMode("rotate");
+    } else if (lower === "x" || lower === "y" || lower === "z") {
+      e.preventDefault();
+      constrainAxis =
+        constrainAxis === lower ? null : (lower as "x" | "y" | "z");
+      // Update gizmo constraints
+      if (selected.kind === "tool") {
+        gizmo.showX = constrainAxis === null || constrainAxis === "x";
+        gizmo.showY = constrainAxis === null || constrainAxis === "y";
+        gizmo.showZ = constrainAxis === null || constrainAxis === "z";
+      }
+    }
+  };
+
+  document.addEventListener("keydown", handleGizmoKeys);
+
+  return {
+    group,
+    update(dt: number, t: number) {
+      const toolDragging = selected?.kind === "tool" && dragging;
+      if (selected && dragging) {
+        if (selected.kind === "tool") syncToolFromGizmo();
+        else syncPoseFromProxy(selected);
+      }
+      updateDiverRig(rig, dt, {
+        bodyYaw: 0,
+        bodyPitch: 0,
+        lookYaw: 0,
+        lookPitch: 0,
+        vel,
+        carrying: false,
+      });
+      applyArmPoseSides(rig, poseL, poseR); // locks the arms, overriding the swim blend
+      for (const j of armJoints) {
+        if (j === selected && dragging) continue;
+        syncProxyFromPose(j);
+      }
+      if (!toolDragging) {
+        driller.group.position.set(tool.px, tool.py, tool.pz);
+        driller.group.rotation.set(tool.rx, tool.ry, tool.rz);
+      }
+      driller.update(t, true); // held: no idle world-bob fighting the sliders
+    },
+    ui(panel: HTMLElement, api: BenchUiApi) {
+      function renderPanel() {
+        panel.innerHTML = "";
+        sliderHandles.clear();
+
+        const editSec = api.section(panel, "Editing");
+        api
+          .button(editSec, "mirror L/R", (b) => {
+            mirror = !mirror;
+            if (mirror) Object.assign(poseR, poseL);
+            b.classList.toggle("on", mirror);
+            renderPanel();
+          })
+          .classList.toggle("on", mirror);
+        api
+          .button(editSec, "gizmo select", (b) => {
+            gizmoOn = !gizmoOn;
+            if (!gizmoOn) selectTarget(null);
+            for (const j of targets) j.marker.visible = gizmoOn;
+            b.classList.toggle("on", gizmoOn);
+            renderPanel();
+          })
+          .classList.toggle("on", gizmoOn);
+
+        const toolModeBtns: Record<string, HTMLButtonElement> = {
+          translate: api.button(editSec, "tool: move (T)", () => {
+            setToolMode("translate");
+            markOn(toolModeBtns, "translate");
+          }),
+          rotate: api.button(editSec, "tool: rotate (R)", () => {
+            setToolMode("rotate");
+            markOn(toolModeBtns, "rotate");
+          }),
+        };
+        markOn(toolModeBtns, toolMode);
+
+        // Gizmo size slider
+        const gizmoSec = api.section(panel, "Gizmo");
+        api.sliderRow(
+          gizmoSec,
+          "size",
+          0.3,
+          1.5,
+          0.05,
+          gizmo.size,
+          (v) => {
+            gizmo.size = v;
+          },
+          (v) => `${v.toFixed(2)}`,
+        );
+
+        // Reset buttons
+        const resetBtnContainer = document.createElement("div");
+        resetBtnContainer.className = "row";
+        gizmoSec.appendChild(resetBtnContainer);
+        api.button(resetBtnContainer, "reset arm", () => {
+          const zero = zeroPose();
+          Object.assign(poseL, zero);
+          if (!mirror) Object.assign(poseR, zero);
+          else Object.assign(poseR, zero);
+          refreshSliders();
+          for (const j of armJoints) syncProxyFromPose(j);
+        });
+        api.button(resetBtnContainer, "reset tool", () => {
+          tool.px = tool.py = tool.pz = 0;
+          tool.rx = tool.ry = tool.rz = 0;
+          refreshToolSliders();
+          driller.group.position.set(0, 0, 0);
+          driller.group.rotation.set(0, 0, 0);
+        });
+
+        const addSide = (label: string, side: "L" | "R", p: ArmPose) => {
+          const sec = api.section(panel, label);
+          const fields: (keyof ArmPose)[] = [
+            "uy",
+            "ux",
+            "fy",
+            "fx",
+            "fz",
+            "hx",
+            "hy",
+            "hz",
+          ];
+          for (const f of fields) {
+            const h = api.sliderRow(
+              sec,
+              f,
+              -Math.PI,
+              Math.PI,
+              0.01,
+              p[f],
+              (v) => {
+                p[f] = v;
+                if (mirror) {
+                  const other = side === "L" ? poseR : poseL;
+                  other[f] = v;
+                  sliderHandles.get(`${side === "L" ? "R" : "L"}.${f}`)?.set(v);
+                }
+              },
+            );
+            sliderHandles.set(`${side}.${f}`, h);
+          }
+        };
+        if (mirror) addSide("Arm Pose", "L", poseL);
+        else {
+          addSide("Left Arm", "L", poseL);
+          addSide("Right Arm", "R", poseR);
+        }
+
+        const exportSec = api.section(panel, "Export");
+        api.button(exportSec, "Export Pose", () => {
+          const payload = mirror
+            ? { armPose: { ...poseL } }
+            : { armPoseL: { ...poseL }, armPoseR: { ...poseR } };
+          const full = {
+            ...payload,
+            tool: {
+              position: [tool.px, tool.py, tool.pz],
+              rotation: [tool.rx, tool.ry, tool.rz],
+            },
+          };
+          exportStr = JSON.stringify(full);
+          console.log("driller hold pose:\n" + JSON.stringify(full, null, 2));
+        });
+
+        const toolSec = api.section(panel, "Tool Transform");
+        const toolFields: [keyof typeof tool, string, number, number][] = [
+          ["px", "pos x", -2, 2],
+          ["py", "pos y", -2, 2],
+          ["pz", "pos z", -2, 2],
+          ["rx", "rot x", -Math.PI, Math.PI],
+          ["ry", "rot y", -Math.PI, Math.PI],
+          ["rz", "rot z", -Math.PI, Math.PI],
+        ];
+        for (const [key, label, min, max] of toolFields) {
+          const h = api.sliderRow(
+            toolSec,
+            label,
+            min,
+            max,
+            0.01,
+            tool[key],
+            (v) => {
+              tool[key] = v;
+            },
+          );
+          toolSliderHandles.set(key, h);
+        }
+
+        const note = document.createElement("div");
+        note.className = "hint";
+        note.textContent =
+          '"mirror L/R" (default on) keeps both arms symmetric. "gizmo select" shows ' +
+          "clickable handles at each joint and the tool. " +
+          "Keyboard shortcuts when gizmo is active: " +
+          "T=translate, R=rotate (tool only), X/Y/Z=lock axis, ESC=deselect. " +
+          'Hover over markers to highlight. "Reset" buttons clear poses quickly. ' +
+          "Click any slider's number to type an exact value.";
+        panel.appendChild(note);
+      }
+      renderPanel();
+    },
+    lines: () => {
+      const parts: [string, string][] = [["export", exportStr]];
+      if (gizmoOn && selected) {
+        parts.push([
+          "gizmo",
+          `${selected.kind}${selected.kind === "tool" ? ` (${toolMode})` : ""} ${constrainAxis ? `[${constrainAxis.toUpperCase()}]` : ""}`,
+        ]);
+      }
+      return parts;
+    },
+  };
+}
+
 // --- Registry ----------------------------------------------------------------
 // ⚠ Standing rule: every new game model gets an entry here (see AGENTS.md).
 const MODELS: BenchModelDef[] = [
@@ -940,6 +1501,13 @@ const MODELS: BenchModelDef[] = [
     url: `${BASE}models/drill_tool.glb`,
     cam: { dist: 3, height: 0, gridY: -1 },
     build: buildDriller,
+  },
+  {
+    id: "driller-pose",
+    label: "driller hold pose",
+    url: `${BASE}models/ratdiverAbyssalGouda.glb`,
+    cam: { dist: 4, height: -0.3, gridY: -1.6 },
+    build: buildDrillerPoseEditor,
   },
 ];
 

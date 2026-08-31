@@ -32,15 +32,58 @@ export function sliderRow(
 ): SliderHandle {
   const row = document.createElement("div");
   row.className = "slider-row";
-  row.innerHTML = `<span class="name">${name}</span><input type="range"><span class="val"></span>`;
+  row.innerHTML = `<span class="name">${name}</span><input type="range"><span class="val" tabindex="0" title="click to type a value"></span>`;
   const input = row.querySelector("input")!;
-  const val = row.querySelector(".val")!;
+  const val = row.querySelector(".val") as HTMLSpanElement;
   Object.assign(input, { min, max, step, value });
   const show = () => (val.textContent = fmt(+input.value));
+  const commit = (v: number) => {
+    const clamped = Math.min(max, Math.max(min, v));
+    input.value = clamped as unknown as string; // DOM coerces numbers; keep the raw assign
+    show();
+    onInput(clamped);
+  };
   input.addEventListener("input", () => {
     show();
     onInput(+input.value);
   });
+
+  // Click the number to type an exact value instead of dragging.
+  const startEdit = () => {
+    const edit = document.createElement("input");
+    edit.type = "number";
+    edit.className = "val-edit";
+    edit.min = String(min);
+    edit.max = String(max);
+    edit.step = String(step);
+    edit.value = String(+input.value);
+    val.replaceWith(edit);
+    edit.focus();
+    edit.select();
+    let done = false; // replaceWith() below detaches edit, which re-fires blur
+    const stop = (apply: boolean) => {
+      if (done) return;
+      done = true;
+      if (apply) {
+        const v = Number(edit.value);
+        if (Number.isFinite(v)) commit(v);
+      }
+      edit.replaceWith(val);
+    };
+    edit.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") stop(true);
+      else if (e.key === "Escape") stop(false);
+    });
+    edit.addEventListener("blur", () => stop(true));
+  };
+  val.addEventListener("click", startEdit);
+  val.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      startEdit();
+    }
+  });
+
   show();
   parent.appendChild(row);
   return {

@@ -51,7 +51,7 @@ const REF_SPEED = 10; // world speed that maps to a full-effort kick
 const FP_OFFSET = new THREE.Vector3(0, -0.16, 0.1);
 
 // Base arm poses (template-space angles), numerically solved per view.
-interface ArmPose {
+export interface ArmPose {
   uy: number; // upper arm: swing out/back (mirrored L/R)
   ux: number; // upper arm: raise/lower
   fy: number; // elbow fold (mirrored L/R)
@@ -839,4 +839,41 @@ export function updateDiverRig(
     rig.head.quaternion.copy(_q3.invert()).multiply(rig.headQuat);
     rig.head.getWorldPosition(rig.headPos);
   }
+}
+
+// Set the arm bones directly from explicit L/R poses — same mirrored
+// convention updateDiverRig's arm section uses (L negates uy/fy/hy/fz/hz
+// relative to R) but with no swim oscillation on top and each side free to
+// differ. Bone state from updateDiverRig is overwritten synchronously —
+// callers that want a locked custom pose must call this AFTER
+// updateDiverRig, not instead of mutating rig.pose (which updateDiverRig
+// already consumed by the time it returns). This is also the primitive a
+// pose editor exports: an ArmPose authored here is exactly what a new
+// ARM_POSE_* constant would hold.
+export function applyArmPoseSides(
+  rig: DiverRig,
+  left: ArmPose,
+  right: ArmPose,
+): void {
+  pose(rig, "L_Upperarm", "aY", -left.uy);
+  poseAdd(rig, "L_Upperarm", "aX", left.ux);
+  pose(rig, "R_Upperarm", "aY", right.uy);
+  poseAdd(rig, "R_Upperarm", "aX", right.ux);
+  pose(rig, "L_Forearm", "aY", -left.fy);
+  poseAdd(rig, "L_Forearm", "aX", left.fx);
+  poseAdd(rig, "L_Forearm", "aZ", -left.fz);
+  pose(rig, "R_Forearm", "aY", right.fy);
+  poseAdd(rig, "R_Forearm", "aX", right.fx);
+  poseAdd(rig, "R_Forearm", "aZ", right.fz);
+  pose(rig, "L_Hand", "aX", left.hx);
+  poseAdd(rig, "L_Hand", "aY", -left.hy);
+  poseAdd(rig, "L_Hand", "aZ", -left.hz);
+  pose(rig, "R_Hand", "aX", right.hx);
+  poseAdd(rig, "R_Hand", "aY", right.hy);
+  poseAdd(rig, "R_Hand", "aZ", right.hz);
+}
+
+// Symmetric case: both arms mirror the same authored pose.
+export function applyArmPose(rig: DiverRig, p: ArmPose): void {
+  applyArmPoseSides(rig, p, p);
 }
