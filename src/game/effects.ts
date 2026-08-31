@@ -7,6 +7,8 @@ export const STATUS = {
   POISONED: 1 << 2, // hit a rat-poison vein — inverted controls (phase 3)
   TRAPPED: 1 << 3, // snapped into a rat trap (phase 3)
   SPEAKING: 1 << 4, // mic activity — bubble trail (phase 4)
+  HOLDING_DRILLER: 1 << 5, // holding the driller (M3.1) — cosmetic only,
+  // unlike CARRYING it never blocks digging: the driller IS the dig tool.
 } as const;
 
 export type StatusBit = (typeof STATUS)[keyof typeof STATUS];
@@ -88,6 +90,7 @@ const ICONS: Array<[StatusBit, string]> = [
   [STATUS.POISONED, "☠️"],
   [STATUS.TRAPPED, "🪤"],
   [STATUS.SPEAKING, "💬"],
+  [STATUS.HOLDING_DRILLER, "🛠"],
 ];
 
 export function statusIcons(mask: StatusMask): string {

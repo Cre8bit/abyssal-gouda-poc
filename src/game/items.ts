@@ -119,6 +119,19 @@ export function isSupported(item: ItemInstance, gap = 1.5): boolean {
   return worldDistance(item.x, item.y - gap, item.z) <= 0;
 }
 
+// The item (if any) whose data.holder === id — every carry system stores the
+// current holder there by convention. Backs the "one pair of hands" rule
+// (locked, MVP plan): a carry system's pick arbitration checks this to deny a
+// grab by someone whose hands are already full with a DIFFERENT item, and the
+// same id after connecting re-files whatever was held under the pre-connect
+// placeholder.
+export function heldBy(id: string): ItemInstance | undefined {
+  for (const item of items.values()) {
+    if (item.data.holder === id) return item;
+  }
+  return undefined;
+}
+
 // --- Replication -------------------------------------------------------------
 
 interface SerializedItem {

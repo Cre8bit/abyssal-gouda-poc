@@ -33,6 +33,7 @@ import {
 } from "../entities/diverRig.ts";
 import { initCatfishSystem } from "../entities/catfish.ts";
 import { setGoudaScene } from "../entities/goldenGouda.ts";
+import { setDrillerScene } from "../entities/driller.ts";
 import { toonMaterial } from "./toon.ts";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
@@ -342,6 +343,7 @@ export function initGraphics(container: HTMLElement): HTMLCanvasElement {
   createLocalBody();
   initCatfishSystem(scene);
   setGoudaScene(scene); // the Golden Gouda mounts itself here when it spawns
+  setDrillerScene(scene); // the driller mounts itself here when it spawns
   createSnow();
   createBubbles();
   createBursts();

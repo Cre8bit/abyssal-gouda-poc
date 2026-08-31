@@ -34,6 +34,11 @@ import {
   prepareGoudaTemplate,
   GOUDA_RADIUS,
 } from "../entities/goldenGouda.ts";
+import {
+  createDrillerVisual,
+  prepareDrillerTemplate,
+  DRILLER_LENGTH,
+} from "../entities/driller.ts";
 import { CARGO, holdPose } from "../game/cargo.ts";
 import { applyFpBodyParams } from "./shots.ts";
 import { button, markOn, section, sliderRow } from "./ui.ts";
@@ -845,6 +850,52 @@ function buildGouda(gltf: GLTF | null): BenchInstance {
   };
 }
 
+// --- Model: the driller ---------------------------------------------------
+// Prop: static mesh, no skin/animation. Test scale-fit and the carry pose.
+function buildDriller(gltf: GLTF | null): BenchInstance {
+  const driller = createDrillerVisual(
+    gltf ? prepareDrillerTemplate(gltf) : null,
+  );
+  let held = false;
+
+  // Diver stand-in at cargo hold offset (test carry pose)
+  const stand = new THREE.Mesh(
+    new THREE.CapsuleGeometry(0.6, 0.7, 6, 12),
+    toonMaterial({ color: 0x2b4756, transparent: true, opacity: 0.5 }),
+  );
+  stand.position.set(0, CARGO.HOLD_DOWN, CARGO.HOLD_FORWARD);
+  stand.visible = false;
+  driller.group.add(stand);
+
+  return {
+    group: driller.group,
+    update(_dt: number, t: number) {
+      driller.update(t, held);
+    },
+    ui(panel: HTMLElement) {
+      const parts = section(panel, "Haul");
+      button(parts, "held", (b) => {
+        held = !held;
+        stand.visible = held;
+        b.classList.toggle("on", held);
+      });
+      const note = document.createElement("div");
+      note.className = "hint";
+      note.textContent =
+        `driller length ${DRILLER_LENGTH} u — one per run, seeded in the ` +
+        'drift wreck (M3.1). "held" shows a stand-in diver at the carry ' +
+        "offset (same HOLD_* rig the Golden Gouda rides); the model has no " +
+        "rig of its own, just a bounding-box scale-fit.";
+      panel.appendChild(note);
+    },
+    action() {
+      held = !held;
+      stand.visible = held;
+    },
+    lines: () => [["held", held ? "yes" : "no"]],
+  };
+}
+
 // --- Registry ----------------------------------------------------------------
 // ⚠ Standing rule: every new game model gets an entry here (see AGENTS.md).
 const MODELS: BenchModelDef[] = [
@@ -882,6 +933,13 @@ const MODELS: BenchModelDef[] = [
     url: `${BASE}models/golden_gouda.glb`,
     cam: { dist: 4.5, height: 0, gridY: -1.6 },
     build: buildGouda,
+  },
+  {
+    id: "driller",
+    label: "driller",
+    url: `${BASE}models/drill_tool.glb`,
+    cam: { dist: 3, height: 0, gridY: -1 },
+    build: buildDriller,
   },
 ];
 

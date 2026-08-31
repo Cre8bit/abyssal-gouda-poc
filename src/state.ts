@@ -48,7 +48,7 @@ export interface GameState {
   velocity: Vec3;
   spawnPoint: Vec3; // bathyscaphe berth — also the O₂ recharge zone
   flashlightOn: boolean;
-  digTool: DigTool; // debug-toggled until M3 seeds the driller item
+  digTool: DigTool; // "driller" iff drillerSystem says you're holding it
   debug: DebugState;
   mapWireframe: boolean; // M key — overlay only, survives independent of debug.mode
 

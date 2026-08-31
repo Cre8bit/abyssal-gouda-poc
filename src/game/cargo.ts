@@ -2,7 +2,7 @@
 // grip loss conditions, hold offsets. Pure math; replication and authority
 // logic live in systems/cargoSystem.ts.
 import { getMyId } from "../net/mesh.ts";
-import type { Vec3 } from "../state.ts";
+import { game, type Vec3 } from "../state.ts";
 
 export const CARGO = {
   // --- reach ---------------------------------------------------------------
@@ -112,4 +112,17 @@ export function fpHoldPose(
 
 export function distance(a: Vec3, b: Vec3): number {
   return Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+// Closest teammate to a point, by their last interpolated pose. Shared by
+// every carry system's hand-off verb (the "give" request needs a "to").
+export function nearestTeammate(from: Vec3): { id: string; d: number } | null {
+  let best: { id: string; d: number } | null = null;
+  for (const [peerId, buffer] of game.remoteBuffers) {
+    const s = buffer.sample();
+    if (!s) continue;
+    const d = distance(from, s);
+    if (!best || d < best.d) best = { id: peerId, d };
+  }
+  return best;
 }

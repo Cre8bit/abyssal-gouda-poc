@@ -7,6 +7,7 @@ import {
   spawnItem,
   getItem,
   syncItem,
+  heldBy,
   type ItemInstance,
 } from "../game/items.ts";
 import {
@@ -17,6 +18,7 @@ import {
   holdPose,
   isSelf,
   looseSinkRate,
+  nearestTeammate,
   selfId,
   sprintFumbleChance,
 } from "../game/cargo.ts";
@@ -60,6 +62,9 @@ export interface CargoSystem extends GameSystem {
   use(): boolean;
   // Lose your grip — a fish hit you, or the abyss took you.
   fumble(reason: string): void;
+  // Deliberate drop (G key). No lockout — unlike a fumble, this was a
+  // choice. Returns false (no-op) if you aren't the carrier.
+  drop(): boolean;
   // Re-pose a carried wheel AFTER physics has moved the diver this frame.
   // Systems run before physics, so posing it there leaves the wheel a frame
   // behind the camera — which reads as the cheese swimming in your hands
@@ -101,10 +106,15 @@ export function createCargoSystem({
   const isAuthority = () => getHostId() === null;
 
   // Send a request to whoever arbitrates — or, if that's us, act on it now.
+  // Every carry system listens on the same "pick"/"give"/"drop" kinds
+  // (registry routes an event kind to every system that declared it), so the
+  // request carries its own item id and arbitrate() below ignores anything
+  // that isn't the Gouda's.
   function request(kind: string, payload: Record<string, unknown> = {}): void {
     const hostId = getHostId();
-    if (isAuthority() || !hostId) arbitrate(selfId(), kind, payload);
-    else sendEventTo(hostId, { kind, ...payload });
+    const msg = { id: GOUDA_ID, ...payload };
+    if (isAuthority() || !hostId) arbitrate(selfId(), kind, msg);
+    else sendEventTo(hostId, { kind, ...msg });
   }
 
   // THE authoritative decision point. Runs only on the host (or solo).
@@ -113,14 +123,18 @@ export function createCargoSystem({
     kind: string,
     data: Record<string, unknown>,
   ): void {
+    if (data.id !== GOUDA_ID) return; // another carry system's request
     const item = getItem(GOUDA_ID);
     if (!item || won) return;
     const holder = holderOf(item);
 
     if (kind === "pick") {
       // Contested grab: first request in wins, every later one is answered
-      // with the same truth, so the loser's client corrects itself.
-      if (holder === null && withinReach(from, item)) setHolder(item, from);
+      // with the same truth, so the loser's client corrects itself. Hands
+      // already full with something else (the "one pair of hands" rule) are
+      // an equally flat denial.
+      if (holder === null && withinReach(from, item) && !heldBy(from))
+        setHolder(item, from);
       else syncItem(GOUDA_ID); // denied — tell them who really has it
       return;
     }
@@ -198,17 +212,6 @@ export function createCargoSystem({
   }
 
   // --- The verbs ------------------------------------------------------------
-  function nearestTeammate(from: Vec3): { id: string; d: number } | null {
-    let best: { id: string; d: number } | null = null;
-    for (const [peerId, buffer] of game.remoteBuffers) {
-      const s = buffer.sample();
-      if (!s) continue;
-      const d = distance(from, s);
-      if (!best || d < best.d) best = { id: peerId, d };
-    }
-    return best;
-  }
-
   function use(): boolean {
     const item = getItem(GOUDA_ID);
     if (!item || won) return false;
@@ -230,6 +233,10 @@ export function createCargoSystem({
     if (holder !== null) return false; // someone else has it — no stealing
     if (performance.now() < regrabUntil) return true; // you JUST fumbled it
     if (distance(game.localPosition, item) > CARGO.PICKUP_RANGE) return false;
+    if (heldBy(selfId())) {
+      showEvent("🧀 Both hands are full — drop what you're carrying first.");
+      return true;
+    }
     request("pick");
     return true;
   }
@@ -246,6 +253,13 @@ export function createCargoSystem({
 
   function fumble(reason: string): void {
     release(reason, true);
+  }
+
+  function drop(): boolean {
+    const item = getItem(GOUDA_ID);
+    if (!item || !isSelf(holderOf(item))) return false;
+    release("🧀 You set the Golden Gouda down.", false);
+    return true;
   }
 
   // --- Loose-wheel physics --------------------------------------------------
@@ -307,7 +321,11 @@ export function createCargoSystem({
     const d = distance(game.localPosition, item);
     if (d <= CARGO.PICKUP_RANGE) {
       setPrompt(
-        isFalling(item) ? "🧀 [E] CATCH IT" : "🧀 [E] lift the Golden Gouda",
+        heldBy(selfId())
+          ? "🧀 hands full"
+          : isFalling(item)
+            ? "🧀 [E] CATCH IT"
+            : "🧀 [E] lift the Golden Gouda",
       );
     } else {
       setPrompt(null);
@@ -352,6 +370,7 @@ export function createCargoSystem({
 
     use,
     fumble,
+    drop,
 
     followCarrier() {
       const item = getItem(GOUDA_ID);

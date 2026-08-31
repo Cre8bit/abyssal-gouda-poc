@@ -120,6 +120,7 @@ import { createOxygenSystem } from "./systems/oxygenSystem.ts";
 import { createCatfishSystem } from "./systems/catfishSystem.ts";
 import { createItemsSystem } from "./systems/itemsSystem.ts";
 import { createCargoSystem } from "./systems/cargoSystem.ts";
+import { createDrillerSystem } from "./systems/drillerSystem.ts";
 import { getMountedGouda } from "./entities/goldenGouda.ts";
 import { carrySpeedCap, CARGO } from "./game/cargo.ts";
 import {
@@ -201,6 +202,13 @@ initMouseLook(canvas);
 // Simulation systems in order (see systems/types.ts): one slot after input, before physics.
 registerSystem(createEffectsSystem()); // 10 — expire timed statuses
 registerSystem(createOxygenSystem({ o2Fill, o2Bar })); // 20 — drain + HUD
+// Cargo and the driller share one HUD line; the Gouda always wins the tie
+// (Gouda first, per the E-key contract below) when both have something to say.
+let cargoPrompt: string | null = null;
+let drillerPrompt: string | null = null;
+function renderCarryPrompt() {
+  carryPrompt.textContent = cargoPrompt ?? drillerPrompt ?? "";
+}
 const cargoSys = registerSystem(
   createCargoSystem({
     showEvent,
@@ -209,10 +217,22 @@ const cargoSys = registerSystem(
       game.flashlightOn = setFlashlight(on);
       broadcastNow();
     },
-    setPrompt: (text) => (carryPrompt.textContent = text ?? ""),
+    setPrompt: (text) => {
+      cargoPrompt = text;
+      renderCarryPrompt();
+    },
     onWin: showWin,
   }),
 ); // 35 — the haul
+const drillerSys = registerSystem(
+  createDrillerSystem({
+    showEvent,
+    setPrompt: (text) => {
+      drillerPrompt = text;
+      renderCarryPrompt();
+    },
+  }),
+); // 36 — the driller (M3.1)
 const catfishSys = registerSystem(
   createCatfishSystem({
     showEvent,
@@ -280,6 +300,8 @@ async function buildWorld(rebuild = false) {
   catfishSys.spawn(game.difficulty);
   // Spawn Gouda (seeded → same place, free on wire).
   cargoSys.spawn();
+  // Spawn the driller at the drift wreck (seeded, M3.1).
+  drillerSys.spawn();
   // Rebuild: request live items from host.
   const hostId = getHostId();
   if (hostId) requestItemSnapshotFrom(hostId);
@@ -299,6 +321,7 @@ hostBtn.addEventListener("click", async () => {
     game.fishAuthorityId = id;
     // A wheel picked up before the mesh existed is filed under "local".
     cargoSys.rebindLocalId();
+    drillerSys.rebindLocalId();
     const peer = getPeer();
     if (peer) initVoice(peer); // non-null right after hostGame() resolves
     showStatus("Invite a diver:");
@@ -351,6 +374,7 @@ async function join(hostId: string, mode: SignalingMode | null = null) {
     game.fishAuthority = false;
     game.fishAuthorityId = remoteId;
     cargoSys.rebindLocalId();
+    drillerSys.rebindLocalId();
     menu.classList.add("hidden");
     hud.classList.remove("hidden");
   } catch (err) {
@@ -405,18 +429,13 @@ window.addEventListener("keydown", (e) => {
     broadcastNow();
   } else if (e.code === "KeyV") {
     toggleMute();
-  } else if (e.code === "KeyT") {
-    // TEMPORARY debug toggle until M3 seeds the driller item (WG-01).
-    game.digTool = game.digTool === "hands" ? "driller" : "hands";
-    playClick();
-    showEvent(
-      game.digTool === "driller"
-        ? "🛠 [DEBUG] Tool: DRILLER (2.4 u, loud)"
-        : "⛏ [DEBUG] Tool: bare paws (0.7 u, quiet)",
-    );
   } else if (e.code === "KeyE") {
-    // E key: Gouda first (can't dig with both arms full), then pickaxe.
-    if (!cargoSys.use()) tryDig();
+    // E key: Gouda first (can't dig with both arms full), then the driller
+    // (pick up / hand off), then bare hands on whatever's in reach.
+    if (!cargoSys.use() && !drillerSys.use()) tryDig();
+  } else if (e.code === "KeyG") {
+    // G key: deliberate drop — whatever's in your hands, Gouda or driller.
+    if (!cargoSys.drop()) drillerSys.drop();
   } else if (e.code === "KeyO") {
     // DEBUG mode: coordinate HUD + TP + freecam. Leaving it also drops
     // freecam, so you can never get stuck noclipped with the panel gone.
@@ -875,6 +894,7 @@ initOxygen({
     showEvent("💀 Blackout… the abyss takes you.", DEATH_RESPAWN_MS);
     // Carried items dropped on death.
     cargoSys.fumble("🧀 Your grip fails — the Gouda slips away.");
+    drillerSys.drop("🛠 Your grip fails — the driller sinks away.");
     clearTimeout(respawnTimer);
     respawnTimer = setTimeout(() => {
       const s = game.spawnPoint;
