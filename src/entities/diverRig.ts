@@ -134,6 +134,96 @@ const ARM_POSE_CARRY_FP: ArmPose = {
 };
 // FP body slides forward/down during carry (shoulder cut buried in cheese).
 const FP_OFFSET_CARRY = new THREE.Vector3(0, -0.19, -0.21);
+// …and drops down/right while drilling, so the tool rides the lower corner
+// instead of sitting on the crosshair.
+const FP_OFFSET_DRILLER = new THREE.Vector3(0.1, -0.3, 0.1);
+
+// Driller grip — authored in the bench pose editor (preview.ts, "driller hold
+// pose") and asymmetric, unlike the Gouda's two-handed hug: the left paw
+// steadies the barrel, the right sits back on the grip. The same pose serves
+// first person, so the tool sits in the paw the camera can actually see.
+const ARM_POSE_DRILLER_L: ArmPose = {
+  uy: 1.3198565821023656,
+  ux: -0.415358708308355,
+  fy: 1.302265700985218,
+  fx: 0.6579266744367341,
+  fz: -0.6772623830737345,
+  hx: -0.6036618994241535,
+  hy: -0.2518724893837019,
+  hz: 0.3547426396190361,
+};
+const ARM_POSE_DRILLER_R: ArmPose = {
+  uy: 0.9704390268508847,
+  ux: -0.11836488532226327,
+  fy: 1.5259339280412691,
+  fx: -0.0260704506934891,
+  fz: -0.31900848911504565,
+  hx: -1.258815879760726,
+  hy: -0.3527417713840886,
+  hz: 0.7129024863996127,
+};
+// The other half of that export: where the tool itself sits in the rig-root
+// frame once the arms are in the grip above. holdAnchor() turns this into a
+// node under the right hand bone, so the prop rides the arm instead of the body.
+const DRILLER_TOOL = new THREE.Matrix4().compose(
+  new THREE.Vector3(
+    -0.06804448617029013,
+    1.2413661952630088,
+    -0.9445430500185676,
+  ),
+  new THREE.Quaternion().setFromEuler(
+    new THREE.Euler(
+      -1.0304698079267598,
+      -0.03442524227649817,
+      -3.002240982155287,
+    ),
+  ),
+  new THREE.Vector3(1, 1, 1),
+);
+
+// What the diver has in its paws. "none" is the idle/swim blend; every other
+// kind is a grip in GRIPS below.
+export type GripKind = "gouda" | "driller";
+export type CarryKind = "none" | GripKind;
+
+interface Grip {
+  left: ArmPose;
+  right: ArmPose;
+  fpLeft: ArmPose;
+  fpRight: ArmPose;
+  /** Where the FP body parks while gripping (see FP_OFFSET_CARRY). */
+  fpOffset: THREE.Vector3;
+  /** How long the FP arms are while gripping (see FP_SCALE). */
+  fpScale: number;
+  /** Prop transform in the rig-root frame; null = placed by game/cargo.ts. */
+  tool: THREE.Matrix4 | null;
+}
+
+const GRIPS: Record<GripKind, Grip> = {
+  gouda: {
+    left: ARM_POSE_CARRY_THIRD,
+    right: ARM_POSE_CARRY_THIRD,
+    fpLeft: ARM_POSE_CARRY_FP,
+    fpRight: ARM_POSE_CARRY_FP,
+    fpOffset: FP_OFFSET_CARRY,
+    fpScale: 0, // 0 = keep FP_SCALE, whatever it's been tuned to
+    tool: null,
+  },
+  driller: {
+    left: ARM_POSE_DRILLER_L,
+    right: ARM_POSE_DRILLER_R,
+    fpLeft: ARM_POSE_DRILLER_L,
+    fpRight: ARM_POSE_DRILLER_R,
+    // No wheel to bury the shoulder cut in — the FP body drops down and right
+    // instead, and the arms come most of the way down to true scale: the grip
+    // was authored around a tool of a fixed real size, so full FP_SCALE arms
+    // hold a driller that fills the lens. This leaves the usual mild viewmodel
+    // exaggeration and nothing more.
+    fpOffset: FP_OFFSET_DRILLER,
+    fpScale: 1.7,
+    tool: DRILLER_TOOL,
+  },
+};
 
 // FP body RIGIDLY follows camera (yaw + pitch 1:1). Shoulder cut stays fixed
 // in camera space—behind lens at all angles/banks. Reveal job belongs to pose
@@ -288,15 +378,19 @@ export interface DiverRig {
   anchorUnit: THREE.Vector3;
   anchor: THREE.Vector3;
   firstPerson: boolean;
-  /** The idle pose for this view, the look-down reveal, and the carry grip. */
+  /** The idle pose for this view and the look-down reveal. */
   armPose: ArmPose;
   downPose: ArmPose;
-  carryPose: ArmPose;
-  /** Scratch the three are blended into each frame — never allocated here. */
-  pose: ArmPose;
+  /** Last grip asked for — sticky, so releasing eases back out of the same one. */
+  carryKind: GripKind;
+  /** Scratch the blends land in each frame — never allocated here. */
+  poseL: ArmPose;
+  poseR: ArmPose;
   poseTmp: ArmPose;
   /** 0 = idle, 1 = carrying. Eased, so a hand-off reads as a movement. */
   carrySm: number;
+  /** Solved lazily by holdAnchor(), one paw node per grip. */
+  anchors: Map<GripKind, THREE.Object3D>;
   head: THREE.Object3D | null;
   chain: THREE.Object3D[];
   cycle: number;
@@ -569,10 +663,12 @@ export function createDiverRig(
     // Third person has no reveal to do — its "look down" pose IS its pose,
     // so the blend below is a no-op there rather than a special case.
     downPose: firstPerson ? ARM_POSE_FP_DOWN : ARM_POSE_THIRD,
-    carryPose: firstPerson ? ARM_POSE_CARRY_FP : ARM_POSE_CARRY_THIRD,
-    pose: { uy: 0, ux: 0, fy: 0, fx: 0, fz: 0, hx: 0, hy: 0, hz: 0 },
+    carryKind: "gouda",
+    poseL: { uy: 0, ux: 0, fy: 0, fx: 0, fz: 0, hx: 0, hy: 0, hz: 0 },
+    poseR: { uy: 0, ux: 0, fy: 0, fx: 0, fz: 0, hx: 0, hy: 0, hz: 0 },
     poseTmp: { uy: 0, ux: 0, fy: 0, fx: 0, fz: 0, hx: 0, hy: 0, hz: 0 },
     carrySm: 0,
+    anchors: new Map(),
     head: bones.get("Head") ?? null,
     chain: HEAD_CHAIN.map((n) => bones.get(n)).filter(
       Boolean,
@@ -598,10 +694,13 @@ export function createDiverRig(
 // swings beneath it). First-person bodies also get the FP_OFFSET cheat.
 function applyRootPose(rig: DiverRig, swayX = 0, swayZ = 0) {
   if (rig.firstPerson) {
-    // Re-read FP_SCALE (live tuning knob). Anchor derives from it; head stays
-    // pinned to camera. Arms don't grow on pickup (body slides forward instead).
-    rig.model.scale.setScalar(FP_SCALE);
-    rig.anchor.copy(rig.anchorUnit).multiplyScalar(FP_SCALE);
+    // Re-read FP_SCALE (live tuning knob), then blend toward the grip's own
+    // arm length. Anchor derives from it; head stays pinned to camera.
+    const grip = GRIPS[rig.carryKind];
+    const scale =
+      FP_SCALE + ((grip.fpScale || FP_SCALE) - FP_SCALE) * rig.carrySm;
+    rig.model.scale.setScalar(scale);
+    rig.anchor.copy(rig.anchorUnit).multiplyScalar(scale);
   }
   rig.root.rotation.set(
     -(rig.firstPerson ? FP_LEAN : LEAN) + rig.leanAdj + swayX,
@@ -611,7 +710,7 @@ function applyRootPose(rig: DiverRig, swayX = 0, swayZ = 0) {
   rig.root.position.copy(rig.anchor).applyEuler(rig.root.rotation).negate();
   if (rig.firstPerson) {
     rig.root.position.add(
-      _v3.lerpVectors(FP_OFFSET, FP_OFFSET_CARRY, rig.carrySm),
+      _v3.lerpVectors(FP_OFFSET, GRIPS[rig.carryKind].fpOffset, rig.carrySm),
     );
   }
 }
@@ -664,26 +763,29 @@ export function updateDiverRig(
     lookYaw,
     lookPitch,
     vel,
-    carrying = false,
+    carry = "none",
   }: {
     bodyYaw: number;
     bodyPitch: number;
     lookYaw: number;
     lookPitch: number;
     vel: { x: number; y: number; z: number };
-    // Both arms on wheel: hold carry pose, stop stroking. True for local
-    // carrier & remotes with STATUS.CARRYING (replicated state).
-    carrying?: boolean;
+    // What's in the paws: hold that grip, stop stroking. Driven by the local
+    // carry systems and, for remotes, by the replicated status mask.
+    carry?: CarryKind;
   },
 ) {
   // --- Carry blend --------------------------------------------------------
   // Eased first, because applyRootPose (below) reads it: the FP body slides
-  // forward toward the wheel over the same ~0.2 s the arms take to close.
+  // toward its grip offset over the same ~0.2 s the arms take to close.
+  if (carry !== "none") rig.carryKind = carry;
+  const grip = GRIPS[rig.carryKind];
   rig.carrySm +=
-    ((carrying ? 1 : 0) - rig.carrySm) * Math.min(1, dt * CARRY_EASE);
-  // Level pose → look-down reveal → carry grip, in that order. The reveal is
+    ((carry === "none" ? 0 : 1) - rig.carrySm) * Math.min(1, dt * CARRY_EASE);
+  // Level pose → look-down reveal → grip, in that order. The reveal is
   // driven straight off the look (no easing: it IS the look, and the camera
-  // is already smoothed), the grip off the carry ease.
+  // is already smoothed), the grip off the carry ease. Grips are per-side:
+  // a tool is held asymmetrically, a wheel is hugged.
   const down = Math.min(
     1,
     Math.max(
@@ -692,7 +794,10 @@ export function updateDiverRig(
     ),
   );
   blendPose(rig.armPose, rig.downPose, down, rig.poseTmp);
-  blendPose(rig.poseTmp, rig.carryPose, rig.carrySm, rig.pose);
+  const gripL = rig.firstPerson ? grip.fpLeft : grip.left;
+  const gripR = rig.firstPerson ? grip.fpRight : grip.right;
+  blendPose(rig.poseTmp, gripL, rig.carrySm, rig.poseL);
+  blendPose(rig.poseTmp, gripR, rig.carrySm, rig.poseR);
 
   // --- Movement analysis --------------------------------------------------
   _q1.setFromEuler(_e1.set(bodyPitch, bodyYaw, 0, "YXZ")); // body world quat
@@ -769,42 +874,43 @@ export function updateDiverRig(
   const arm = (0.25 + 0.85 * effort) * (rig.firstPerson ? 0.06 : 1) * free;
   const sw = s(c * 0.5);
   const sw2 = s(c * 0.5 - 0.9);
-  const ap = rig.pose; // idle pose blended toward the carry pose (see above)
+  const apL = rig.poseL; // idle pose blended toward this side's grip (above)
+  const apR = rig.poseR;
   // Strafing: both arms sweep toward the travel side — the diver visibly
   // pulls itself sideways with its arms (third person only, and not with its
   // hands full).
   const sOff = rig.firstPerson ? 0 : rig.strafeSm * 0.5 * free;
-  pose(rig, "L_Upperarm", "aY", -ap.uy + arm * 0.7 * sw + sOff);
-  poseAdd(rig, "L_Upperarm", "aX", ap.ux + arm * 0.4 * sw2);
-  pose(rig, "R_Upperarm", "aY", ap.uy - arm * 0.7 * sw + sOff);
-  poseAdd(rig, "R_Upperarm", "aX", ap.ux + arm * 0.4 * sw2);
+  pose(rig, "L_Upperarm", "aY", -apL.uy + arm * 0.7 * sw + sOff);
+  poseAdd(rig, "L_Upperarm", "aX", apL.ux + arm * 0.4 * sw2);
+  pose(rig, "R_Upperarm", "aY", apR.uy - arm * 0.7 * sw + sOff);
+  poseAdd(rig, "R_Upperarm", "aX", apR.ux + arm * 0.4 * sw2);
   pose(
     rig,
     "L_Forearm",
     "aY",
-    -ap.fy - arm * 0.6 * Math.max(0, sw2) + sOff * 0.6,
+    -apL.fy - arm * 0.6 * Math.max(0, sw2) + sOff * 0.6,
   );
-  poseAdd(rig, "L_Forearm", "aX", ap.fx);
-  poseAdd(rig, "L_Forearm", "aZ", -ap.fz);
+  poseAdd(rig, "L_Forearm", "aX", apL.fx);
+  poseAdd(rig, "L_Forearm", "aZ", -apL.fz);
   pose(
     rig,
     "R_Forearm",
     "aY",
-    ap.fy + arm * 0.6 * Math.max(0, sw2) + sOff * 0.6,
+    apR.fy + arm * 0.6 * Math.max(0, sw2) + sOff * 0.6,
   );
-  poseAdd(rig, "R_Forearm", "aX", ap.fx);
-  poseAdd(rig, "R_Forearm", "aZ", ap.fz);
+  poseAdd(rig, "R_Forearm", "aX", apR.fx);
+  poseAdd(rig, "R_Forearm", "aZ", apR.fz);
   const handWiggle = (rig.firstPerson ? 0.04 : 0.16) * free;
   // Three axes (mirrored L/R like uy/fy): hx (wrist bend), hy (palms inward—
   // read as holding vs. flat), hz (palm roll + forearm pronation). Without hz
   // paws meet wheel back-first, fingers splayed. Zero for flat hand, all three
   // for grip.
-  pose(rig, "L_Hand", "aX", ap.hx + handWiggle * sw);
-  poseAdd(rig, "L_Hand", "aY", -ap.hy);
-  poseAdd(rig, "L_Hand", "aZ", -ap.hz);
-  pose(rig, "R_Hand", "aX", ap.hx + handWiggle * sw);
-  poseAdd(rig, "R_Hand", "aY", ap.hy);
-  poseAdd(rig, "R_Hand", "aZ", ap.hz);
+  pose(rig, "L_Hand", "aX", apL.hx + handWiggle * sw);
+  poseAdd(rig, "L_Hand", "aY", -apL.hy);
+  poseAdd(rig, "L_Hand", "aZ", -apL.hz);
+  pose(rig, "R_Hand", "aX", apR.hx + handWiggle * sw);
+  poseAdd(rig, "R_Hand", "aY", apR.hy);
+  poseAdd(rig, "R_Hand", "aZ", apR.hz);
 
   // First person: the head is collapsed/invisible and the local torch is
   // camera-mounted — skip the whole look solve.
@@ -876,4 +982,43 @@ export function applyArmPoseSides(
 // Symmetric case: both arms mirror the same authored pose.
 export function applyArmPose(rig: DiverRig, p: ArmPose): void {
   applyArmPoseSides(rig, p, p);
+}
+
+const _m1 = new THREE.Matrix4();
+const _m2 = new THREE.Matrix4();
+const _m3 = new THREE.Matrix4();
+
+// The node a held prop hangs from: a child of the right hand BONE, so the
+// prop inherits the paw's every stroke, sway and lean for free instead of
+// being re-placed from the diver's position each frame. Its transform is
+// solved once per rig, from the grip's authored rig-root placement:
+//   anchorLocal = boneChain⁻¹ · modelMatrix⁻¹ · tool
+// measured at DIVER_SCALE whatever the rig's own scale is — so a first-person
+// body (scaled up so the arms read) carries a proportionally scaled tool.
+// Returns null for grips whose prop is placed by game/cargo.ts instead.
+export function holdAnchor(
+  rig: DiverRig,
+  kind: GripKind,
+): THREE.Object3D | null {
+  const cached = rig.anchors.get(kind);
+  if (cached) return cached;
+  const grip = GRIPS[kind];
+  const hand = rig.bones.get("R_Hand");
+  if (!grip.tool || !hand) return null;
+
+  // The placement only means anything with the arms in that exact grip; the
+  // next updateDiverRig() overwrites these bones anyway.
+  applyArmPoseSides(rig, grip.left, grip.right);
+  rig.root.updateMatrixWorld(true);
+  _m1.copy(rig.model.matrixWorld).invert().multiply(hand.matrixWorld);
+  _m2.makeRotationY(-Math.PI).multiply(grip.tool); // model node's own flip
+  const inv = 1 / DIVER_SCALE;
+  _m2.premultiply(_m3.makeScale(inv, inv, inv));
+  _m2.premultiply(_m1.invert());
+
+  const anchor = new THREE.Object3D();
+  _m2.decompose(anchor.position, anchor.quaternion, anchor.scale);
+  hand.add(anchor);
+  rig.anchors.set(kind, anchor);
+  return anchor;
 }

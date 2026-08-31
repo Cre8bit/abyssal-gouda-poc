@@ -51,6 +51,9 @@ export interface DrillerSystemDeps {
   // Contextual HUD line, or null to clear it. Only ever set when the Gouda's
   // own prompt (cargoSystem, higher priority) has nothing to say.
   setPrompt(text: string | null): void;
+  // Park the driller in the carrier's right paw, so it rides the arm's own
+  // swim sway. False means no rig took it — place it in the world by hand.
+  holdInPaw(peerId: string | null, self: boolean): boolean;
 }
 
 export interface DrillerSystem extends GameSystem {
@@ -73,6 +76,7 @@ export interface DrillerSystem extends GameSystem {
 export function createDrillerSystem({
   showEvent,
   setPrompt,
+  holdInPaw,
 }: DrillerSystemDeps): DrillerSystem {
   let lastHolder: string | null = null;
   let looseSyncTimer = 0;
@@ -234,7 +238,10 @@ export function createDrillerSystem({
   function placeVisual(item: ItemInstance, holder: string | null): void {
     const visual = getMountedDriller();
     if (!visual) return;
-    if (isSelf(holder)) {
+    const self = isSelf(holder);
+    // In a paw the arm owns the transform; the rest is a world placement.
+    if (holdInPaw(holder === null ? null : holder, self)) return;
+    if (self) {
       fpHoldPose(game.localPosition, getYaw(), getPitch(), _view);
       visual.group.position.set(_view.x, _view.y, _view.z);
     } else {
@@ -259,7 +266,9 @@ export function createDrillerSystem({
     }
     const d = distance(game.localPosition, item);
     if (d <= CARGO.PICKUP_RANGE) {
-      setPrompt(heldBy(selfId()) ? "🛠 hands full" : "🛠 [E] pick up the driller");
+      setPrompt(
+        heldBy(selfId()) ? "🛠 hands full" : "🛠 [E] pick up the driller",
+      );
     } else {
       setPrompt(null);
     }
@@ -286,14 +295,19 @@ export function createDrillerSystem({
     spawn() {
       const wreck = getSeededProps().find((p) => p.kind === "wreck");
       if (!wreck) {
-        console.warn(
-          "[driller] world has no wreck prop — no driller seeded",
-        );
+        console.warn("[driller] world has no wreck prop — no driller seeded");
         return;
       }
       // Seeded: identical on every client, so it costs nothing to place and
       // a late joiner who rebuilt the same map already has it.
-      console.log("[driller] spawning driller at wreck position", wreck.pos.x,',', wreck.pos.y,',', wreck.pos.z);
+      console.log(
+        "[driller] spawning driller at wreck position",
+        wreck.pos.x,
+        ",",
+        wreck.pos.y,
+        ",",
+        wreck.pos.z,
+      );
       spawnItem(
         "driller",
         wreck.pos,

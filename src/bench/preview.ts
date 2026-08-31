@@ -27,7 +27,9 @@ import {
   applyArmPoseSides,
   fpBodyPitch,
   configureFpBody,
+  holdAnchor,
   type ArmPose,
+  type CarryKind,
   type DiverRig,
 } from "../entities/diverRig.ts";
 import { prepareCatfishTemplate } from "../entities/catfish.ts";
@@ -105,6 +107,16 @@ const TORCH_INTENSITY = 190;
 
 const BONE_UP = new THREE.Vector3(0, 1, 0);
 const ORIGIN = new THREE.Vector3();
+
+// The hold cycle both diver entries share: nothing → the wheel → the tool.
+const CARRY_CYCLE: CarryKind[] = ["none", "gouda", "driller"];
+const nextCarry = (c: CarryKind) =>
+  CARRY_CYCLE[(CARRY_CYCLE.indexOf(c) + 1) % CARRY_CYCLE.length];
+// Deep link: ?hold=gouda|driller opens with something already in the paws.
+const startCarry = ((): CarryKind => {
+  const p = new URLSearchParams(location.search).get("hold") as CarryKind;
+  return CARRY_CYCLE.includes(p) ? p : "none";
+})();
 
 // --- Scene -----------------------------------------------------------------
 const scene = new THREE.Scene();
@@ -213,7 +225,7 @@ function buildDiver(gltf: GLTF): BenchInstance {
     angle: 0,
     yaw: 0,
     bodyPitchSm: 0,
-    carrying: false, // both arms around the Golden Gouda
+    carry: startCarry, // what's in the paws
   };
   const vel = new THREE.Vector3();
   const focus = new THREE.Vector3();
@@ -226,6 +238,10 @@ function buildDiver(gltf: GLTF): BenchInstance {
   );
   cargo.visible = false;
   group.add(cargo);
+  // The driller rides its paw anchor — same node the game hangs it from.
+  const driller = createDrillerVisual();
+  driller.group.visible = false;
+  holdAnchor(rig, "driller")?.add(driller.group);
   const R = 7; // swim circle radius
 
   let modeBtns: Record<string, HTMLButtonElement> = {};
@@ -281,10 +297,12 @@ function buildDiver(gltf: GLTF): BenchInstance {
         lookYaw,
         lookPitch,
         vel,
-        carrying: st.carrying,
+        carry: st.carry,
       });
       // Cargo at game/cargo.ts position — test carry pose
-      cargo.visible = st.carrying;
+      cargo.visible = st.carry === "gouda";
+      driller.group.visible = st.carry === "driller";
+      driller.update(t, true);
       holdPose(ORIGIN, st.yaw, lookPitch, _hold);
       cargo.position.set(_hold.x, _hold.y, _hold.z).add(swim.position);
 
@@ -311,10 +329,12 @@ function buildDiver(gltf: GLTF): BenchInstance {
         torch.visible = !torch.visible;
         b.classList.toggle("on", torch.visible);
       }).classList.add("on");
-      button(modes, "carrying", (b) => {
-        st.carrying = !st.carrying;
-        b.classList.toggle("on", st.carrying);
+      const carryBtn = button(modes, "hold: none", (b) => {
+        st.carry = nextCarry(st.carry);
+        b.textContent = `hold: ${st.carry}`;
+        b.classList.toggle("on", st.carry !== "none");
       });
+      carryBtn.textContent = `hold: ${st.carry}`;
 
       // Slider touch → manual mode (stop and look)
       const hold = section(panel, "Hold (manual)").parentElement!;
@@ -351,7 +371,7 @@ function buildDiver(gltf: GLTF): BenchInstance {
     lines: () => [
       ["mode", st.mode],
       ["speed", `${vel.length().toFixed(1)} m/s`],
-      ["carrying", st.carrying ? "yes" : "no"],
+      ["holding", st.carry],
     ],
     bars: () => [
       ["kick effort", rig.speedSm],
@@ -402,7 +422,12 @@ function buildGloves(gltf: GLTF): BenchInstance {
   });
   pivot.add(rig.root);
 
-  const st = { pitch: 0, speed: 0, eyeCam: false, carrying: false };
+  const st = {
+    pitch: 0,
+    speed: 0,
+    eyeCam: false,
+    carry: startCarry,
+  };
   const vel = new THREE.Vector3();
   const focus = new THREE.Vector3(0, -0.3, -0.6);
   // Cargo at FP_HOLD offset; pivot-locked for carry pose (fpBodyPitch)
@@ -413,6 +438,10 @@ function buildGloves(gltf: GLTF): BenchInstance {
   cargo.position.set(0, -CARGO.FP_HOLD_DOWN, -CARGO.FP_HOLD_FORWARD);
   cargo.visible = false;
   pivot.add(cargo);
+  // The driller rides the FP paw anchor, exactly as it does in game.
+  const driller = createDrillerVisual();
+  driller.group.visible = false;
+  holdAnchor(rig, "driller")?.add(driller.group);
 
   // Joint camera-space positions: shoulder (cut), wrist (frame edge)
   const shoulder = rig.bones.get("R_Upperarm");
@@ -444,7 +473,7 @@ function buildGloves(gltf: GLTF): BenchInstance {
     group,
     focus,
     camLocked: false,
-    update(dt: number) {
+    update(dt: number, t: number) {
       // FPS body pitch synchronized with camera look
       const bodyPitch = fpBodyPitch(st.pitch);
       pivot.rotation.x = bodyPitch;
@@ -455,9 +484,11 @@ function buildGloves(gltf: GLTF): BenchInstance {
         lookYaw: 0,
         lookPitch: st.pitch,
         vel,
-        carrying: st.carrying,
+        carry: st.carry,
       });
-      cargo.visible = st.carrying;
+      cargo.visible = st.carry === "gouda";
+      driller.group.visible = st.carry === "driller";
+      driller.update(t, true);
       // Eye cam: follow-lerp chases look target, not rig
       if (st.eyeCam) focus.set(0, Math.tan(-st.pitch) * 4, -4);
       else focus.set(0, -0.3, -0.6);
@@ -478,10 +509,12 @@ function buildGloves(gltf: GLTF): BenchInstance {
           frameCamera(ACTIVE_DEF.cam);
         }
       });
-      button(cams, "carrying", (b) => {
-        st.carrying = !st.carrying;
-        b.classList.toggle("on", st.carrying);
+      const carryBtn = button(cams, "hold: none", (b) => {
+        st.carry = nextCarry(st.carry);
+        b.textContent = `hold: ${st.carry}`;
+        b.classList.toggle("on", st.carry !== "none");
       });
+      carryBtn.textContent = `hold: ${st.carry}`;
       const hold = section(panel, "Pose").parentElement!;
       sliderRow(hold, "look pitch", -1.2, 1.2, 0.01, 0, (v) => {
         st.pitch = v;
@@ -535,7 +568,7 @@ function buildGloves(gltf: GLTF): BenchInstance {
         ],
         ["frame edge @ wrist", (-edge).toFixed(2)],
         ["body pitch", fpBodyPitch(st.pitch).toFixed(2)],
-        ["carrying", st.carrying ? "yes" : "no"],
+        ["holding", st.carry],
       ];
     },
     bars: () => [
@@ -1269,7 +1302,7 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
         lookYaw: 0,
         lookPitch: 0,
         vel,
-        carrying: false,
+        carry: "none",
       });
       applyArmPoseSides(rig, poseL, poseR); // locks the arms, overriding the swim blend
       for (const j of armJoints) {

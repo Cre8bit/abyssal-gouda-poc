@@ -142,7 +142,7 @@ export function mountDriller(): DrillerVisual | null {
 
 export function unmountDriller(): void {
   if (!mounted) return;
-  gameScene?.remove(mounted.group);
+  mounted.group.removeFromParent(); // may be hanging off a carrier's paw
   mounted.dispose();
   mounted = null;
 }

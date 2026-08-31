@@ -14,7 +14,8 @@ import {
   renderLoop,
   toggleFlashlight,
   setPlayerLight,
-  setPlayerCarrying,
+  setPlayerCarry,
+  setDrillerHolder,
   loadWorld,
   rebuildWorld,
   emitBreath,
@@ -98,6 +99,7 @@ import {
   hasLocalStatus,
 } from "./game/effects.ts";
 import { initOxygen, refillOxygen, isDead } from "./game/oxygen.ts";
+import type { CarryKind } from "./entities/diverRig.ts";
 import { setBellCount, collideBathyscaphe } from "./world/bathyscaphe.ts";
 import {
   game,
@@ -231,6 +233,7 @@ const drillerSys = registerSystem(
       drillerPrompt = text;
       renderCarryPrompt();
     },
+    holdInPaw: setDrillerHolder,
   }),
 ); // 36 — the driller (M3.1)
 const catfishSys = registerSystem(
@@ -648,6 +651,14 @@ onPeerDisconnected((peerId) => {
   showStatus("Diver disconnected.");
 });
 
+// Which grip a status mask puts in the paws. The Gouda wins: it takes both
+// arms, so it can never share them with the driller.
+function carryKind(status: number): CarryKind {
+  if (status & STATUS.CARRYING) return "gouda";
+  if (status & STATUS.HOLDING_DRILLER) return "driller";
+  return "none";
+}
+
 // Buffer for interpolation. Flags (light, status) applied instantly.
 onStateReceived((peerId, { x, y, z, yaw, pitch, light, sy, sp, status }) => {
   game.remoteBuffers.get(peerId)?.push({ x, y, z, yaw, pitch, sy, sp });
@@ -655,7 +666,7 @@ onStateReceived((peerId, { x, y, z, yaw, pitch, light, sy, sp, status }) => {
   if (status !== undefined) {
     setPeerStatus(peerId, status);
     // Exterior carry animation (FP half on local body status).
-    setPlayerCarrying(peerId, (status & STATUS.CARRYING) !== 0);
+    setPlayerCarry(peerId, carryKind(status));
   }
 });
 
@@ -812,9 +823,10 @@ renderLoop((delta) => {
     swimYaw,
     swimPitch,
     vel,
-    hasLocalStatus(STATUS.CARRYING),
+    carryKind(getLocalStatus()),
   );
   cargoSys.followCarrier();
+  drillerSys.followCarrier();
 
   // Spatial audio follows camera; soundscape follows depth/speed/effort.
   setListenerPose(pos, yaw, pitch);

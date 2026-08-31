@@ -30,10 +30,12 @@ import {
   createDiverRig,
   updateDiverRig,
   fpBodyPitch,
+  holdAnchor,
+  type CarryKind,
 } from "../entities/diverRig.ts";
 import { initCatfishSystem } from "../entities/catfish.ts";
 import { setGoudaScene } from "../entities/goldenGouda.ts";
-import { setDrillerScene } from "../entities/driller.ts";
+import { setDrillerScene, getMountedDriller } from "../entities/driller.ts";
 import { toonMaterial } from "./toon.ts";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
@@ -104,7 +106,7 @@ interface RemotePlayer {
   velEst: THREE.Vector3;
   lastPos: THREE.Vector3;
   hasLast: boolean;
-  carrying: boolean;
+  carry: CarryKind;
 }
 
 // traverse() hands back plain Object3Ds; disposables are found by probing.
@@ -221,7 +223,7 @@ const localState = {
   swimYaw: 0,
   swimPitch: 0,
   vel: new THREE.Vector3(),
-  carrying: false,
+  carry: "none" as CarryKind,
 };
 
 // FP suit: double-sided, darkened to prevent blown-out arms in torch core
@@ -265,10 +267,10 @@ export function updateLocalPlayer(
   swimYaw: number,
   swimPitch: number,
   vel: Vec3,
-  carrying: boolean = false,
+  carry: CarryKind = "none",
 ): void {
   localState.active = true;
-  localState.carrying = carrying;
+  localState.carry = carry;
   localState.pos.set(pos.x, pos.y, pos.z);
   localState.yaw = yaw;
   localState.pitch = pitch;
@@ -291,7 +293,7 @@ function updateLocalBody(delta: number): void {
     lookYaw: localState.yaw,
     lookPitch: localState.pitch,
     vel: localState.vel,
-    carrying: localState.carrying,
+    carry: localState.carry,
   });
 }
 
@@ -1181,7 +1183,7 @@ export function addPlayer(id: string, color: THREE.ColorRepresentation): void {
     velEst: new THREE.Vector3(),
     lastPos: new THREE.Vector3(),
     hasLast: false,
-    carrying: false,
+    carry: "none",
   };
   players.set(id, player);
 
@@ -1244,7 +1246,7 @@ function updateRemoteDiver(player: RemotePlayer, delta: number): void {
     lookYaw: player.lookYaw,
     lookPitch: player.lookPitch,
     vel: player.velEst,
-    carrying: player.carrying,
+    carry: player.carry,
   });
 
   // Torch: positioned/oriented along look direction
@@ -1258,6 +1260,14 @@ function updateRemoteDiver(player: RemotePlayer, delta: number): void {
 export function removePlayer(id: string): void {
   const player = players.get(id);
   if (!player) return;
+  // A prop in this diver's paw is shared, not theirs: rescue it before the
+  // traversal below disposes the geometry every other driller would reuse.
+  const prop = getMountedDriller()?.group;
+  for (let o = prop?.parent; o; o = o.parent) {
+    if (o !== player.group) continue;
+    scene.add(prop!);
+    break;
+  }
   for (const obj of [player.group, player.torch, player.headGlow]) {
     if (!obj) continue;
     scene.remove(obj);
@@ -1299,10 +1309,39 @@ export function updatePlayerPosition(
   player.swimPitch = swimPitch ?? pitch ?? player.swimPitch;
 }
 
-// Carrying: rig holds wheel with both arms when set
-export function setPlayerCarrying(id: string, carrying: boolean): void {
+// What a remote diver has in its paws (from the replicated status mask):
+// picks the grip its arms hold, and which paw a held prop hangs from.
+export function setPlayerCarry(id: string, carry: CarryKind): void {
   const player = players.get(id);
-  if (player) player.carrying = carrying;
+  if (player) player.carry = carry;
+}
+
+// Park the driller in its carrier's right paw, where it inherits the arm's
+// own sway instead of being re-placed from the diver's position each frame.
+// Returns false when no rig can take it (nobody holding it, or the diver
+// model hasn't loaded yet) — the caller then places it in the world itself.
+export function setDrillerHolder(
+  peerId: string | null,
+  self: boolean,
+): boolean {
+  const prop = getMountedDriller()?.group;
+  if (!prop) return false;
+  const rig = self
+    ? (localBody?.rig ?? null)
+    : peerId
+      ? (players.get(peerId)?.rig ?? null)
+      : null;
+  const anchor = rig ? holdAnchor(rig, "driller") : null;
+  if (!anchor) {
+    if (prop.parent !== scene) scene.add(prop);
+    return false;
+  }
+  if (prop.parent !== anchor) {
+    anchor.add(prop);
+    prop.position.set(0, 0, 0);
+    prop.quaternion.identity();
+  }
+  return true;
 }
 
 export function setPlayerLight(id: string, on: boolean): void {
