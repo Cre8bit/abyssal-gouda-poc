@@ -27,6 +27,7 @@ import {
   buildWorldData,
   chunkDistance,
   SIGHT_RANGE,
+  softSpotDigRadius,
   tileFieldCovers,
   type Chunk,
   type DebrisSpec,
@@ -523,8 +524,7 @@ function addDataDig(
 
 // Drill every Great Wheel soft spot: a driller-radius bore along the ray
 // from the world origin through the spot (the hull is star-shaped around
-// the origin, so the ray always crosses the husk), long enough to pierce
-// the crust at any face obliquity.
+// the origin, so the ray always crosses the husk).
 function breachSoftSpots(data: WorldData): void {
   const DRILL_R = 2.4;
   for (const spot of data.plan.softSpots) {
@@ -532,7 +532,7 @@ function breachSoftSpots(data: WorldData): void {
     const dx = spot.x / len,
       dy = spot.y / len,
       dz = spot.z / len;
-    const reach = spot.r + 34;
+    const reach = softSpotDigRadius(spot.r);
     for (let t = -reach; t <= reach; t += 1.6)
       addDataDig(
         data.chunks,

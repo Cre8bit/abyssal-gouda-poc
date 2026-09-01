@@ -62,7 +62,7 @@ export interface CargoSystem extends GameSystem {
   use(): boolean;
   // Lose your grip — a fish hit you, or the abyss took you.
   fumble(reason: string): void;
-  // Deliberate drop (G key). No lockout — unlike a fumble, this was a
+  // Deliberate drop (R key). No lockout — unlike a fumble, this was a
   // choice. Returns false (no-op) if you aren't the carrier.
   drop(): boolean;
   // Re-pose a carried wheel AFTER physics has moved the diver this frame.
@@ -217,18 +217,10 @@ export function createCargoSystem({
     if (!item || won) return false;
     const holder = holderOf(item);
 
-    if (isSelf(holder)) {
-      // Hand-off — the cooperative verb. Momentum carries: the receiver is
-      // already moving, and the wheel simply becomes theirs.
-      const mate = nearestTeammate(game.localPosition);
-      if (!mate || mate.d > CARGO.HANDOFF_RANGE) {
-        showEvent("🧀 Nobody close enough to take it.");
-        return true; // hands full — the pickaxe is stowed either way
-      }
-      request("give", { to: mate.id });
-      showEvent(`🤝 Handing it to ${mate.id.slice(0, 4)}…`);
-      return true;
-    }
+    // Already holding it — E is now the "use" key, and there is nothing to
+    // use the Gouda for; leave the press for tryDig (which itself refuses to
+    // swing with both arms full via STATUS.CARRYING).
+    if (isSelf(holder)) return false;
 
     if (holder !== null) return false; // someone else has it — no stealing
     if (performance.now() < regrabUntil) return true; // you JUST fumbled it
@@ -258,6 +250,13 @@ export function createCargoSystem({
   function drop(): boolean {
     const item = getItem(GOUDA_ID);
     if (!item || !isSelf(holderOf(item))) return false;
+    // R with a teammate close hands it over instead of letting it fall.
+    const mate = nearestTeammate(game.localPosition);
+    if (mate && mate.d <= CARGO.HANDOFF_RANGE) {
+      request("give", { to: mate.id });
+      showEvent(`🤝 Handing it to ${mate.id.slice(0, 4)}…`);
+      return true;
+    }
     release("🧀 You set the Golden Gouda down.", false);
     return true;
   }
@@ -309,8 +308,8 @@ export function createCargoSystem({
       const mate = nearestTeammate(game.localPosition);
       setPrompt(
         mate && mate.d <= CARGO.HANDOFF_RANGE
-          ? `🤝 [E] hand the Gouda to ${mate.id.slice(0, 4)}`
-          : "🧀 carrying the Golden Gouda",
+          ? `🤝 [R] hand the Gouda to ${mate.id.slice(0, 4)}`
+          : "🧀 carrying the Golden Gouda — [R] drop",
       );
       return;
     }

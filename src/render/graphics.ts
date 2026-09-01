@@ -88,6 +88,18 @@ interface ChipState {
   life: number;
 }
 
+interface DustState {
+  x: number;
+  y: number;
+  z: number;
+  vx: number;
+  vy: number;
+  vz: number;
+  age: number;
+  life: number;
+  size: number;
+}
+
 interface Flashlight {
   group: THREE.Group;
   spot: THREE.SpotLight;
@@ -164,9 +176,14 @@ const BURST_PARTICLES = 24;
 const PLANKTON_COUNT = 320;
 const PLANKTON_RADIUS = 26;
 const BREATH_COUNT = 18; // your own exhaled bubbles
-const CHIP_COUNT = 120; // cheese crumbs thrown by the driller
-const CHIP_DRAG = 2.6; // 1/s — water eats the throw fast
-const CHIP_SINK = 1.1; // u/s² — crumbs are heavier than water
+const CHIP_COUNT = 320; // cheese crumbs thrown by the driller
+const CHIP_DRAG = 2.2; // 1/s — water eats the throw fast
+const CHIP_SINK = 1.4; // u/s² — crumbs are heavier than water
+const CHIP_CONE = 0.55; // isotropic fraction kept when a spray has an aim
+const DUST_COUNT = 220; // rind flour hanging in the water after a cut
+const DUST_DRAG = 1.5; // 1/s
+const DUST_SINK = 0.16; // u/s² — flour barely sinks; it hangs and smears
+const SHAKE_DECAY = 3.4; // 1/s — a bite's worth of chatter lasts ~0.4 s
 
 const FLASHLIGHT_INTENSITY = 260;
 const SPILL_INTENSITY = 32;
@@ -206,6 +223,13 @@ let chips: {
   states: ChipState[];
   cursor: number;
 };
+// { points, states } — rind flour, the cloud a cut leaves behind it
+let dust: {
+  points: THREE.Points<THREE.BufferGeometry, THREE.ShaderMaterial>;
+  states: DustState[];
+  cursor: number;
+};
+let shake = 0; // 0..1, decays every frame — the bit fighting the rind
 let flashlight: Flashlight; // { group, spot, spill, beam, halo, on } — helmet-mounted
 let elapsed = 0;
 let moveFactor = 0;
@@ -372,6 +396,7 @@ export function initGraphics(container: HTMLElement): HTMLCanvasElement {
   createPlankton();
   createBreath();
   createChips();
+  createDust();
 
   window.addEventListener("resize", onResize);
 
@@ -1092,6 +1117,7 @@ function createChips(): void {
   const positions = new Float32Array(CHIP_COUNT * 3);
   const alphas = new Float32Array(CHIP_COUNT);
   const seeds = new Float32Array(CHIP_COUNT);
+  const hots = new Float32Array(CHIP_COUNT);
   for (let i = 0; i < CHIP_COUNT; i++) {
     positions[i * 3 + 1] = -9999;
     seeds[i] = Math.random();
@@ -1100,6 +1126,7 @@ function createChips(): void {
   geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
   geometry.setAttribute("aAlpha", new THREE.BufferAttribute(alphas, 1));
   geometry.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 1));
+  geometry.setAttribute("aHot", new THREE.BufferAttribute(hots, 1));
 
   const material = new THREE.ShaderMaterial({
     transparent: true,
@@ -1109,20 +1136,27 @@ function createChips(): void {
       uniform float uPixelRatio;
       attribute float aAlpha;
       attribute float aSeed;
+      attribute float aHot;
       varying float vAlpha;
+      varying float vHot;
       void main() {
         vec4 mv = modelViewMatrix * vec4(position, 1.0);
-        gl_PointSize = (2.0 + aSeed * 3.5) * uPixelRatio * (16.0 / -mv.z);
+        gl_PointSize = (2.2 + aSeed * 6.0) * uPixelRatio * (16.0 / -mv.z);
         vAlpha = aAlpha * smoothstep(34.0, 2.0, -mv.z);
+        vHot = aHot;
         gl_Position = projectionMatrix * mv;
       }
     `,
     fragmentShader: /* glsl */ `
       varying float vAlpha;
+      varying float vHot;
       void main() {
         float d = distance(gl_PointCoord, vec2(0.5));
         float a = smoothstep(0.5, 0.18, d) * vAlpha;
-        gl_FragColor = vec4(0.86, 0.70, 0.32, a);
+        // Flecks torn off under the bit come away glowing: friction heat is
+        // the one cue that says this rind is fighting back.
+        vec3 c = mix(vec3(0.86, 0.70, 0.32), vec3(1.0, 0.88, 0.58), vHot);
+        gl_FragColor = vec4(c, a * (1.0 + vHot * 0.7));
       }
     `,
   });
@@ -1139,30 +1173,66 @@ function createChips(): void {
 }
 
 // Spray crumbs out of a carve. `speed` scales the throw — the driller
-// demolishes, bare paws only crumble.
+// demolishes, bare paws only crumble. `aim` is the direction the tool is
+// pointing: spoil flies BACK along it, into the digger's face. Without one
+// (a remote dig, whose aim we never see) the spray stays isotropic. `hot`
+// is the fraction of flecks that come away glowing with friction heat.
 export function chipsAt(
   x: number,
   y: number,
   z: number,
   count: number = 18,
   speed: number = 3.4,
+  aim?: Vec3 | null,
+  hot: number = 0,
 ): void {
   if (!chips) return;
+  const hots = chips.points.geometry.attributes.aHot;
+  const seeds = chips.points.geometry.attributes.aSeed;
+  let ax = 0;
+  let ay = 0;
+  let az = 0;
+  if (aim) {
+    const len = Math.hypot(aim.x, aim.y, aim.z);
+    if (len > 1e-6) {
+      ax = -aim.x / len;
+      ay = -aim.y / len;
+      az = -aim.z / len;
+    }
+  }
+  const aimed = ax !== 0 || ay !== 0 || az !== 0;
   for (let n = 0; n < count; n++) {
-    const s = chips.states[chips.cursor];
+    const i = chips.cursor;
+    const s = chips.states[i];
     chips.cursor = (chips.cursor + 1) % CHIP_COUNT;
     const theta = Math.random() * Math.PI * 2;
     const phi = Math.acos(2 * Math.random() - 1);
-    const v = speed * (0.35 + Math.random() * 0.65);
+    let dx = Math.sin(phi) * Math.cos(theta);
+    let dy = Math.cos(phi);
+    let dz = Math.sin(phi) * Math.sin(theta);
+    if (aimed) {
+      dx = dx * CHIP_CONE + ax;
+      dy = dy * CHIP_CONE + ay;
+      dz = dz * CHIP_CONE + az;
+      const l = Math.hypot(dx, dy, dz) || 1;
+      dx /= l;
+      dy /= l;
+      dz /= l;
+    }
+    const v = speed * (0.3 + Math.random() * 0.7);
     s.x = x;
     s.y = y;
     s.z = z;
-    s.vx = Math.sin(phi) * Math.cos(theta) * v;
-    s.vy = Math.cos(phi) * v;
-    s.vz = Math.sin(phi) * Math.sin(theta) * v;
+    s.vx = dx * v;
+    s.vy = dy * v;
+    s.vz = dz * v;
     s.age = 0;
-    s.life = 0.9 + Math.random() * 0.9;
+    s.life = 1.1 + Math.random() * 1.3;
+    seeds.setX(i, Math.random());
+    hots.setX(i, Math.random() < hot ? 0.5 + Math.random() * 0.5 : 0);
   }
+  hots.needsUpdate = true;
+  seeds.needsUpdate = true;
 }
 
 function updateChips(delta: number): void {
@@ -1190,6 +1260,162 @@ function updateChips(delta: number): void {
   }
   positions.needsUpdate = true;
   alphas.needsUpdate = true;
+}
+
+// Rind flour: the pale cloud a cut leaves hanging in the water. Big, soft,
+// nearly weightless quads that swell as they slow — the sediment is what
+// makes a carve read as grinding through something solid rather than
+// puncturing it.
+function createDust(): void {
+  const positions = new Float32Array(DUST_COUNT * 3);
+  const alphas = new Float32Array(DUST_COUNT);
+  const sizes = new Float32Array(DUST_COUNT);
+  const seeds = new Float32Array(DUST_COUNT);
+  for (let i = 0; i < DUST_COUNT; i++) {
+    positions[i * 3 + 1] = -9999;
+    seeds[i] = Math.random();
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+  geometry.setAttribute("aAlpha", new THREE.BufferAttribute(alphas, 1));
+  geometry.setAttribute("aSize", new THREE.BufferAttribute(sizes, 1));
+  geometry.setAttribute("aSeed", new THREE.BufferAttribute(seeds, 1));
+
+  const material = new THREE.ShaderMaterial({
+    transparent: true,
+    depthWrite: false,
+    uniforms: { uPixelRatio: { value: Math.min(window.devicePixelRatio, 2) } },
+    vertexShader: /* glsl */ `
+      uniform float uPixelRatio;
+      attribute float aAlpha;
+      attribute float aSize;
+      attribute float aSeed;
+      varying float vAlpha;
+      varying float vSeed;
+      void main() {
+        vec4 mv = modelViewMatrix * vec4(position, 1.0);
+        gl_PointSize = aSize * uPixelRatio * (240.0 / -mv.z);
+        vAlpha = aAlpha * smoothstep(40.0, 1.0, -mv.z);
+        vSeed = aSeed;
+        gl_Position = projectionMatrix * mv;
+      }
+    `,
+    fragmentShader: /* glsl */ `
+      varying float vAlpha;
+      varying float vSeed;
+      void main() {
+        float d = distance(gl_PointCoord, vec2(0.5));
+        float a = smoothstep(0.5, 0.0, d) * vAlpha;
+        vec3 c = mix(vec3(0.74, 0.66, 0.46), vec3(0.52, 0.50, 0.42), vSeed);
+        gl_FragColor = vec4(c, a * 0.42);
+      }
+    `,
+  });
+
+  const points = new THREE.Points(geometry, material);
+  points.frustumCulled = false;
+  scene.add(points);
+
+  const states: DustState[] = [];
+  for (let i = 0; i < DUST_COUNT; i++) {
+    states.push({
+      x: 0,
+      y: -9999,
+      z: 0,
+      vx: 0,
+      vy: 0,
+      vz: 0,
+      age: 9,
+      life: 1,
+      size: 1,
+    });
+  }
+  dust = { points, states, cursor: 0 };
+}
+
+// Kick a cloud of flour out of a carve. `spread` is the puff's radius in
+// world units; `aim` biases it back at the digger the way chipsAt does.
+export function dustAt(
+  x: number,
+  y: number,
+  z: number,
+  count: number = 10,
+  spread: number = 0.8,
+  aim?: Vec3 | null,
+): void {
+  if (!dust) return;
+  const seeds = dust.points.geometry.attributes.aSeed;
+  let ax = 0;
+  let ay = 0;
+  let az = 0;
+  if (aim) {
+    const len = Math.hypot(aim.x, aim.y, aim.z);
+    if (len > 1e-6) {
+      ax = -aim.x / len;
+      ay = -aim.y / len;
+      az = -aim.z / len;
+    }
+  }
+  for (let n = 0; n < count; n++) {
+    const i = dust.cursor;
+    const s = dust.states[i];
+    dust.cursor = (dust.cursor + 1) % DUST_COUNT;
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(2 * Math.random() - 1);
+    const dx = Math.sin(phi) * Math.cos(theta);
+    const dy = Math.cos(phi);
+    const dz = Math.sin(phi) * Math.sin(theta);
+    const v = spread * (0.6 + Math.random() * 1.5);
+    s.x = x + dx * spread * 0.35;
+    s.y = y + dy * spread * 0.35;
+    s.z = z + dz * spread * 0.35;
+    s.vx = dx * v + ax * v * 0.8;
+    s.vy = dy * v + ay * v * 0.8;
+    s.vz = dz * v + az * v * 0.8;
+    s.age = 0;
+    s.life = 1.6 + Math.random() * 2.2;
+    s.size = spread * (0.5 + Math.random() * 0.7);
+    seeds.setX(i, Math.random());
+  }
+  seeds.needsUpdate = true;
+}
+
+function updateDust(delta: number): void {
+  const positions = dust.points.geometry.attributes.position;
+  const alphas = dust.points.geometry.attributes.aAlpha;
+  const sizes = dust.points.geometry.attributes.aSize;
+  const drag = Math.max(0, 1 - DUST_DRAG * delta);
+  for (let i = 0; i < DUST_COUNT; i++) {
+    const s = dust.states[i];
+    if (s.age >= s.life) {
+      if (alphas.getX(i) !== 0) {
+        alphas.setX(i, 0);
+        positions.setXYZ(i, 0, -9999, 0);
+      }
+      continue;
+    }
+    s.age += delta;
+    s.vx *= drag;
+    s.vy = s.vy * drag - DUST_SINK * delta;
+    s.vz *= drag;
+    s.x += s.vx * delta;
+    s.y += s.vy * delta;
+    s.z += s.vz * delta;
+    const p = s.age / s.life;
+    positions.setXYZ(i, s.x, s.y, s.z);
+    // Swells as it slows, then thins out: a puff dispersing, not a fading dot.
+    sizes.setX(i, s.size * (0.5 + p * 1.9));
+    alphas.setX(i, Math.sin(Math.PI * Math.min(1, p)) * (1 - p * 0.35));
+  }
+  positions.needsUpdate = true;
+  alphas.needsUpdate = true;
+  sizes.needsUpdate = true;
+}
+
+// The tool fighting the rind, felt in the neck. Accumulates across the bites
+// of a held drill run and decays on its own.
+export function addCameraShake(amount: number): void {
+  shake = Math.min(1, shake + amount);
 }
 
 // Current drift: Perlin-driven with gusts; returns reused object
@@ -1491,15 +1717,22 @@ export function updateCamera(
   const heave =
     Math.sin(elapsed * 0.45) * 0.05 + Math.sin(elapsed * 0.9) * 0.02;
   const surgeX = Math.sin(elapsed * 0.31 + 1.7) * 0.03;
+  // Tool chatter: fast, incommensurate jitter so it never reads as a wobble.
+  const s = shake * shake;
+  const j = elapsed * 43;
   camera.position.set(
-    playerPos.x + surgeX * idle,
-    playerPos.y + heave * idle,
+    playerPos.x + surgeX * idle + Math.sin(j * 1.7) * 0.035 * s,
+    playerPos.y + heave * idle + Math.sin(j * 2.3 + 1.1) * 0.03 * s,
     playerPos.z + Math.cos(elapsed * 0.27) * 0.03 * idle,
   );
-  camera.rotation.y = yaw;
-  camera.rotation.x = pitch + Math.sin(elapsed * 0.5) * 0.0035 * idle;
+  camera.rotation.y = yaw + Math.sin(j * 1.9 + 0.6) * 0.006 * s;
+  camera.rotation.x =
+    pitch + Math.sin(elapsed * 0.5) * 0.0035 * idle + Math.sin(j) * 0.008 * s;
   // Subtle bank into turns + buoyant roll (order YXZ: applied last).
-  camera.rotation.z = roll + Math.sin(elapsed * 0.23) * 0.004 * idle;
+  camera.rotation.z =
+    roll +
+    Math.sin(elapsed * 0.23) * 0.004 * idle +
+    Math.sin(j * 1.3) * 0.01 * s;
   moveFactor += (speed - moveFactor) * 0.05;
 }
 
@@ -1575,6 +1808,8 @@ export function renderLoop(onFrame?: (delta: number) => void): void {
     updateBursts(delta);
     updateBreath(delta);
     updateChips(delta);
+    updateDust(delta);
+    shake = Math.max(0, shake - shake * SHAKE_DECAY * delta - delta * 0.05);
 
     animateFlashlight();
     if (onFrame) onFrame(delta);

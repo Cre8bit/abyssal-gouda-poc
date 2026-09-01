@@ -437,52 +437,224 @@ export function playDig() {
   }
 }
 
-// The driller biting rind: a motor winding up under a broadband grind, and
-// a spit of gas out of the wound. Runs ~0.6 s — just over the dig cooldown,
-// so held fire reads as one continuous chew.
+// --- The driller -----------------------------------------------------------
+// A drill is a MACHINE, not a one-shot. One persistent rig runs for the whole
+// session and each bite only holds its throttle open, so held fire reads as
+// one unbroken chew and letting go coasts down instead of cutting off.
+// playDrill() stays the only entry point — main.ts calls it once per carve.
+
+const DRILL_HOLD_S = 0.62; // throttle stays open this long past one bite
+const DRILL_SPIN_UP = 6.5; // 1/s, load rising
+const DRILL_SPIN_DOWN = 1.7; // 1/s, coasting down
+const DRILL_IDLE_HZ = 30; // motor fundamental, throttle shut
+const DRILL_LOAD_HZ = 84; // …and wide open
+
+interface DrillRig {
+  out: GainNode;
+  motorA: OscillatorNode;
+  motorB: OscillatorNode;
+  motorSub: OscillatorNode;
+  casing: BiquadFilterNode;
+  grind: GainNode;
+  grindFilter: BiquadFilterNode;
+  tear: BiquadFilterNode;
+  chatter: OscillatorNode;
+  chatterDepth: GainNode;
+  whine: OscillatorNode;
+  whineGain: GainNode;
+}
+
+let drill: DrillRig | null = null;
+let drillHold = 0; // s of throttle left
+let drillLoad = 0; // 0 idle → 1 chewing
+let drillBog = 0; // per-bite torque sag, decays fast
+let drillTime = 0;
+
+function ramp(param: AudioParam, value: number, tc = 0.04) {
+  param.setTargetAtTime(value, ctx!.currentTime, tc);
+}
+
+function buildDrill(): DrillRig {
+  const out = ctx!.createGain();
+  out.gain.value = 0;
+  out.connect(master);
+  const send = ctx!.createGain();
+  send.gain.value = 0.4;
+  out.connect(send);
+  send.connect(reverbSend);
+
+  // Motor: a detuned saw/square pair squeezed through a resonant lowpass —
+  // the tool's own casing ringing around the armature.
+  const casing = ctx!.createBiquadFilter();
+  casing.type = "lowpass";
+  casing.frequency.value = 600;
+  casing.Q.value = 7;
+  casing.connect(out);
+  const motorGain = ctx!.createGain();
+  motorGain.gain.value = 0.06;
+  motorGain.connect(casing);
+  const motorA = ctx!.createOscillator();
+  motorA.type = "sawtooth";
+  motorA.frequency.value = DRILL_IDLE_HZ;
+  motorA.connect(motorGain);
+  const motorB = ctx!.createOscillator();
+  motorB.type = "square";
+  motorB.frequency.value = DRILL_IDLE_HZ * 1.007;
+  const bGain = ctx!.createGain();
+  bGain.gain.value = 0.028;
+  motorB.connect(bGain);
+  bGain.connect(casing);
+  // The sub bypasses the casing filter — pure weight in the chest.
+  const motorSub = ctx!.createOscillator();
+  motorSub.type = "sine";
+  motorSub.frequency.value = DRILL_IDLE_HZ * 0.5;
+  const subG = ctx!.createGain();
+  subG.gain.value = 0.055;
+  motorSub.connect(subG);
+  subG.connect(out);
+
+  // The bit chewing rind: white noise ground bright over brown noise torn low.
+  const grind = ctx!.createGain();
+  grind.gain.value = 0;
+  grind.connect(out);
+  const grindFilter = ctx!.createBiquadFilter();
+  grindFilter.type = "bandpass";
+  grindFilter.frequency.value = 1200;
+  grindFilter.Q.value = 0.7;
+  grindFilter.connect(grind);
+  loopNoise(noiseBuffer!).connect(grindFilter);
+  const tear = ctx!.createBiquadFilter();
+  tear.type = "lowpass";
+  tear.frequency.value = 300;
+  tear.Q.value = 3.5;
+  const tearGain = ctx!.createGain();
+  tearGain.gain.value = 1.5;
+  tear.connect(tearGain);
+  tearGain.connect(grind);
+  loopNoise(brownBuffer!).connect(tear);
+
+  // Tooth chatter: the flutes slapping rind, amplitude-modulating the grind
+  // at the bit's own rate. This is what stops it reading as a flat hiss.
+  const chatter = ctx!.createOscillator();
+  chatter.type = "sawtooth";
+  chatter.frequency.value = DRILL_IDLE_HZ * 2;
+  const chatterDepth = ctx!.createGain();
+  chatterDepth.gain.value = 0;
+  chatter.connect(chatterDepth);
+  chatterDepth.connect(grind.gain);
+
+  // Bearing whine, riding the rpm far up top.
+  const whine = ctx!.createOscillator();
+  whine.type = "triangle";
+  whine.frequency.value = DRILL_IDLE_HZ * 11;
+  const whineGain = ctx!.createGain();
+  whineGain.gain.value = 0;
+  whine.connect(whineGain);
+  whineGain.connect(out);
+
+  for (const o of [motorA, motorB, motorSub, chatter, whine]) o.start();
+  return {
+    out,
+    motorA,
+    motorB,
+    motorSub,
+    casing,
+    grind,
+    grindFilter,
+    tear,
+    chatter,
+    chatterDepth,
+    whine,
+    whineGain,
+  };
+}
+
+function updateDrill(delta: number) {
+  if (!drill) return;
+  const wanted = drillHold > 0 ? 1 : 0;
+  drillHold = Math.max(0, drillHold - delta);
+  const rate = wanted > drillLoad ? DRILL_SPIN_UP : DRILL_SPIN_DOWN;
+  drillLoad += (wanted - drillLoad) * Math.min(1, delta * rate);
+  drillBog = Math.max(0, drillBog - delta * 4.5);
+  drillTime += delta;
+
+  if (drillLoad < 0.004) {
+    ramp(drill.out.gain, 0, 0.09);
+    return;
+  }
+  // Two incommensurate wobbles on top of the bite sag: the bit never runs
+  // clean, it fights the rind.
+  const wobble =
+    Math.sin(drillTime * 7.3) * 0.05 + Math.sin(drillTime * 18.7) * 0.028;
+  const rpm = Math.max(
+    18,
+    (DRILL_IDLE_HZ + (DRILL_LOAD_HZ - DRILL_IDLE_HZ) * drillLoad) *
+      (1 - drillBog * 0.36 + wobble),
+  );
+  ramp(drill.motorA.frequency, rpm, 0.03);
+  ramp(drill.motorB.frequency, rpm * 1.007, 0.03);
+  ramp(drill.motorSub.frequency, rpm * 0.5, 0.05);
+  ramp(drill.whine.frequency, rpm * 11, 0.05);
+  ramp(drill.chatter.frequency, rpm * 2, 0.03); // two flutes
+  ramp(drill.casing.frequency, 380 + drillLoad * 820, 0.05);
+  ramp(drill.grindFilter.frequency, 620 + drillLoad * 1500, 0.05);
+  ramp(drill.grindFilter.Q, 1.4 - drillLoad * 0.8, 0.08);
+  ramp(drill.tear.frequency, 190 + drillLoad * 210, 0.05);
+  ramp(drill.grind.gain, 0.02 + drillLoad * 0.05 + drillBog * 0.03, 0.04);
+  ramp(drill.chatterDepth.gain, 0.014 + drillLoad * 0.04, 0.04);
+  ramp(drill.whineGain.gain, drillLoad * drillLoad * 0.005, 0.06);
+  ramp(drill.out.gain, Math.min(1, drillLoad * 1.2), 0.05);
+}
+
+// One bite of rind: hold the rig's throttle open, sag the motor under the
+// load, and lay a dull impact over it. The sustained tone is the rig's job.
 export function playDrill() {
   if (!ctx) return;
-  // The motor, loaded and labouring.
+  if (!drill) drill = buildDrill();
+  drillHold = DRILL_HOLD_S;
+  drillBog = Math.min(1, drillBog + 0.8);
+
+  // The bit landing on something that does not want to give.
   tone({
-    duration: 0.62,
-    type: "sawtooth",
-    from: 105,
-    to: 168,
-    gain: 0.03,
-    attack: 0.07,
-    vibrato: 14,
-  });
-  tone({
-    duration: 0.55,
-    type: "square",
-    from: 58,
-    to: 88,
-    gain: 0.02,
-    attack: 0.08,
-    vibrato: 20,
-  });
-  // The bit chewing: bright grind over a low tear.
-  noiseBurst({
-    duration: 0.6,
-    from: 900,
-    to: 2400,
-    q: 0.9,
-    gain: 0.045,
-    reverb: 0.35,
-    attack: 0.06,
-  });
-  noiseBurst({
-    duration: 0.55,
-    type: "lowpass",
-    from: 340,
-    to: 130,
+    duration: 0.18,
+    type: "sine",
+    from: 165,
+    to: 48,
     gain: 0.05,
-    color: "brown",
-    reverb: 0.6,
-    attack: 0.04,
+    attack: 0.004,
   });
+  noiseBurst({
+    duration: 0.14,
+    type: "lowpass",
+    from: 1100,
+    to: 190,
+    q: 1.2,
+    gain: 0.06,
+    color: "brown",
+    reverb: 0.45,
+    attack: 0.003,
+  });
+  // A shard or two cracking off the rind.
+  const nCracks = 1 + Math.floor(Math.random() * 2);
+  for (let i = 0; i < nCracks; i++) {
+    setTimeout(
+      () => {
+        if (!ctx) return;
+        noiseBurst({
+          duration: 0.05,
+          from: 2200 + Math.random() * 1800,
+          to: 700,
+          q: 3,
+          gain: 0.022,
+          reverb: 0.3,
+          attack: 0.002,
+        });
+      },
+      50 + i * (70 + Math.random() * 90),
+    );
+  }
   // Gas boiling out of the cut, faster and thicker than a hand dig.
-  for (let i = 0; i < 6; i++) {
+  for (let i = 0; i < 4; i++) {
     setTimeout(
       () => {
         if (!ctx) return;
@@ -491,11 +663,11 @@ export function playDrill() {
           duration: 0.07,
           from: f0,
           to: f0 * 2.3,
-          gain: 0.007,
+          gain: 0.006,
           attack: 0.004,
         });
       },
-      40 + i * 65,
+      40 + i * 80,
     );
   }
 }
@@ -566,6 +738,8 @@ export function updateAbyssAudio(
   // Effort follows speed; sprinting spikes it.
   const effortTarget = Math.min(1, speed + (sprinting ? 0.45 : 0));
   effortSm += (effortTarget - effortSm) * Math.min(1, delta * 0.8);
+
+  updateDrill(delta);
 
   // Water-mass bed and sub swell with depth; the world muffles down. The
   // sub rises and falls on its own slow cycle so it never reads as an

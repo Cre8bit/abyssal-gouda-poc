@@ -223,6 +223,8 @@ let worldProps: SeededProp[] = [];
 let hasSpin = false; // any rotating chunk in the built world (skip the frame loop otherwise)
 let wireframeOn = false; // debug overlay (M key, main.ts) — superposed, not a material swap
 let wireMaterial: THREE.LineBasicMaterial | null = null;
+let softSpotsOn = false; // debug soft-spot markers (L key, main.ts)
+let softSpotGroup: THREE.Group | null = null;
 
 const uGoudaTime = { value: 0 };
 
@@ -878,6 +880,11 @@ const TOOL_MAX_HARDNESS: Record<DigTool, number> = { hands: 0, driller: 2 };
 // Great Wheel exception: a dig point inside a soft spot digs as hardness 1 —
 // the geometric hook the M3 breach timer attaches to. Hulls without soft
 // spots (the melt shell, WG-08) get no exception by construction.
+const SOFT_SPOT_PAD = 0.3; // × spot radius
+export function softSpotDigRadius(r: number): number {
+  return r * (1 + SOFT_SPOT_PAD);
+}
+
 function digHardness(c: Chunk, x: number, y: number, z: number): number {
   const spots = c.body?.softSpots;
   if (c.hardness > 1 && spots) {
@@ -885,7 +892,8 @@ function digHardness(c: Chunk, x: number, y: number, z: number): number {
       const dx = x - s.x,
         dy = y - s.y,
         dz = z - s.z;
-      if (dx * dx + dy * dy + dz * dz < s.r * s.r) return 1;
+      const rr = softSpotDigRadius(s.r);
+      if (dx * dx + dy * dy + dz * dz < rr * rr) return 1;
     }
   }
   return c.hardness;
@@ -1301,6 +1309,68 @@ function createBlastMarkers(parent: THREE.Group): void {
     sprite.scale.setScalar(2.6);
     parent.add(sprite);
   }
+}
+
+// DEBUG soft-spot markers (L key, main.ts): a wire ball at each drillable
+// hull bulge, plus a depth-test-free beacon sprite so the target is findable
+// from across the map, through the cheese.
+function createSoftSpotMarkers(parent: THREE.Group): void {
+  const group = new THREE.Group();
+  group.visible = softSpotsOn;
+  const shell = new THREE.MeshBasicMaterial({
+    color: 0x7cff5a,
+    wireframe: true,
+    transparent: true,
+    opacity: 0.45,
+    depthWrite: false,
+  });
+  const tex = getMarkerTexture();
+  const beacon = tex
+    ? new THREE.SpriteMaterial({
+        map: tex,
+        color: 0x7cff5a,
+        transparent: true,
+        opacity: 0.85,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+        depthTest: false,
+      })
+    : null;
+  for (const s of worldSoftSpots) {
+    const ball = new THREE.Mesh(new THREE.SphereGeometry(s.r, 20, 14), shell);
+    ball.position.set(s.x, s.y, s.z);
+    ball.raycast = () => {};
+    group.add(ball);
+    if (beacon) {
+      const sprite = new THREE.Sprite(beacon);
+      sprite.position.set(s.x, s.y, s.z);
+      sprite.scale.setScalar(s.r * 0.9);
+      sprite.renderOrder = 999;
+      group.add(sprite);
+    }
+  }
+  softSpotGroup = group;
+  parent.add(group);
+}
+
+export function setSoftSpotMarkers(on: boolean): void {
+  softSpotsOn = on;
+  if (softSpotGroup) softSpotGroup.visible = on;
+}
+
+// Nearest open water outside a soft spot — where a debug teleport should
+// land, since the spot itself sits in the hull's solid crust.
+export function softSpotApproach(s: SoftSpot): Vec3 {
+  const len = Math.hypot(s.x, s.y, s.z) || 1;
+  const nx = s.x / len,
+    ny = s.y / len,
+    nz = s.z / len;
+  let d = s.r * 0.5;
+  for (; d < s.r * 3 + 40; d += 1.5) {
+    const p = { x: s.x + nx * d, y: s.y + ny * d, z: s.z + nz * d };
+    if (worldDistance(p.x, p.y, p.z) > 2) return p;
+  }
+  return { x: s.x + nx * d, y: s.y + ny * d, z: s.z + nz * d };
 }
 
 // --- Per-frame updates ------------------------------------------------------------------------
@@ -2989,6 +3059,7 @@ export async function buildGoudaWorld(
   // Wheel is an item (game/items.ts), world only seeds position.
   createBoundarySphere(extrasGroup, world.boundaryR);
   createBlastMarkers(extrasGroup);
+  createSoftSpotMarkers(extrasGroup);
   scene.add(extrasGroup);
 
   spawnPoint = new THREE.Vector3(
@@ -3036,6 +3107,7 @@ export function disposeWorld(scene: THREE.Scene): void {
   remeshDirty.clear();
   wireframeOn = false;
   wireMaterial = null;
+  softSpotGroup = null;
 }
 
 // Seeded gold position; read once at world build.

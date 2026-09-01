@@ -62,7 +62,7 @@ export interface DrillerSystem extends GameSystem {
   // The contextual verb behind the action key: pick it up, or hand it over.
   // Returns true if it consumed the press (main.ts falls through otherwise).
   use(): boolean;
-  // Deliberate drop (G key). Returns false (no-op) if you aren't holding it.
+  // Deliberate drop (R key). Returns false (no-op) if you aren't holding it.
   drop(reason?: string): boolean;
   // One bite of cheese: spin the bit up, whoever is holding it. Driven by
   // the dig path in main.ts, local digs and replayed remote ones alike.
@@ -180,17 +180,8 @@ export function createDrillerSystem({
     if (!item) return false;
     const holder = holderOf(item);
 
-    if (isSelf(holder)) {
-      // Hand-off — same cooperative verb as the Gouda.
-      const mate = nearestTeammate(game.localPosition);
-      if (!mate || mate.d > CARGO.HANDOFF_RANGE) {
-        showEvent("🛠 Nobody close enough to take it.");
-        return true;
-      }
-      request("give", { to: mate.id });
-      showEvent(`🤝 Handing the driller to ${mate.id.slice(0, 4)}…`);
-      return true;
-    }
+    // Already holding it — E now bites the cheese (tryDig), not a handoff.
+    if (isSelf(holder)) return false;
 
     if (holder !== null) return false; // someone else has it — no stealing
     if (distance(game.localPosition, item) > CARGO.PICKUP_RANGE) return false;
@@ -213,6 +204,13 @@ export function createDrillerSystem({
   function drop(reason = "🛠 You set the driller down."): boolean {
     const item = getItem(DRILLER_ID);
     if (!item || !isSelf(holderOf(item))) return false;
+    // R with a teammate close hands it over instead of letting it fall.
+    const mate = nearestTeammate(game.localPosition);
+    if (mate && mate.d <= CARGO.HANDOFF_RANGE) {
+      request("give", { to: mate.id });
+      showEvent(`🤝 Handing the driller to ${mate.id.slice(0, 4)}…`);
+      return true;
+    }
     release(reason);
     return true;
   }
@@ -258,8 +256,8 @@ export function createDrillerSystem({
       const mate = nearestTeammate(game.localPosition);
       setPrompt(
         mate && mate.d <= CARGO.HANDOFF_RANGE
-          ? `🤝 [E] hand the driller to ${mate.id.slice(0, 4)}`
-          : "🛠 carrying the driller",
+          ? `🤝 [R] hand the driller to ${mate.id.slice(0, 4)}`
+          : "🛠 carrying the driller — [E] dig · [R] drop",
       );
       return;
     }

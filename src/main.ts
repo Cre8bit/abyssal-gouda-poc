@@ -21,6 +21,8 @@ import {
   emitBreath,
   burstAt,
   chipsAt,
+  dustAt,
+  addCameraShake,
   setFlashlight,
 } from "./render/graphics.ts";
 import {
@@ -42,6 +44,9 @@ import {
   chunkLocalToWorld,
   raycastSolid,
   setWireframeOverlay,
+  setSoftSpotMarkers,
+  softSpotApproach,
+  getSoftSpots,
   WORLD_R,
 } from "./world/gouda.ts";
 import {
@@ -300,6 +305,7 @@ async function buildWorld(rebuild = false) {
   loaderEl.classList.add("done");
   // Debug wireframe preference survives a rebuild; the overlay itself doesn't.
   if (game.mapWireframe) setWireframeOverlay(true);
+  logSoftSpots();
 
   // Spawn catfish (host simulates, joiners get puppets).
   catfishSys.spawn(game.difficulty);
@@ -435,11 +441,13 @@ window.addEventListener("keydown", (e) => {
   } else if (e.code === "KeyV") {
     toggleMute();
   } else if (e.code === "KeyE") {
-    // E key: Gouda first (can't dig with both arms full), then the driller
-    // (pick up / hand off), then bare hands on whatever's in reach.
+    // E key: pick up a nearby item; if already holding one, use it instead
+    // (the driller digs, tryDig itself refuses to swing with the Gouda in
+    // both arms) — never a handoff, that's R now.
     if (!cargoSys.use() && !drillerSys.use()) tryDig();
-  } else if (e.code === "KeyG") {
-    // G key: deliberate drop — whatever's in your hands, Gouda or driller.
+  } else if (e.code === "KeyR") {
+    // R key: let go of whatever's in your hands — Gouda or driller. With a
+    // teammate close enough, it's a handoff instead of a drop.
     if (!cargoSys.drop()) drillerSys.drop();
   } else if (e.code === "KeyO") {
     // DEBUG mode: coordinate HUD + TP + freecam. Leaving it also drops
@@ -482,8 +490,57 @@ window.addEventListener("keydown", (e) => {
     teleportLocal(parts[0], parts[1], parts[2]);
     playWhoosh();
     showEvent(`🐞 [DEBUG] Teleported to ${parts.join(", ")}`);
+  } else if (e.code === "KeyL" && game.debug.mode) {
+    // DEBUG: hull soft spots — Shift+L hops to the next one, L toggles the
+    // markers (and re-prints the coordinate list).
+    if (e.shiftKey) {
+      teleportToSoftSpot();
+      return;
+    }
+    game.debug.softSpots = !game.debug.softSpots;
+    setSoftSpotMarkers(game.debug.softSpots);
+    playClick();
+    logSoftSpots();
+    showEvent(
+      game.debug.softSpots
+        ? "🕳 [DEBUG] Soft-spot markers ON — Shift+L to hop there"
+        : "🕳 [DEBUG] Soft-spot markers OFF",
+    );
   }
 });
+
+// DEBUG: the drillable hull bulges, printed with a teleport-ready approach
+// point (paste into the P prompt) beside the spot itself.
+function logSoftSpots(): void {
+  const spots = getSoftSpots();
+  if (!spots.length) {
+    console.log("soft spots: none in this world");
+    return;
+  }
+  const f = (n: number) => n.toFixed(1);
+  console.log(`soft spots (seed ${game.seed}): ${spots.length}`);
+  spots.forEach((s, i) => {
+    const a = softSpotApproach(s);
+    console.log(
+      `  #${i} r ${f(s.r)} at ${f(s.x)}, ${f(s.y)}, ${f(s.z)} — ` +
+        `TP outside: ${f(a.x)}, ${f(a.y)}, ${f(a.z)}`,
+    );
+  });
+}
+
+function teleportToSoftSpot(): void {
+  const spots = getSoftSpots();
+  if (!spots.length) {
+    showEvent("🕳 [DEBUG] No soft spots in this world.");
+    return;
+  }
+  const i = game.debug.softSpotIdx % spots.length;
+  game.debug.softSpotIdx = (i + 1) % spots.length;
+  const a = softSpotApproach(spots[i]);
+  teleportLocal(a.x, a.y, a.z);
+  playWhoosh();
+  showEvent(`🕳 [DEBUG] Teleported to soft spot #${i}`);
+}
 
 // Replayed/remote digs go through the same hardness gate as local ones —
 // same world, same tool ⇒ same verdict on every client.
@@ -496,28 +553,36 @@ function applyDigEvent(d: SphereDig) {
 
 // The sight and sound of a carve, shared by local digs and replayed remote
 // ones. `audible` is false for a dig too far away to hear through the cheese.
+// `aim` is the local digger's own look direction — spoil sprays back along it
+// and the tool's chatter reaches the camera. A remote dig has neither.
 function digFx(
   x: number,
   y: number,
   z: number,
   tool: DigTool,
   audible: boolean,
+  aim?: Vec3,
 ): void {
   burstAt(x, y, z); // gas pockets tear free of the cheese
   if (tool !== "driller") {
-    chipsAt(x, y, z, 8, 1.8);
+    chipsAt(x, y, z, 10, 2.0, aim);
+    dustAt(x, y, z, 6, 0.55, aim);
+    if (aim) addCameraShake(0.12);
     if (audible) playDig();
     return;
   }
-  // The bit throws a far wider spray, and a second vent opens beside it.
+  // The bit throws a far wider spray, hangs a cloud of rind flour in the
+  // water, and a second vent opens beside the cut.
   drillerSys.strike();
-  chipsAt(x, y, z, 26, 4.6);
+  chipsAt(x, y, z, 44, 6.4, aim, 0.35);
+  dustAt(x, y, z, 22, 1.5, aim);
   const r = DIG_RADII.driller * 0.6;
   burstAt(
     x + (Math.random() - 0.5) * r,
     y + (Math.random() - 0.5) * r,
     z + (Math.random() - 0.5) * r,
   );
+  if (aim) addCameraShake(0.45);
   if (audible) playDrill();
 }
 
@@ -560,7 +625,7 @@ function tryDig() {
     }
     return;
   }
-  digFx(hit.x, hit.y, hit.z, tool, true);
+  digFx(hit.x, hit.y, hit.z, tool, true, dir);
   showEvent(
     tool === "driller"
       ? "🛠 The driller chews through"

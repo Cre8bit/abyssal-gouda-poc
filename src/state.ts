@@ -33,6 +33,8 @@ export interface SphereDig {
 export interface DebugState {
   mode: boolean;
   freeCam: boolean;
+  softSpots: boolean; // L key — hull soft-spot markers (drillable walls)
+  softSpotIdx: number; // which spot the next Shift+L teleport lands on
 }
 
 export interface GameState {
@@ -74,7 +76,7 @@ export const game: GameState = {
   spawnPoint: { ...DEFAULT_SPAWN },
   flashlightOn: true,
   digTool: "hands",
-  debug: { mode: false, freeCam: false },
+  debug: { mode: false, freeCam: false, softSpots: false, softSpotIdx: 0 },
   mapWireframe: false,
   hostedId: null,
   fishAuthority: true,
