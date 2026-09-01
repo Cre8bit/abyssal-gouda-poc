@@ -351,12 +351,23 @@ under-reports the cargo bottleneck.
 
 ### Fix C — normalise in the query path, not in the field
 
-Do **not** re-scale `bodySdfWorld`/`baseSdf`: the field values feed marching
-cubes, and MC interpolates linearly between samples, so changing the scaling
-moves the mesh by sub-cell amounts and **rebases the world fingerprint**.
-
-Instead correct at the point of comparison. `resolveCollision` already
-computes a central-difference gradient — one divide makes the value metric:
+> **Shipped** ([pushOutOfField()](../src/world/gouda.ts)). Do **not** re-scale
+> `bodySdfWorld`/`baseSdf`: the field values feed marching cubes, and MC
+> interpolates linearly between samples, so changing the scaling moves the mesh
+> and **rebases the world fingerprint**. The correction lives at the point of
+> comparison instead — the resolver already computes a central-difference
+> gradient, so one divide makes the value metric. `MIN_GRAD = 0.35` clamps the
+> divisor so a collapsing gradient (mid-way between two opposing walls) cannot
+> invent unbounded clearance; below that floor the resolver deliberately keeps
+> its cushion, which is the solid-side error. Measured by **T4**: the largest
+> clearance at which a 0.6 u player was still pushed went **1.58 u → 0.87 u**
+> (the residual is the first-order nature of `d/|∇d|` on strongly curved
+> faces, not the systematic 2.2× rim cushion).
+>
+> `resolveCollision` now delegates to `pushOutOfField(field, pos, radius, out)`,
+> which takes the field as an argument — so the worldgen bench's walk mode
+> pushes off its preview chunks through this exact code instead of the copy it
+> used to carry.
 
 ```ts
 // src/world/gouda.ts
@@ -367,105 +378,112 @@ const MIN_GRAD = 0.35; // below this the gradient is two walls cancelling
 // worldDistance is a min of per-chunk APPROXIMATE SDFs — sign-correct but
 // not 1-Lipschitz. d / |∇d| is the first-order distance to the isosurface,
 // which is what a radius may be compared against.
-export function resolveCollision(pos: Vec3, radius: number): Vec3 | null {
-  let normal: Vec3 | null = null;
-  for (let iter = 0; iter < MAX_PUSH_ITERS; iter++) {
-    const d = worldDistance(pos.x, pos.y, pos.z);
-    if (!Number.isFinite(d)) break;
-    if (d >= radius) break; // cheap reject: d ≤ true dist
+export function pushOutOfField(
+  field: DistanceField,
+  pos: Vec3,
+  radius: number,
+  out: Vec3[] | null = null,
+): boolean {
+  const invEps = 1 / (2 * GRAD_EPS);
+  for (let iter = 0; ; iter++) {
+    const d = field(pos.x, pos.y, pos.z);
+    if (!Number.isFinite(d)) return false;
+    if (d >= radius) return false; // cheap reject: d never overstates the gap
 
-    const gx =
-      (worldDistance(pos.x + GRAD_EPS, pos.y, pos.z) -
-        worldDistance(pos.x - GRAD_EPS, pos.y, pos.z)) /
-      (2 * GRAD_EPS);
-    const gy =
-      (worldDistance(pos.x, pos.y + GRAD_EPS, pos.z) -
-        worldDistance(pos.x, pos.y - GRAD_EPS, pos.z)) /
-      (2 * GRAD_EPS);
-    const gz =
-      (worldDistance(pos.x, pos.y, pos.z + GRAD_EPS) -
-        worldDistance(pos.x, pos.y, pos.z - GRAD_EPS)) /
-      (2 * GRAD_EPS);
+    const gx = (field(pos.x + GRAD_EPS, ...) - field(pos.x - GRAD_EPS, ...)) * invEps;
+    // ... gy, gz likewise
     const g = Math.sqrt(gx * gx + gy * gy + gz * gz);
-    if (g < 1e-4) break; // no usable normal: do nothing
+    if (g < 1e-4) return true; // no usable normal: do nothing
 
     const dTrue = d / Math.max(g, MIN_GRAD);
-    if (dTrue >= radius) break;
+    if (dTrue >= radius) return false;
+    if (iter === MAX_PUSH_ITERS) return true; // out of pushes, still inside
 
     const inv = 1 / g;
-    const nx = gx * inv,
-      ny = gy * inv,
-      nz = gz * inv;
+    const nx = gx * inv, ny = gy * inv, nz = gz * inv;
     const push = radius - dTrue + 0.001;
     pos.x += nx * push;
     pos.y += ny * push;
     pos.z += nz * push;
-    normal = { x: nx, y: ny, z: nz };
+    if (out) out.push({ x: nx, y: ny, z: nz });
   }
-  return normal;
 }
 ```
 
-`Math.max(g, MIN_GRAD)` caps the correction so a collapsing gradient (mid-way
-between two opposing walls) cannot produce an unbounded push.
-
 **Risk:** none to generated data — the field is untouched, only the
-comparison changes. The player _will_ be able to enter places it previously
-could not; re-run `npm test` (`tools/test-worldgen.ts` verifier assertions
-on `minClearance` may now report larger, more truthful clearances — expected,
-rebase the recorded numbers if pinned).
+comparison changes; `tools/test-worldgen.ts`'s fingerprints are unmoved. The
+player _can_ now enter places it previously could not.
 
----
+**The secondary casualties above: measured, and deliberately left.**
+`raycastSolid`, `findOpenSpot` and `verify.ts`'s `minClearance` still read the
+raw field. Each was checked against the same 64-ray oracle T4 uses before being
+left alone — the 2.2× worst case is a _body-surface_ number and none of these
+three lives on a body surface:
+
+| reader                     | worst case on paper            | measured                                                                                                      | verdict                                                                                                                                                                                                                                |
+| -------------------------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `raycastSolid` (`d < 0.4`) | dig centre 0.89 u short        | median standoff **0.26 u**, p99 0.64 u; **0.9 %** of hands aims (2.0 % in the galleries) land too far to bite | papercut — the `step = max(0.15, 0.85·d)` march overshoots the threshold and lands close anyway                                                                                                                                        |
+| `verify.ts` `minClearance` | bottleneck 2.2× under-reported | reported **0.62 u** vs measured **0.66 u** (6 %)                                                              | the shipped bottleneck is inside the melt shell's **entrance bore** — a carve term, where the field is already an exact metric distance. The verifier's real error is its own lattice step, which the `0.5` floor already covers       |
+| `findOpenSpot` (`> 1.8`)   | demands a true 4 u             | n/a                                                                                                           | working as tuned: normalising it would let catfish and respawns land in spots ~2× tighter than the ones the game was balanced around. That is a gameplay change, not a bugfix — retune the `1.8` in the same commit if it is ever done |
+
+The one thing worth fixing in that list is not a metric problem at all: when a
+dig lands short, `digAt` returns `changed: false, rejected: false` and
+[main.ts](../src/main.ts) returns **silently** — no message. 2 % of galleries
+hand-digs give the player no feedback whatsoever. Filed in
+[idea-register.md](idea-register.md), not here.
 
 ## 4. BUG D — the collision resolver itself
 
-Same function, three more defects (all fixed by the snippet above plus the
-caller change below):
+Same function, three more defects:
 
 1. **Two iterations only.** In a passage narrower than `2·radius + slack`,
    iteration 1 pushes off wall A, iteration 2 pushes back into wall A off
    wall B, and the loop exits with the player still embedded. → 4 iterations.
 2. **`(0,1,0)` fallback normal.** When the gradient degenerates
    (`len < 1e-5` — exactly what happens between two opposing walls) the old
-   code invents an **upward** normal and shoves the player by
-   `radius - d` straight into the ceiling. Removed above: a degenerate
-   gradient means "no information", not "up".
-3. **Only the last normal is returned**, so [main.ts:778-789](src/main.ts#L778)
-   can only cancel velocity into one wall. In a squeeze the second wall's
+   code invented an **upward** normal and shoved the player by
+   `radius - d` straight into the ceiling. A degenerate gradient means "no
+   information", not "up".
+3. **Only the last normal was returned**, so [main.ts](../src/main.ts)
+   could only cancel velocity into one wall. In a squeeze the second wall's
    normal is discarded, the player keeps drifting into it, and the next frame
    repeats — reading as a hard stop with no slide.
 
-For (3), collect every distinct normal:
+### Fix D
 
-```ts
-// gouda.ts — resolveCollision returns the normals it used
-export function resolveCollisionAll(
-  pos: Vec3,
-  radius: number,
-  out: Vec3[],
-): void;
-```
-
-and in [main.ts](src/main.ts#L777) project velocity against each:
+> **Shipped** with Fix C. (1) and (2) are in `pushOutOfField` above:
+> `MAX_PUSH_ITERS = 4`, and the degenerate-gradient branch now returns instead
+> of inventing a normal. (3) is `resolveCollisionAll(pos, radius, out)`, which
+> appends **every** wall it pushed off; `resolveCollision` survives as the
+> single-normal convenience for the movers that only ever slide along one
+> (catfish, the dropped cargo, the dropped driller).
+>
+> The optional hardening shipped too, with a guard the sketch did not have:
+> when the resolver returns "still embedded", main.ts rewinds to the substep's
+> entry position **only if that position was demonstrably open water**. Without
+> the guard, a player who starts a frame inside solid — a rotating veins chunk
+> sweeping over them (§2), a chunk meshed late (§5) — would be pinned there
+> forever instead of being pushed out.
 
 ```diff
+ // main.ts — the substep
++    _entry.x = pos.x; _entry.y = pos.y; _entry.z = pos.z;
+     pos.x += vel.x * stepDelta; /* … */
 -    const hit = resolveCollision(pos, PLAYER_RADIUS);
--    const bellHit = collideBathyscaphe(pos, PLAYER_RADIUS);
--    for (const n of [hit, bellHit]) {
 +    _normals.length = 0;
-+    resolveCollisionAll(pos, PLAYER_RADIUS, _normals);
-+    const bellHit = collideBathyscaphe(pos, PLAYER_RADIUS);
++    const stuck = resolveCollisionAll(pos, PLAYER_RADIUS, _normals);
+     const bellHit = collideBathyscaphe(pos, PLAYER_RADIUS);
+-    for (const n of [hit, bellHit]) {
+-      if (!n) continue;
 +    if (bellHit) _normals.push(bellHit);
 +    for (const n of _normals) {
-       if (!n) continue;
+       const into = vel.x * n.x + vel.y * n.y + vel.z * n.z;
+       if (into < 0) { /* cancel into the wall */ }
+     }
++    if (stuck && worldDistance(_entry.x, _entry.y, _entry.z) >= PLAYER_RADIUS) {
++      pos.x = _entry.x; pos.y = _entry.y; pos.z = _entry.z;
++    }
 ```
-
-Optional hardening: if the loop exits still embedded (`d < radius` after
-`MAX_PUSH_ITERS`), restore the substep's entry position rather than leaving
-the player inside solid — that removes the "shoved through a wall" class of
-failure entirely.
-
----
 
 ## 5. BUG E — a streamed chunk that fails to mesh is a permanent invisible solid
 
@@ -657,7 +675,8 @@ All node-runnable (`node 24` strips types), all in `tools/`, all wired into
 > — a bucket that misses a chunk opens the world and un-diggables it). T2 is
 > verbatim, sampled in the old sphere's blind shell: 46/46 of those digs left
 > an invisible wall before the fix, 0/46 after; a `1.9·s → 0.9·s` `gridReach`
-> shrink trips T1. T3–T5 are still open (T3/T5 belong with Fix B).
+> shrink trips T1. **T4 shipped with Fix C + D** (see below). T3 and T5 are
+> still open — both belong with Fix B.
 
 **T1 — predicate parity (catches A forever).** For the shipped seed, for
 every layer-body chunk, sample its 8 coverage-box corners plus 64 random
@@ -676,10 +695,21 @@ Fix A. It is the single most valuable test in this list.
 assert `validateWorld(WHEEL_WORLD)` is empty with the new scatter-overlap
 rule from Fix B, and that a deliberately-overlapping fixture is rejected.
 
-**T4 — metric sanity (catches C).** For M points sampled within 3 u of a
-surface, compare `worldDistance(p)` against a bisected true distance along
-the normalised gradient; assert `worldDistance(p) >= 0.85 · trueDistance(p)`
-after Fix C. (Before the fix the fused-layer rims sit at 0.45.)
+**T4 — metric sanity (catches C).** _Shipped, and re-aimed._ Bisecting along
+the gradient (as originally sketched) is not a usable oracle: at a `min` seam
+the steepest-descent direction does not point at the nearest surface, and it
+reads a 0.41 u clearance as 4.04 u. The shipped test measures truth by
+**sphere-tracing 64 Fibonacci-sphere rays** out of the probe and taking the
+minimum hit — sound because the field _under_-estimates, so every step of `d`
+is a step no longer than the true clearance, and tight to ~3 % at 12.5°
+angular spacing.
+
+The statistic is the **effective collision radius**: over 4.7 k probes within
+3 u of a surface, the largest measured clearance at which `resolveCollision`
+still pushes a 0.6 u player. **1.58 u before Fix C, 0.87 u after**, gate at
+`0.6 × 1.6`. Probes where `|∇d| < MIN_GRAD` are counted and skipped, not
+asserted on — there the resolver's cushion is the deliberate solid-side
+clamp, not the bug.
 
 **T5 — mesh ⊆ open (catches B and any future phantom).** For the shipped
 seed at half res, for every extracted vertex `v` of every chunk, assert
@@ -694,9 +724,11 @@ collider disagrees with.
 1. **A** — `chunkCovers` unification (`gouda.ts`). Zero data risk, biggest win,
    directly kills "carved it, can't enter". Ship with **T1 + T2**.
 2. **E** — requeue on stream failure (`gouda.ts`). One-line, zero risk.
-3. **C + D** — metric normalisation and the resolver rewrite (`gouda.ts`,
-   `main.ts`). No generated data changes; re-tune nothing, but re-walk the
-   galleries squeezes in the bench — they get _easier_. Ship with **T4**.
+3. **C + D** — ✅ **done**: metric normalisation and the resolver rewrite
+   (`gouda.ts`, `main.ts`, and the bench walk mode now shares the resolver
+   rather than copying it). No generated data changed — `test-worldgen.ts`'s
+   fingerprints are untouched. Shipped with **T4**. Still worth re-walking the
+   galleries squeezes in the bench by hand: they get _easier_.
 4. **B** — `veins.guard` 0.45 → 0.80 plus the `validateWorld` rule
    (`recipes.ts`). **Changes every seed.** Rebase
    `tools/test-worldgen.ts`'s fingerprint in the same commit and say so in
@@ -710,17 +742,17 @@ Gates as always: `npm run typecheck && npm test && npm run lint`.
 
 ## Appendix — constants involved
 
-| constant                             | value                   | where                                                |
-| ------------------------------------ | ----------------------- | ---------------------------------------------------- |
-| `PLAYER_RADIUS`                      | 0.6                     | [main.ts:138](src/main.ts#L138)                      |
-| `DIG_RADII`                          | hands 0.7, driller 2.4  | [main.ts:142](src/main.ts#L142)                      |
-| `DIG_RANGE`                          | 7                       | [main.ts:143](src/main.ts#L143)                      |
-| `SMOOTH_K`                           | 0.05 (local)            | [sdf.ts](src/world/sdf.ts)                           |
-| `R0`                                 | 0.6 (local)             | [sdf.ts](src/world/sdf.ts)                           |
-| `GRID_CELL` / `GRID_SAT` / `DIG_PAD` | 24 / 8 / 3              | [gouda.ts:3105](src/world/gouda.ts#L3105)            |
-| `GRAD_EPS`                           | 0.25                    | [gouda.ts](src/world/gouda.ts#L3259)                 |
-| `MESH_AHEAD`                         | 120                     | [gouda.ts:817](src/world/gouda.ts#L817)              |
-| tile marched extent                  | `±(s − 2s/res)`         | three `MarchingCubes`, x ∈ [1, res−2]                |
-| tile spacing                         | `2s(res−3)/res`         | [gouda.ts:1652](src/world/gouda.ts#L1652)            |
-| carve-distribution pad               | `SMOOTH_K·s + 2·cellW`  | `buildLayerChunks`, `shareCarves`, `tileFieldCovers` |
-| frame                                | `squash 0.45, tilt 16°` | [recipes.ts](src/world/recipes.ts) `WHEEL_WORLD`     |
+| constant                                   | value                   | where                                                |
+| ------------------------------------------ | ----------------------- | ---------------------------------------------------- |
+| `PLAYER_RADIUS`                            | 0.6                     | [main.ts:138](src/main.ts#L138)                      |
+| `DIG_RADII`                                | hands 0.7, driller 2.4  | [main.ts:142](src/main.ts#L142)                      |
+| `DIG_RANGE`                                | 7                       | [main.ts:143](src/main.ts#L143)                      |
+| `SMOOTH_K`                                 | 0.05 (local)            | [sdf.ts](src/world/sdf.ts)                           |
+| `R0`                                       | 0.6 (local)             | [sdf.ts](src/world/sdf.ts)                           |
+| `GRID_CELL` / `GRID_SAT` / `DIG_PAD`       | 24 / 8 / 3              | [gouda.ts:3105](src/world/gouda.ts#L3105)            |
+| `GRAD_EPS` / `MAX_PUSH_ITERS` / `MIN_GRAD` | 0.25 / 4 / 0.35         | [gouda.ts](../src/world/gouda.ts) `pushOutOfField`   |
+| `MESH_AHEAD`                               | 120                     | [gouda.ts:817](src/world/gouda.ts#L817)              |
+| tile marched extent                        | `±(s − 2s/res)`         | three `MarchingCubes`, x ∈ [1, res−2]                |
+| tile spacing                               | `2s(res−3)/res`         | [gouda.ts:1652](src/world/gouda.ts#L1652)            |
+| carve-distribution pad                     | `SMOOTH_K·s + 2·cellW`  | `buildLayerChunks`, `shareCarves`, `tileFieldCovers` |
+| frame                                      | `squash 0.45, tilt 16°` | [recipes.ts](src/world/recipes.ts) `WHEEL_WORLD`     |

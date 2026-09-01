@@ -13,6 +13,11 @@
 //        solid and authoritative must leave that point open. Sampled in the
 //        shell the old sphere-shaped dig predicate could not reach: every one
 //        of those digs left an invisible wall before the fix.
+//   T4 — no invisible cushion (§3-4). The field is NOT a metric, so comparing
+//        it against a radius fattens the player. Truth is measured by
+//        sphere-tracing 64 rays out of the probe, never from the field's own
+//        maths: the largest clearance at which resolveCollision still pushes
+//        was 1.58 u for a 0.6 u player before Fix C, 0.87 u after.
 //
 // The world is built at res 32 (the predicates are resolution-independent and
 // a full-res node build costs ~80 s); tile size grows the blind shell, so the
@@ -27,6 +32,7 @@ import {
   distanceToWorld,
   mulberry32,
   softSpotDigRadius,
+  resolveCollision,
   worldDistance,
   type Chunk,
 } from "../src/world/gouda.ts";
@@ -153,6 +159,130 @@ const T1_DIRS = [...AXES, ...DIAGS];
   );
   console.log(
     `  · ${probes} coverage-edge probes over ${data.chunks.length} chunks`,
+  );
+}
+
+// --- T4 — the field is not a metric, so the comparison must normalise ----------
+// docs/bug-collision-render-desync.md §3. worldDistance is a min of per-chunk
+// APPROXIMATE SDFs: bodySdfWorld scales by `squash`, baseSdf by `minAxis`, both
+// worst-case reciprocal gradients. Comparing that raw value against a length
+// gives the player an invisible cushion — 0.6/0.45 = 1.33 u of standoff in
+// front of every fused-layer rim face. The truth is measured the one way that
+// cannot restate the field's own maths: sphere-trace rays out of the probe and
+// see where they actually meet the zero set.
+
+const RADIUS = 0.6; // main.ts PLAYER_RADIUS
+const GE = 0.25; // gouda.ts GRAD_EPS
+const MIN_GRAD = 0.35; // gouda.ts — the resolver's gradient-collapse floor
+
+// Distance along `u` to the zero set, or -1 if none within `max`. Sphere
+// tracing is safe here precisely BECAUSE the field under-estimates: every
+// step of `d` is a step no longer than the true clearance.
+function traceHit(
+  x: number,
+  y: number,
+  z: number,
+  ux: number,
+  uy: number,
+  uz: number,
+  max = 6,
+): number {
+  let t = 0;
+  for (let i = 0; i < 120 && t < max; i++) {
+    const d = worldDistance(x + ux * t, y + uy * t, z + uz * t);
+    if (d <= 1e-3) return t;
+    t += Math.max(d, 0.01);
+  }
+  return -1;
+}
+
+// A Fibonacci sphere: 64 directions, ~12.5° apart. min over them is an upper
+// bound on the true distance to the surface, tight to ~3 % on a flat face.
+const RAY_DIRS: [number, number, number][] = [];
+for (let i = 0; i < 64; i++) {
+  const y = 1 - (2 * i + 1) / 64;
+  const r = Math.sqrt(Math.max(0, 1 - y * y));
+  const a = i * Math.PI * (3 - Math.sqrt(5));
+  RAY_DIRS.push([Math.cos(a) * r, y, Math.sin(a) * r]);
+}
+
+// The nearest surface, from every side. -1 when nothing is within `max`.
+function trueClearance(x: number, y: number, z: number): number {
+  let best = -1;
+  for (const [ux, uy, uz] of RAY_DIRS) {
+    const t = traceHit(x, y, z, ux, uy, uz);
+    if (t >= 0 && (best < 0 || t < best)) best = t;
+  }
+  return best;
+}
+
+{
+  const r4 = mulberry32(4242);
+  let probes = 0,
+    pushed = 0,
+    collapsed = 0,
+    effR = 0;
+  let worstAt = "";
+  const zones = new Map<string, number>();
+  for (const c of data.chunks) {
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const u = r4() * 2 - 1,
+        a = r4() * Math.PI * 2,
+        s = Math.sqrt(1 - u * u);
+      const m = c.s * (0.7 + r4() * 0.7);
+      const x = c.center.x + s * Math.cos(a) * m,
+        y = c.center.y + u * m,
+        z = c.center.z + s * Math.sin(a) * m;
+      // Open water, but close enough that a cushion would be felt.
+      const d = worldDistance(x, y, z);
+      if (!(d > 0.05 && d < 3)) continue;
+      // Between two cancelling walls the field has no usable gradient and the
+      // resolver deliberately keeps its cushion (erring solid-side is right
+      // there). Those points are counted, not asserted on.
+      const gi = 1 / (2 * GE);
+      const g = Math.hypot(
+        (worldDistance(x + GE, y, z) - worldDistance(x - GE, y, z)) * gi,
+        (worldDistance(x, y + GE, z) - worldDistance(x, y - GE, z)) * gi,
+        (worldDistance(x, y, z + GE) - worldDistance(x, y, z - GE)) * gi,
+      );
+      if (g < MIN_GRAD) {
+        collapsed++;
+        continue;
+      }
+      probes++;
+      zones.set(c.zone ?? "?", (zones.get(c.zone ?? "?") ?? 0) + 1);
+      const p = { x, y, z };
+      if (!resolveCollision(p, RADIUS)) continue; // not pushed: no cushion here
+      pushed++;
+      // Only now pay for the truth. The largest measured clearance at which a
+      // push still happens IS the player's effective collision radius.
+      const L = trueClearance(x, y, z);
+      if (L < 0) continue; // nothing within 6 u: not a surface probe
+      if (L > effR) {
+        effR = L;
+        worstAt = `${c.zone} s${c.s}, field said ${d.toFixed(2)} at |∇d| ${g.toFixed(2)}`;
+      }
+    }
+  }
+  check(
+    "T4: the sampler finds surfaces to stand off from",
+    probes >= 200 && pushed >= 50,
+    `${probes} near-surface probes, ${pushed} pushed`,
+  );
+  // Before Fix C the fused rims pushed out past 1.4 u — 0.6 / squash 0.45.
+  // d/|∇d| is only a FIRST-order correction, so a little slack survives on
+  // strongly curved faces; the systematic 2.2× cushion does not.
+  check(
+    "T4: no invisible cushion — the effective collision radius is the radius",
+    effR <= RADIUS * 1.6,
+    `pushed at ${effR.toFixed(2)} u of measured clearance vs ${RADIUS} u asked (${worstAt})`,
+  );
+  console.log(
+    `  · ${probes} near-surface probes [${[...zones].map(([k, v]) => `${k} ${v}`).join(", ")}], ` +
+      `${pushed} pushed, ${collapsed} skipped at |∇d| < ${MIN_GRAD}`,
+  );
+  console.log(
+    `  · effective collision radius ${effR.toFixed(2)} u (asked ${RADIUS})`,
   );
 }
 

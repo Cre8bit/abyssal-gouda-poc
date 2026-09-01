@@ -35,7 +35,8 @@ import {
   playWhoosh,
 } from "./audio/ambience.ts";
 import {
-  resolveCollision,
+  resolveCollisionAll,
+  worldDistance,
   findOpenSpot,
   getSpawnPoint,
   getGoldPos,
@@ -818,6 +819,8 @@ const ZERO_MOVE = Object.freeze({ x: 0, y: 0, z: 0 });
 const _fwd = { x: 0, y: 0, z: 0 };
 const _right = { x: 0, z: 0 };
 const _target = { x: 0, y: 0, z: 0 };
+const _normals: Vec3[] = []; // walls this substep pushed off (usually 0 or 1)
+const _entry = { x: 0, y: 0, z: 0 }; // substep start, to fall back to
 const remotePosPool: Vec3[] = []; // backing objects for remotePositions, by index
 const frameCtx = { dt: 0, now: 0, game, connected: false };
 let networkTimer = 0;
@@ -872,22 +875,38 @@ renderLoop((delta) => {
   const steps = Math.min(4, Math.max(1, Math.ceil(frameDist / 0.5)));
   const stepDelta = delta / steps;
   for (let s = 0; s < steps; s++) {
+    _entry.x = pos.x;
+    _entry.y = pos.y;
+    _entry.z = pos.z;
     pos.x += vel.x * stepDelta;
     pos.y += vel.y * stepDelta;
     pos.z += vel.z * stepDelta;
     if (freeCam) continue; // DEBUG: noclip — no collision resolution
 
-    // Resolve SDF collision; remove velocity component into wall (slide, no bounce).
-    const hit = resolveCollision(pos, PLAYER_RADIUS);
+    // Resolve SDF collision; remove velocity component into EVERY wall pushed
+    // off (slide, no bounce). A squeeze touches two, and cancelling into only
+    // one of them leaves the player drifting into the other — a hard stop with
+    // no slide. docs/bug-collision-render-desync.md §4.
+    _normals.length = 0;
+    const stuck = resolveCollisionAll(pos, PLAYER_RADIUS, _normals);
     const bellHit = collideBathyscaphe(pos, PLAYER_RADIUS);
-    for (const n of [hit, bellHit]) {
-      if (!n) continue;
+    if (bellHit) _normals.push(bellHit);
+    for (const n of _normals) {
       const into = vel.x * n.x + vel.y * n.y + vel.z * n.z;
       if (into < 0) {
         vel.x -= n.x * into;
         vel.y -= n.y * into;
         vel.z -= n.z * into;
       }
+    }
+    // The resolver ran out of iterations still embedded. Rather than leave the
+    // player inside solid (where the next push can shove them out the far
+    // side), rewind to where this substep started — but only if that was
+    // demonstrably open water, so this can never wedge them in place.
+    if (stuck && worldDistance(_entry.x, _entry.y, _entry.z) >= PLAYER_RADIUS) {
+      pos.x = _entry.x;
+      pos.y = _entry.y;
+      pos.z = _entry.z;
     }
   }
 

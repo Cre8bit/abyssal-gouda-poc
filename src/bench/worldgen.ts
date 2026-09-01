@@ -37,6 +37,7 @@ import {
   buildLayerChunks,
   buildWorldData,
   chunkDistance,
+  pushOutOfField,
   createGoudaMaterial,
   effectiveTunnelRadius,
   tileFieldCovers,
@@ -391,32 +392,11 @@ function updateWalk(dt: number): void {
   walk.vel.lerp(_mv, 1 - Math.exp(-dt * 9));
   camera.position.addScaledVector(walk.vel, dt);
 
-  if (!walk.collide) return;
-  const p = camera.position;
-  for (let iter = 0; iter < 2; iter++) {
-    const d = benchDistance(p.x, p.y, p.z);
-    if (!Number.isFinite(d) || d >= PLAYER_RADIUS) break;
-    const E = 0.25;
-    let nx =
-      benchDistance(p.x + E, p.y, p.z) - benchDistance(p.x - E, p.y, p.z);
-    let ny =
-      benchDistance(p.x, p.y + E, p.z) - benchDistance(p.x, p.y - E, p.z);
-    let nz =
-      benchDistance(p.x, p.y, p.z + E) - benchDistance(p.x, p.y, p.z - E);
-    const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-    if (len < 1e-5) {
-      nx = 0;
-      ny = 1;
-      nz = 0;
-    } else {
-      nx /= len;
-      ny /= len;
-      nz /= len;
-    }
-    p.x += nx * (PLAYER_RADIUS - d + 0.001);
-    p.y += ny * (PLAYER_RADIUS - d + 0.001);
-    p.z += nz * (PLAYER_RADIUS - d + 0.001);
-  }
+  // The game's own resolver, on the bench's field: iteration count, the
+  // metric d/|∇d| normalisation and the no-fallback-normal rule all stay in
+  // one place, so walk mode keeps reproducing what the player feels.
+  if (walk.collide)
+    pushOutOfField(benchDistance, camera.position, PLAYER_RADIUS);
 }
 
 // --- Content lifecycle ---------------------------------------------------------

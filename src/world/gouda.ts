@@ -3415,38 +3415,92 @@ export function worldDistance(x: number, y: number, z: number): number {
 }
 
 const GRAD_EPS = 0.25;
-export function resolveCollision(pos: Vec3, radius: number): Vec3 | null {
-  let normal: Vec3 | null = null;
-  for (let iter = 0; iter < 2; iter++) {
-    const d = worldDistance(pos.x, pos.y, pos.z);
-    // NaN from degenerate SDF would trap player; bail if non-finite.
-    if (!Number.isFinite(d)) break;
-    if (d >= radius) break;
-    let nx =
-      worldDistance(pos.x + GRAD_EPS, pos.y, pos.z) -
-      worldDistance(pos.x - GRAD_EPS, pos.y, pos.z);
-    let ny =
-      worldDistance(pos.x, pos.y + GRAD_EPS, pos.z) -
-      worldDistance(pos.x, pos.y - GRAD_EPS, pos.z);
-    let nz =
-      worldDistance(pos.x, pos.y, pos.z + GRAD_EPS) -
-      worldDistance(pos.x, pos.y, pos.z - GRAD_EPS);
-    const len = Math.sqrt(nx * nx + ny * ny + nz * nz);
-    if (len < 1e-5) {
-      nx = 0;
-      ny = 1;
-      nz = 0;
-    } else {
-      nx /= len;
-      ny /= len;
-      nz /= len;
-    }
-    pos.x += nx * (radius - d + 0.001);
-    pos.y += ny * (radius - d + 0.001);
-    pos.z += nz * (radius - d + 0.001);
-    normal = { x: nx, y: ny, z: nz };
+const MAX_PUSH_ITERS = 4; // a squeeze needs A, B, then A and B again
+const MIN_GRAD = 0.35; // below this the gradient is two walls cancelling
+
+export type DistanceField = (x: number, y: number, z: number) => number;
+
+// Push `pos` out of `field`'s solid until it stands `radius` clear, appending
+// every surface normal it pushed off to `out`. Returns true if it ran out of
+// iterations still embedded. docs/bug-collision-render-desync.md §3-4.
+//
+// The subtlety is that a min-of-chunks SDF is sign-correct but NOT 1-Lipschitz:
+// bodySdfWorld scales a frame radius by `squash` and baseSdf an ellipsoid
+// radius by `minAxis`, and both are worst-case reciprocal gradients — on an
+// equatorial fused-layer rim the field reports 0.45 × the real distance, so a
+// naive `d < radius` gives the player a 0.73 u invisible cushion. `d / |∇d|` is
+// the first-order distance to the isosurface, and that is the only quantity a
+// radius may be compared against. Rescaling the FIELD instead is not an option:
+// marching cubes interpolates it, so it would move the mesh and rebase the
+// world fingerprint. Exported so the worldgen bench's walk mode pushes off its
+// preview chunks through this exact code rather than a copy of it.
+export function pushOutOfField(
+  field: DistanceField,
+  pos: Vec3,
+  radius: number,
+  out: Vec3[] | null = null,
+): boolean {
+  const invEps = 1 / (2 * GRAD_EPS);
+  for (let iter = 0; ; iter++) {
+    const d = field(pos.x, pos.y, pos.z);
+    // NaN from a degenerate SDF would trap the player; bail if non-finite.
+    if (!Number.isFinite(d)) return false;
+    if (d >= radius) return false; // cheap reject: d never overstates the gap
+    const gx =
+      (field(pos.x + GRAD_EPS, pos.y, pos.z) -
+        field(pos.x - GRAD_EPS, pos.y, pos.z)) *
+      invEps;
+    const gy =
+      (field(pos.x, pos.y + GRAD_EPS, pos.z) -
+        field(pos.x, pos.y - GRAD_EPS, pos.z)) *
+      invEps;
+    const gz =
+      (field(pos.x, pos.y, pos.z + GRAD_EPS) -
+        field(pos.x, pos.y, pos.z - GRAD_EPS)) *
+      invEps;
+    const g = Math.sqrt(gx * gx + gy * gy + gz * gz);
+    // A degenerate gradient means "no information", not "up": the old (0,1,0)
+    // fallback fired exactly between two opposing walls and shoved the player
+    // into the ceiling.
+    if (g < 1e-4) return true;
+    // Clamping the divisor keeps a collapsing gradient (mid-way between two
+    // walls) from inventing unbounded clearance — it errs solid-side.
+    const dTrue = d / Math.max(g, MIN_GRAD);
+    if (dTrue >= radius) return false;
+    // Out of pushes and still inside: the caller decides what to do about it.
+    if (iter === MAX_PUSH_ITERS) return true;
+    const inv = 1 / g;
+    const nx = gx * inv,
+      ny = gy * inv,
+      nz = gz * inv;
+    const push = radius - dTrue + 0.001;
+    pos.x += nx * push;
+    pos.y += ny * push;
+    pos.z += nz * push;
+    if (out) out.push({ x: nx, y: ny, z: nz });
   }
-  return normal;
+}
+
+// Push out of the world, collecting EVERY wall pushed off. A squeeze touches
+// two: keeping only the last one lets the caller cancel velocity into one wall
+// while the player keeps drifting into the other, which reads as a hard stop
+// with no slide.
+export function resolveCollisionAll(
+  pos: Vec3,
+  radius: number,
+  out: Vec3[],
+): boolean {
+  return pushOutOfField(worldDistance, pos, radius, out);
+}
+
+const _pushNormals: Vec3[] = [];
+
+// Single-normal convenience for the movers that only slide along one wall
+// (catfish, the dropped cargo, the dropped driller).
+export function resolveCollision(pos: Vec3, radius: number): Vec3 | null {
+  _pushNormals.length = 0;
+  pushOutOfField(worldDistance, pos, radius, _pushNormals);
+  return _pushNormals.length ? _pushNormals[_pushNormals.length - 1] : null;
 }
 
 export function findOpenSpot(

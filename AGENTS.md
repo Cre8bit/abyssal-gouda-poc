@@ -60,8 +60,9 @@ tools/               node-run (node 24 strips types natively)
   test-clock.ts        shared-clock unit tests (npm test)
   test-recipes.ts      worldgen recipe-table sanity checks (npm test)
   test-worldgen.ts     route verifier + world fingerprint (npm test)
-  test-collision.ts    collision == render: chunkCovers parity, dig-then-swim
-                       against a real node build (npm test)
+  test-collision.ts    collision == render: chunkCovers parity, dig-then-swim,
+                       and the effective collision radius, against a real node
+                       build (npm test)
 ```
 
 ## Conventions
@@ -139,7 +140,7 @@ placement mode were retired in WG-04.
 
 **Placement modes come in two families:**
 
-- *Per-chunk bodies* — `center | band`: every chunk is its own closed
+- _Per-chunk bodies_ — `center | band`: every chunk is its own closed
   ellipsoid SDF. `band` supports `densityGrade`/`sizeGrade`
   (outward/inward), `sightline` (each chunk placed within sight of the
   already-placed trail — the dark veins), and `rotate` (WG-12: a slow
@@ -150,7 +151,7 @@ placement mode were retired in WG-04.
   A dig on a rotating chunk replicates as **chunk id + local coords**
   (`SphereDig.c`, replayed via `digAtChunkLocal`) — a world point replayed
   at a different clock would land elsewhere on the cheese.
-- *Layer bodies* — `fused | hull`: ONE analytic body per biome (a radial
+- _Layer bodies_ — `fused | hull`: ONE analytic body per biome (a radial
   band of solid cheese; the Great Wheel's rounded-cylinder husk with
   soft-spot bulges; the melt shell's sphere husk with its one generated
   `entrance` bore), meshed by lattice-aligned cube tiles. Tile spacing is
@@ -195,16 +196,17 @@ live r×res + rat/cargo clearance verdicts in the HUD), biome (a wedge at
 true density; fused/hull biomes render real lattice tiles WITH their
 inter-tile carve network), map (proxies incl. hull silhouette, spine and
 soft spots — or the real build). **Walk mode (F)** pointer-locks into a
-player-speed swim (10 u/s, collision at the player's 0.6 u radius) so you
-can navigate anything you generate exactly like the game; the clip plane
-cuts along X/Y/Z through everything. Edits autosave to localStorage; the
+player-speed swim (10 u/s, collision at the player's 0.6 u radius, resolved
+through the game's own `pushOutOfField`) so you can navigate anything you
+generate exactly like the game; the clip plane cuts along X/Y/Z through
+everything. Edits autosave to localStorage; the
 **copy buttons dump JSON to paste into `recipes.ts`**, which is the only
 way a tuning ships. Deep links: `?world=<key>`, `?part=<id>`,
 `?biome=<id>`, `?map=1`, `&build=1` (real build), `&seed=`.
 
 Adding a new cheese part type or biome = a new table entry in `recipes.ts`
-(author it in the bench, copy it out), NOT new generator code. New *shape
-grammar* (a new `PartKind`, a new placement mode, a new hull surface) is a
+(author it in the bench, copy it out), NOT new generator code. New _shape
+grammar_ (a new `PartKind`, a new placement mode, a new hull surface) is a
 `gouda.ts` change.
 
 ⚠ The seeded rng stream is a pure function of the tables: draw order is part
@@ -223,8 +225,14 @@ same sdf.ts code), the GAME additionally streams chunks by distance
 at ~120 u; collision needs no mesh, chunkSdf is the collider, and digs into
 unmeshed chunks are recorded and baked at first meshing). Runtime queries
 (worldDistance/digAt/raycast) ride a chunk spatial hash built per world
-build and saturate at 8 u of open water. Dig remeshes run async through the
-pool (one in-flight per chunk, latest field wins) — collision is exact the
+build and saturate at 8 u of open water. `worldDistance` is a `min` of
+per-chunk APPROXIMATE SDFs — sign-correct, but **not a metric** (layer bands
+scale by `squash`, ellipsoids by `minAxis`), so it under-reports distance by
+up to 2.2×. Never compare it against a length directly: push through
+`pushOutOfField()`, which divides by the measured `|∇d|` first.
+`tools/test-collision.ts` T4 pins the resulting effective collision radius.
+Dig remeshes run async through the pool (one in-flight per chunk, latest
+field wins) — collision is exact the
 moment digAt returns. Node and the tests keep the sync path
 (`workers: false` or no Worker global); a full-res node build still costs
 ~80 s — iterate at half res (the bench default). Biome wax is ONE shader
@@ -392,11 +400,13 @@ the wheel through the hands on every pitch.
 ## Comment Guidelines
 
 ### Allowed: Top-of-File Architecture Headers
+
 - Multi-paragraph comments are permitted ONLY at the very top of a file (file-header level).
 - File headers MUST focus exclusively on high-level architecture: file responsibility, API contract/exports, skeleton structure, parameter conventions, and frame-of-reference rules.
 - Do NOT include step-by-step design history, trial-and-error logs, or subjective visual flavor text even in file headers.
 
 ### Banned: Mid-File & Inline Narrative Comments
+
 - INSIDE functions or mid-file: keep comments strictly to 1–2 lines max.
 - Zero narrative prose, historical rationale ("the old version did X"), or physical/visual metaphors inside function bodies.
-- Code should explain *what* it is doing, not why alternative values failed.
+- Code should explain _what_ it is doing, not why alternative values failed.
