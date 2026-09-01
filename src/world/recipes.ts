@@ -473,7 +473,8 @@ export const WHEEL_BIOMES: BiomeRecipe[] = [
       rMin: 100,
       rMax: 226,
       count: 90,
-      guard: 0.45,
+      // ≥ scatterSurfaceRadius(roquefort-float): interpenetrating scatter
+      guard: 0.8,
       densityGrade: "inward",
       sizeGrade: "inward",
       sightline: true,
@@ -611,6 +612,25 @@ export function cloneWorld(world: WorldRecipe): WorldRecipe {
   return structuredClone(world);
 }
 
+// Chunk-local geometry mirrored from gouda.ts so seed-time rules can bound a
+// scatter chunk without importing the generator: the ellipsoid surface sits
+// at |p| = SURFACE_R0, and makeChunkData draws each half-axis in a per-family
+// range.
+const SURFACE_R0 = 0.6;
+const MAX_ELLIPSOID_AXIS: Record<PartKind, number> = {
+  wheel: 1.15,
+  hunk: 1.2,
+  block: 1.2,
+  slab: 1.2,
+  column: 1.25,
+};
+
+// Widest a chunk's surface can reach, as a fraction of its scale `s`: the
+// longest ellipsoid half-axis plus the crust displacement riding on it.
+export function scatterSurfaceRadius(part: PartRecipe): number {
+  return SURFACE_R0 * MAX_ELLIPSOID_AXIS[part.kind] + part.crust.amp;
+}
+
 export const VALID_RES = [32, 48, 56, 64, 72, 96];
 
 // Seed-time rules (plan-mvp §M2.4): violations that would generate a broken
@@ -640,6 +660,22 @@ export function validateWorld(world: WorldRecipe): string[] {
       errors.push(
         `${biome.id}: rotate ${pl.rotate.degPerSec}°/s outside (0, 4]`,
       );
+    if (pl.mode === "band") {
+      // Scatter chunks are independent bodies: shareCarves() refuses to
+      // compose ellipsoid pairs, so two that interpenetrate become each
+      // other's invisible walls
+      for (const entry of biome.parts) {
+        const part = world.parts.find((p) => p.id === entry.part);
+        if (!part) continue;
+        const surf = scatterSurfaceRadius(part);
+        if (pl.guard < surf)
+          errors.push(
+            `${biome.id}: guard ${pl.guard} < ${surf.toFixed(2)} for part ` +
+              `"${part.id}" — scatter chunks interpenetrate and their carves ` +
+              `do not compose (invisible walls)`,
+          );
+      }
+    }
     if (pl.mode === "hull") {
       for (const entry of biome.parts) {
         const part = world.parts.find((p) => p.id === entry.part);

@@ -4,7 +4,9 @@
 // node with no DOM/GL.
 import {
   WHEEL_WORLD,
+  cloneWorld,
   partById,
+  scatterSurfaceRadius,
   validateWorld,
   VALID_RES,
   type BiomeRecipe,
@@ -180,6 +182,35 @@ check(
     WHEEL_WORLD.parts.find((p) => p.id === "melt-rind")?.hardness === 3,
 );
 
+// T3 (docs/bug-collision-render-desync.md §2) — the scatter-overlap rule.
+// shareCarves() refuses to compose two ellipsoid chunks, so a band whose
+// guard lets its chunks interpenetrate builds invisible walls. Every shipped
+// band must clear its parts' surfaces, and a deliberately-overlapping table
+// must be REJECTED — the rule is worthless if it only ever passes.
+for (const biome of WHEEL_WORLD.biomes) {
+  const pl = biome.placement;
+  if (pl.mode !== "band") continue;
+  for (const entry of biome.parts) {
+    const surf = scatterSurfaceRadius(partById(WHEEL_WORLD, entry.part));
+    check(
+      `T3: band ${biome.id} guard clears ${entry.part}'s surface`,
+      pl.guard >= surf,
+      `guard ${pl.guard} vs surface ${surf.toFixed(3)}`,
+    );
+  }
+}
+{
+  const overlapping = cloneWorld(WHEEL_WORLD);
+  const b = overlapping.biomes.find((x) => x.id === "veins")!;
+  if (b.placement.mode === "band") b.placement.guard = 0.45;
+  const errors = validateWorld(overlapping);
+  check(
+    "T3: validateWorld rejects an interpenetrating scatter band",
+    errors.some((e) => e.includes("veins") && e.includes("interpenetrate")),
+    errors.join("; ") || "no errors raised",
+  );
+}
+
 // The veins are a sightline-chained scatter, graded inward — no fused body.
 const veins = WHEEL_WORLD.biomes.find((b) => b.id === "veins")!;
 check(
@@ -199,7 +230,10 @@ const drift = WHEEL_WORLD.biomes.find((b) => b.id === "drift")!;
 const melt = WHEEL_WORLD.biomes.find((b) => b.id === "melt")!;
 const heart = WHEEL_WORLD.biomes.find((b) => b.id === "heart")!;
 check("wheel: drift seeds 6 air pockets", drift.budgets?.airPockets === 6);
-check("wheel: heart seeds the last air pocket", heart.budgets?.airPockets === 1);
+check(
+  "wheel: heart seeds the last air pocket",
+  heart.budgets?.airPockets === 1,
+);
 check(
   "wheel: melt hazard budget seeded",
   melt.budgets?.hazards?.meltFalls === 12 &&

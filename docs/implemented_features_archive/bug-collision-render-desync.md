@@ -250,6 +250,26 @@ over time. The wall moves.
 
 Two options; **B1 is shippable, B2 is the "right" one but is blocked.**
 
+> **Shipped: B1.** `veins.guard` 0.45 → 0.80 plus the `validateWorld` rule
+> below, both in [recipes.ts](../src/world/recipes.ts). Measured on the three
+> pinned seeds: **117 / 122 / 87 interpenetrating veins pairs before, 0 after**;
+> the worst penetration was 22.65 u. `count` did NOT need re-tuning — all 90
+> chunks still place (the placement loop's `shrink` ladder absorbs the extra
+> spacing; the largest chunk goes 36.6 u → 32.4 u), the trail still links
+> **90/90 with 0 orphans** and still reaches the entrance on every seed. B2
+> stays blocked and is filed in [idea-register.md](idea-register.md).
+>
+> The surface bound is derived rather than hardcoded:
+> `scatterSurfaceRadius(part)` = the longest ellipsoid half-axis `makeChunkData`
+> can draw for that shape family, times `R0`, plus the crust displacement
+> riding on it. `MAX_ELLIPSOID_AXIS` mirrors `makeChunkData`'s draws into
+> `recipes.ts` (which stays three-free), and **T5 checks the mirror against
+> real geometry** — a re-tuned axis range that outgrows the bound shows up as
+> buried vertices, not as a silent regression.
+>
+> **Fingerprints rebased in the same commit** (`tools/test-worldgen.ts`):
+> `bf179d31 → 032cca14`, `06178761 → 38f1226d`, `e250706b → 11e3836a`.
+
 **B1 — forbid the overlap at placement, and make it machine-checked.**
 
 ```diff
@@ -691,9 +711,11 @@ points along the verifier's solved `path`, call
 **This fails today** on any point in a tile's blind corner and passes after
 Fix A. It is the single most valuable test in this list.
 
-**T3 — placement invariant (catches B).** Extend `tools/test-recipes.ts` to
-assert `validateWorld(WHEEL_WORLD)` is empty with the new scatter-overlap
-rule from Fix B, and that a deliberately-overlapping fixture is rejected.
+**T3 — placement invariant (catches B).** _Shipped_
+(`tools/test-recipes.ts`): every shipped `band` biome's `guard` must clear
+`scatterSurfaceRadius()` of each of its parts, and a fixture with the old
+`veins.guard = 0.45` must be **rejected** by `validateWorld` — the rule is
+worthless if it only ever passes.
 
 **T4 — metric sanity (catches C).** _Shipped, and re-aimed._ Bisecting along
 the gradient (as originally sketched) is not a usable oracle: at a `min` seam
@@ -711,11 +733,20 @@ still pushes a 0.6 u player. **1.58 u before Fix C, 0.87 u after**, gate at
 asserted on — there the resolver's cushion is the deliberate solid-side
 clamp, not the bug.
 
-**T5 — mesh ⊆ open (catches B and any future phantom).** For the shipped
-seed at half res, for every extracted vertex `v` of every chunk, assert
-`worldDistance(v) > -tol` with `tol = 0.25·cellW`. A vertex sitting deep
-inside another chunk's solid is, by definition, a rendered surface the
-collider disagrees with.
+**T5 — mesh ⊆ open (catches B and any future phantom).** _Shipped, and
+scoped._ (`tools/test-collision.ts`.) The sketch — assert
+`worldDistance(v) > -tol` for **every** extracted vertex — does not hold and
+should not: radially adjacent layer bands **abut on purpose**, so a band's rim
+vertex legitimately sits inside its neighbour's solid. Measured at res 32 on
+the shipped seed: 17.4 k of 787 k vertices are buried that way
+(`melt-shell∩melt` 1.3 k, `galleries∩melt` 845, `heart∩galleries` 175, …), and
+none of them is a bug — an interior face is never a visible opening, and those
+pairs **do** compose their carves.
+
+The scope that _is_ an invariant is the one `shareCarves()` skips: for every
+vertex of every ellipsoid chunk, no **other** ellipsoid chunk may report solid
+past `tol = 0.25·cellW`. 257 k vertices, ~2 s. **10 172 buried at
+`guard: 0.45`, worst 6.04 u past tolerance; 0 at `guard: 0.80`.**
 
 ---
 
@@ -729,11 +760,12 @@ collider disagrees with.
    rather than copying it). No generated data changed — `test-worldgen.ts`'s
    fingerprints are untouched. Shipped with **T4**. Still worth re-walking the
    galleries squeezes in the bench by hand: they get _easier_.
-4. **B** — `veins.guard` 0.45 → 0.80 plus the `validateWorld` rule
-   (`recipes.ts`). **Changes every seed.** Rebase
-   `tools/test-worldgen.ts`'s fingerprint in the same commit and say so in
-   the message. Re-check `verifyWorld().trail.orphans === 0` and re-tune
-   `count` in the bench. Ship with **T3 + T5**.
+4. **B** — ✅ **done**: `veins.guard` 0.45 → 0.80 plus the `validateWorld`
+   scatter-overlap rule (`recipes.ts`). Every seed's world moved, so
+   `tools/test-worldgen.ts`'s three fingerprints are rebased in the same
+   commit. `trail.orphans` is 0 and `count: 90` still places in full, so no
+   bench re-tune was needed. Shipped with **T3 + T5**. B2 (composing the
+   carves for real) stays blocked on per-cluster spin — `docs/idea-register.md`.
 5. **§6** — leave alone.
 
 Gates as always: `npm run typecheck && npm test && npm run lint`.

@@ -210,11 +210,14 @@ for (const [seed, diff] of MATRIX) {
 
 // Wheel-world fingerprint baseline (WG-04). Perf tickets (WG-19/21/22) must
 // keep these EXACT; a content ticket that changes the stream rebases them in
-// the same commit and says so.
+// the same commit and says so. Last rebase: Fix B
+// (docs/bug-collision-render-desync.md §2) raised the dark veins' placement
+// guard 0.45 → 0.8 so scatter chunks stop interpenetrating — a placement
+// parameter, so every seed's world moved.
 const PINNED: Record<string, string> = {
-  "1337/1": "bf179d31",
-  "1337/3": "06178761",
-  "424242/1": "e250706b",
+  "1337/1": "032cca14",
+  "1337/3": "38f1226d",
+  "424242/1": "11e3836a",
 };
 for (const [key, want] of Object.entries(PINNED)) {
   const [seed, diff] = key.split("/").map(Number);

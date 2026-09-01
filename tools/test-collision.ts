@@ -18,6 +18,10 @@
 //        sphere-tracing 64 rays out of the probe, never from the field's own
 //        maths: the largest clearance at which resolveCollision still pushes
 //        was 1.58 u for a 0.6 u player before Fix C, 0.87 u after.
+//   T5 — mesh ⊆ open (§2), over the chunk pairs shareCarves() refuses to
+//        compose. A scatter chunk's rendered surface buried in another
+//        scatter chunk's solid is a wall you can see through and cannot
+//        enter — the dark veins before Fix B raised their placement guard.
 //
 // The world is built at res 32 (the predicates are resolution-independent and
 // a full-res node build costs ~80 s); tile size grows the blind shell, so the
@@ -36,7 +40,13 @@ import {
   worldDistance,
   type Chunk,
 } from "../src/world/gouda.ts";
-import { WHEEL_WORLD, cloneWorld } from "../src/world/recipes.ts";
+import { R0, meshChunkBuffers } from "../src/world/sdf.ts";
+import {
+  WHEEL_WORLD,
+  cloneWorld,
+  partById,
+  scatterSurfaceRadius,
+} from "../src/world/recipes.ts";
 
 let failures = 0;
 function check(name: string, ok: boolean, detail = ""): void {
@@ -284,6 +294,106 @@ function trueClearance(x: number, y: number, z: number): number {
   console.log(
     `  · effective collision radius ${effR.toFixed(2)} u (asked ${RADIUS})`,
   );
+}
+
+// --- T5 — mesh ⊆ open, for the pairs that never compose -----------------------
+// docs/bug-collision-render-desync.md §2. shareCarves() skips ellipsoid pairs
+// ("scatter chunks are independent bodies by design"), so two that
+// interpenetrate never cut each other: A's tunnel is drawn straight through
+// B's untouched solid and the player bounces off a wall they can see through.
+// The scope is exactly that skip. Layer tiles are NOT in it: radially
+// adjacent bands abut on purpose, so a band's rim vertex legitimately sits
+// inside its neighbour's solid — an interior face, never a visible opening —
+// and those pairs do compose their carves.
+// Tolerance is the marching-cubes reconstruction floor (§6), 0.25 cells.
+
+{
+  const scatter = data.chunks.filter((c) => !c.body);
+  // The mirror itself: recipes.ts declares the widest half-axis makeChunkData
+  // can draw per shape family, and validateWorld bounds `guard` with it. Read
+  // it back off real chunks so a re-tuned axis range cannot outgrow the rule.
+  {
+    let over = 0;
+    let worstAt = "";
+    for (const c of scatter) {
+      const biome = world.biomes.find((b) => b.id === c.zone);
+      if (!biome) continue;
+      const bound = Math.max(
+        ...biome.parts.map((e) =>
+          scatterSurfaceRadius(partById(world, e.part)),
+        ),
+      );
+      const measured = R0 / Math.min(c.ix, c.iy, c.iz) + c.amp;
+      if (measured > bound + 1e-9) {
+        over++;
+        worstAt = `${c.zone}: ${measured.toFixed(3)} > ${bound.toFixed(3)}`;
+      }
+    }
+    check(
+      "T5: scatterSurfaceRadius() bounds the ellipsoids the generator draws",
+      over === 0,
+      `${over}/${scatter.length} chunks exceed the declared bound (${worstAt})`,
+    );
+  }
+  // Only a chunk whose influence ball reaches A's surface can bury it.
+  const neighbours = scatter.map((a) =>
+    scatter.filter(
+      (b) =>
+        b !== a &&
+        Math.hypot(
+          a.center.x - b.center.x,
+          a.center.y - b.center.y,
+          a.center.z - b.center.z,
+        ) <
+          (a.s + b.s) * 1.4,
+    ),
+  );
+  let verts = 0,
+    buried = 0,
+    worst = 0;
+  let worstAt = "";
+  const zones = new Map<string, number>();
+  for (let i = 0; i < scatter.length; i++) {
+    const a = scatter[i];
+    if (!neighbours[i].length) continue;
+    const tol = 0.25 * ((2 * a.s) / a.res);
+    const mc = meshChunkBuffers(a);
+    const pos = mc.positions;
+    // Marching cubes emits neighbouring vertices a fraction of a cell apart:
+    // every 7th carries the same information for a seventh of the queries.
+    for (let v = 0; v < mc.count * 3; v += 21) {
+      const x = a.center.x + pos[v] * a.s,
+        y = a.center.y + pos[v + 1] * a.s,
+        z = a.center.z + pos[v + 2] * a.s;
+      verts++;
+      for (const b of neighbours[i]) {
+        const d = chunkDistance(b, x, y, z);
+        if (d > -tol) continue;
+        buried++;
+        const key = `${a.zone}∩${b.zone}`;
+        zones.set(key, (zones.get(key) ?? 0) + 1);
+        if (-d - tol > worst) {
+          worst = -d - tol;
+          worstAt = `${a.zone} s${a.s.toFixed(1)} inside ${b.zone} s${b.s.toFixed(1)}`;
+        }
+        break;
+      }
+    }
+  }
+  check(
+    "T5: the sampler finds scatter chunks close enough to bury each other",
+    verts > 1000,
+    `${verts} vertices over ${neighbours.filter((n) => n.length).length}/${scatter.length} scatter chunks with neighbours`,
+  );
+  // Before Fix B the dark veins placed at guard 0.45 against a 0.79 surface:
+  // ~120 interpenetrating pairs per seed, up to 22 u deep.
+  check(
+    "T5: no scatter chunk's rendered surface is buried in another's solid",
+    buried === 0,
+    `${buried}/${verts} buried [${[...zones].map(([k, v]) => `${k} ${v}`).join(", ")}], ` +
+      `worst ${worst.toFixed(2)} u past tolerance (${worstAt})`,
+  );
+  console.log(`  · ${verts} scatter vertices probed against their neighbours`);
 }
 
 // --- T2 — dig, then swim -------------------------------------------------------

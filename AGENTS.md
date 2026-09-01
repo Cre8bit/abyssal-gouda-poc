@@ -61,8 +61,8 @@ tools/               node-run (node 24 strips types natively)
   test-recipes.ts      worldgen recipe-table sanity checks (npm test)
   test-worldgen.ts     route verifier + world fingerprint (npm test)
   test-collision.ts    collision == render: chunkCovers parity, dig-then-swim,
-                       and the effective collision radius, against a real node
-                       build (npm test)
+                       the effective collision radius, and mesh ⊆ open for
+                       scatter pairs, against a real node build (npm test)
 ```
 
 ## Conventions
@@ -151,6 +151,12 @@ placement mode were retired in WG-04.
   A dig on a rotating chunk replicates as **chunk id + local coords**
   (`SphereDig.c`, replayed via `digAtChunkLocal`) — a world point replayed
   at a different clock would land elsewhere on the cheese.
+  Scatter chunks are **independent bodies**: `shareCarves()` refuses to
+  compose two ellipsoids, so two that interpenetrate become each other's
+  invisible walls. `validateWorld()` therefore requires a band's `guard` to
+  clear `scatterSurfaceRadius(part)` — the widest half-axis `makeChunkData`
+  draws for that shape family, plus the crust. Loosening a `guard` below it
+  is a rejected table, not a tuning.
 - _Layer bodies_ — `fused | hull`: ONE analytic body per biome (a radial
   band of solid cheese; the Great Wheel's rounded-cylinder husk with
   soft-spot bulges; the melt shell's sphere husk with its one generated
