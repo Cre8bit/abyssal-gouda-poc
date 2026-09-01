@@ -966,7 +966,8 @@ export function digAt(
       dy = y - c.center.y,
       dz = z - c.center.z;
     const dc = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    if (dc > (c.body ? c.s * 1.74 : c.s * 1.35) + r) continue;
+    // Same predicate the collider uses: anything that can block here is dug.
+    if (!chunkCovers(c, x, y, z, r)) continue;
     if (digHardness(c, x, y, z) > maxHardness) {
       rejected = true;
       continue;
@@ -3147,14 +3148,16 @@ export function getSeededProps(): SeededProp[] {
 // the carve. Every world point near the body lies in some tile's box, so
 // queries skip tiles that don't cover the point. Exported for the verifier
 // and the bench (their query loops must apply the same ownership rule).
+// `extra` inflates the box by a dig radius (see chunkCovers).
 export function tileFieldCovers(
   c: Chunk,
   x: number,
   y: number,
   z: number,
+  extra = 0,
 ): boolean {
   const cellW = (2 * c.s) / c.res;
-  const pad = SMOOTH_K * c.s + 2 * cellW;
+  const pad = SMOOTH_K * c.s + 2 * cellW + extra;
   const lo = -(c.s - cellW) - pad;
   const hi = c.s - 2 * cellW + pad;
   const dx = x - c.center.x;
@@ -3163,6 +3166,26 @@ export function tileFieldCovers(
   if (dy < lo || dy > hi) return false;
   const dz = z - c.center.z;
   return dz >= lo && dz <= hi;
+}
+
+// THE authority predicate: a chunk that may report solid at a point must be
+// diggable at that point. Collision (chunkContribution), digging (digAt) and
+// the spatial hash (gridReach) all read this one shape — a tile's field box,
+// an ellipsoid chunk's near-field ball — so "I carved it and still can't get
+// through" cannot come back. `extra` inflates it by a dig sphere radius.
+export function chunkCovers(
+  c: Chunk,
+  x: number,
+  y: number,
+  z: number,
+  extra = 0,
+): boolean {
+  if (c.body) return tileFieldCovers(c, x, y, z, extra);
+  const dx = x - c.center.x,
+    dy = y - c.center.y,
+    dz = z - c.center.z;
+  const reach = c.s * 1.4 + extra;
+  return dx * dx + dy * dy + dz * dz <= reach * reach;
 }
 
 // --- Chunk spatial hash (WG-21) ------------------------------------------------
@@ -3185,10 +3208,12 @@ function gridKey(cx: number, cy: number, cz: number): number {
 
 // Everything a chunk can influence: its near-field (chunkSdf reach), its
 // far-field estimate dropping below GRID_SAT, or a dig sphere touching it.
+// Buckets are per-axis boxes, so a body tile needs the worst-axis half-extent
+// of chunkCovers' box (|lo| = 1.05·s + cellW) plus the dig ball — derived, so
+// a new res cannot silently outgrow it.
 function gridReach(c: Chunk): number {
-  return c.body
-    ? c.s * 1.9 + DIG_PAD // covers the tile box diagonal AND the dig ball
-    : Math.max(c.s * 1.4, c.s * 0.85 + GRID_SAT, c.s * 1.35 + DIG_PAD);
+  if (c.body) return 1.05 * c.s + (2 * c.s) / c.res + DIG_PAD;
+  return Math.max(c.s * 0.85 + GRID_SAT, c.s * 1.4 + DIG_PAD);
 }
 
 function buildChunkGrid(): void {
@@ -3257,14 +3282,15 @@ function chunkContribution(
   const dc = Math.sqrt(dx * dx + dy * dy + dz * dz);
   if (c.body) {
     // Tile of a layer body: the tile's box owns its region (see
-    // tileFieldCovers) — outside it the tile must not contribute.
-    if (dc - c.s * 1.74 > best) return best;
-    if (!tileFieldCovers(c, x, y, z)) return best;
+    // tileFieldCovers) — outside it the tile must not contribute. No cheaper
+    // sphere pre-reject: one that clips the box corners would report solid
+    // where digAt (same predicate) cannot reach.
+    if (!chunkCovers(c, x, y, z)) return best;
     const d = chunkSdf(c, dx / c.s, dy / c.s, dz / c.s) * c.s;
     return d < best ? d : best;
   }
   if (dc - c.s > best) return best;
-  if (dc > c.s * 1.4) {
+  if (!chunkCovers(c, x, y, z)) {
     const d = dc - c.s * (R0 + 0.25);
     return d < best ? d : best;
   }

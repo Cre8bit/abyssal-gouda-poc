@@ -57,7 +57,11 @@ src/
 tools/               node-run (node 24 strips types natively)
   runner.ts            CDP screenshot runner
   test-protocol.ts     protocol unit tests (npm test)
+  test-clock.ts        shared-clock unit tests (npm test)
   test-recipes.ts      worldgen recipe-table sanity checks (npm test)
+  test-worldgen.ts     route verifier + world fingerprint (npm test)
+  test-collision.ts    collision == render: chunkCovers parity, dig-then-swim
+                       against a real node build (npm test)
 ```
 
 ## Conventions
