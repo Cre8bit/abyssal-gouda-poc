@@ -496,6 +496,18 @@ chunk. It stays solid, forever, with no geometry. Same for the
 
 ### Fix E
 
+> **Shipped** ([streamChunk()](../src/world/gouda.ts), `pumpStreaming()`): the
+> `.catch` now requeues instead of dropping, bounded at `STREAM_RETRIES = 2`
+> and then falling back to the synchronous main-thread `meshChunk` — a
+> poisoned chunk can neither vanish nor loop the pump. The rebuild case
+> (`worldGroup !== group`) deliberately does _not_ requeue: `disposeWorld`
+> already cleared `chunks`, so nothing is left to be solid and a requeue would
+> resurrect a dead chunk. The watchdog moved **above** the
+> `streamBusy >= maxBusy` bail-out (a starved pump is precisely how a near
+> chunk lingers) and warns once per chunk, so it cannot spam at 4 Hz.
+
+Sketch as audited:
+
 ```diff
 -    .catch((err) => console.warn("gouda: streamed meshing failed", err))
 +    .catch((err) => {

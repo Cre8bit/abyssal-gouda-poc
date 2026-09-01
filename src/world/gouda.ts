@@ -825,6 +825,19 @@ function chunkReach(c: Chunk): number {
   return c.body ? c.s * 1.75 : c.s * 1.4;
 }
 
+// A chunk that never meshes is an invisible solid, forever: chunkSdf collides
+// whether or not triangles exist. So a lost stream job is a permanent phantom
+// wall — retry it through the pool, then mesh it on the main thread rather
+// than drop it (a poisoned chunk must not loop the pump either).
+const STREAM_RETRIES = 2;
+const streamFails = new Map<Chunk, number>();
+
+function mountStreamed(c: Chunk, group: THREE.Group, mesh: THREE.Mesh): void {
+  mesh.userData.reach = chunkReach(c);
+  mesh.userData.zone = c.zone;
+  group.add(mesh);
+}
+
 function streamChunk(c: Chunk): void {
   const group = worldGroup; // guards against a rebuild landing mid-flight
   streamBusy++;
@@ -832,11 +845,13 @@ function streamChunk(c: Chunk): void {
   submitMeshJob(c, null, true, () => (digsAtDispatch = c.digs.length))
     .then((r) => {
       if (worldGroup !== group || !group || c.mesh) return;
+      streamFails.delete(c);
       c.field = r.field;
-      const mesh = mountChunkMesh(c, r, zoneMaterialsLive[c.zone!]!);
-      mesh.userData.reach = chunkReach(c);
-      mesh.userData.zone = c.zone;
-      group.add(mesh);
+      mountStreamed(
+        c,
+        group,
+        mountChunkMesh(c, r, zoneMaterialsLive[c.zone!]!),
+      );
       // Digs that landed after dispatch aren't in this field — bake + swap.
       if (c.digs.length > digsAtDispatch) {
         for (let i = digsAtDispatch; i < c.digs.length; i++)
@@ -844,7 +859,35 @@ function streamChunk(c: Chunk): void {
         scheduleRemesh(c);
       }
     })
-    .catch((err) => console.warn("gouda: streamed meshing failed", err))
+    .catch((err) => {
+      // A rebuild landed: disposeWorld already dropped the chunk, so there is
+      // nothing left to be solid. Requeueing here would resurrect a dead one.
+      if (worldGroup !== group || !group || c.mesh) return;
+      const fails = (streamFails.get(c) ?? 0) + 1;
+      streamFails.set(c, fails);
+      if (fails <= STREAM_RETRIES) {
+        console.warn(
+          `gouda: streamed meshing failed (${fails}/${STREAM_RETRIES}), requeueing`,
+          err,
+        );
+        unmeshed.push(c);
+        return;
+      }
+      console.warn(
+        "gouda: streamed meshing keeps failing, meshing on main",
+        err,
+      );
+      streamFails.delete(c);
+      try {
+        mountStreamed(c, group, meshChunk(c, zoneMaterialsLive[c.zone!]!));
+      } catch (err2) {
+        // Out of options: the chunk stays a solid with no geometry. Say so.
+        console.error(
+          "gouda: chunk cannot be meshed — invisible collider",
+          err2,
+        );
+      }
+    })
     .finally(() => {
       streamBusy--;
     });
@@ -852,17 +895,33 @@ function streamChunk(c: Chunk): void {
 
 // 4 Hz (piggybacks on the cull tick): submit the nearest unmeshed chunks in
 // reach, keeping the pool about twice-covered so results keep landing.
+const STREAM_WARN_DIST = 40;
+const streamWarned = new Set<Chunk>();
+
 function pumpStreaming(cameraPos: THREE.Vector3): void {
   if (!unmeshed.length || !worldGroup) return;
   const pool = getMeshPool();
   if (!pool) return;
-  const maxBusy = pool.length * 2;
-  if (streamBusy >= maxBusy) return;
   unmeshed.sort(
     (a, b) =>
       a.center.distanceToSquared(cameraPos) -
       b.center.distanceToSquared(cameraPos),
   );
+  // Loud, once per chunk — and before the busy bail-out, because a starved
+  // pump is exactly how a near chunk lingers: an unmeshed chunk this close is
+  // a collider the player can walk into and cannot see.
+  const near = unmeshed[0];
+  if (
+    near.center.distanceTo(cameraPos) - chunkReach(near) < STREAM_WARN_DIST &&
+    !streamWarned.has(near)
+  ) {
+    streamWarned.add(near);
+    console.warn(
+      `gouda: unmeshed chunk inside ${STREAM_WARN_DIST} u — invisible collider`,
+      near.center,
+    );
+  }
+  const maxBusy = pool.length * 2;
   while (streamBusy < maxBusy && unmeshed.length) {
     const c = unmeshed[0];
     if (c.center.distanceTo(cameraPos) - chunkReach(c) > MESH_AHEAD) break;
@@ -3103,6 +3162,8 @@ export function disposeWorld(scene: THREE.Scene): void {
   hasSpin = false;
   chunkGrid = null;
   unmeshed = [];
+  streamFails.clear();
+  streamWarned.clear();
   zoneMaterialsLive = {};
   remeshInFlight.clear();
   remeshDirty.clear();
