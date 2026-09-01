@@ -33,8 +33,8 @@ export interface SphereDig {
 export interface DebugState {
   mode: boolean;
   freeCam: boolean;
-  softSpots: boolean; // L key — hull soft-spot markers (drillable walls)
-  softSpotIdx: number; // which spot the next Shift+L teleport lands on
+  routeMarkers: boolean; // L key — soft spots + the melt-shell entrance
+  routeIdx: number; // which of those the next Shift+L teleport lands on
 }
 
 export interface GameState {
@@ -52,7 +52,7 @@ export interface GameState {
   flashlightOn: boolean;
   digTool: DigTool; // "driller" iff drillerSystem says you're holding it
   debug: DebugState;
-  mapWireframe: boolean; // M key — overlay only, survives independent of debug.mode
+  mapWireframe: boolean; // [I] key — overlay only, survives independent of debug.mode
 
   // Session roles.
   hostedId: string | null; // our shareable id when we are the host
@@ -76,7 +76,7 @@ export const game: GameState = {
   spawnPoint: { ...DEFAULT_SPAWN },
   flashlightOn: true,
   digTool: "hands",
-  debug: { mode: false, freeCam: false, softSpots: false, softSpotIdx: 0 },
+  debug: { mode: false, freeCam: false, routeMarkers: false, routeIdx: 0 },
   mapWireframe: false,
   hostedId: null,
   fishAuthority: true,

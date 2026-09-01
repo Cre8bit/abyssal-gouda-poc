@@ -223,8 +223,9 @@ let worldProps: SeededProp[] = [];
 let hasSpin = false; // any rotating chunk in the built world (skip the frame loop otherwise)
 let wireframeOn = false; // debug overlay (M key, main.ts) — superposed, not a material swap
 let wireMaterial: THREE.LineBasicMaterial | null = null;
-let softSpotsOn = false; // debug soft-spot markers (L key, main.ts)
-let softSpotGroup: THREE.Group | null = null;
+let worldEntrance: EntranceSpec | null = null;
+let routeMarkersOn = false; // debug route markers (L key, main.ts)
+let routeMarkerGroup: THREE.Group | null = null;
 
 const uGoudaTime = { value: 0 };
 
@@ -1371,12 +1372,21 @@ function createBlastMarkers(parent: THREE.Group): void {
   }
 }
 
-// DEBUG soft-spot markers (L key, main.ts): a wire ball at each drillable
-// hull bulge, plus a depth-test-free beacon sprite so the target is findable
-// from across the map, through the cheese.
-function createSoftSpotMarkers(parent: THREE.Group): void {
+const ENTRANCE_COLOR = 0x34e5e5; // shared with the bench map view
+const ENTRANCE_BEACON = 8; // sprite scale — reads from across the veins
+const WRECK_COLOR = 0x9ca3af; // shared with the bench map view
+const WRECK_BEACON = 6; // sprite scale — the wreck is smaller than a soft spot
+const WRECK_MARK_R = 3; // wire ball radius — the wreck has no radius of its own
+
+// DEBUG route markers (L key, main.ts): the two ways through the seals plus
+// the tool that opens them — a green wire ball at each drillable hull bulge,
+// the melt shell's hidden entrance in cyan, and the drift wreck where the
+// driller is seeded in grey (the same colours the worldgen bench paints them).
+// Each gets a depth-test-free beacon sprite, so the target is findable from
+// across the map, through the cheese.
+function createRouteMarkers(parent: THREE.Group): void {
   const group = new THREE.Group();
-  group.visible = softSpotsOn;
+  group.visible = routeMarkersOn;
   const shell = new THREE.MeshBasicMaterial({
     color: 0x7cff5a,
     wireframe: true,
@@ -1409,13 +1419,95 @@ function createSoftSpotMarkers(parent: THREE.Group): void {
       group.add(sprite);
     }
   }
-  softSpotGroup = group;
+  if (worldEntrance) {
+    const e = worldEntrance;
+    const shellE = new THREE.MeshBasicMaterial({
+      color: ENTRANCE_COLOR,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.5,
+      depthWrite: false,
+    });
+    const ball = new THREE.Mesh(new THREE.SphereGeometry(e.r, 16, 12), shellE);
+    ball.position.set(e.surface.x, e.surface.y, e.surface.z);
+    ball.raycast = () => {};
+    group.add(ball);
+    // The bore axis, mouth to inner end: which way to swim once you found it.
+    const bore = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([
+        new THREE.Vector3(e.mouth.x, e.mouth.y, e.mouth.z),
+        new THREE.Vector3(e.inner.x, e.inner.y, e.inner.z),
+      ]),
+      new THREE.LineBasicMaterial({
+        color: ENTRANCE_COLOR,
+        transparent: true,
+        opacity: 0.8,
+        depthWrite: false,
+        depthTest: false,
+      }),
+    );
+    bore.renderOrder = 999;
+    group.add(bore);
+    if (tex) {
+      const sprite = new THREE.Sprite(
+        new THREE.SpriteMaterial({
+          map: tex,
+          color: ENTRANCE_COLOR,
+          transparent: true,
+          opacity: 0.85,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          depthTest: false,
+        }),
+      );
+      sprite.position.set(e.mouth.x, e.mouth.y, e.mouth.z);
+      sprite.scale.setScalar(ENTRANCE_BEACON); // fixed: the bore is far thinner than a soft spot
+      sprite.renderOrder = 999;
+      group.add(sprite);
+    }
+  }
+  // The drift wreck: where the driller starts the run (M3.1, drillerSystem).
+  const wreck = worldProps.find((p) => p.kind === "wreck");
+  if (wreck) {
+    const shellW = new THREE.MeshBasicMaterial({
+      color: WRECK_COLOR,
+      wireframe: true,
+      transparent: true,
+      opacity: 0.5,
+      depthWrite: false,
+    });
+    const ball = new THREE.Mesh(
+      new THREE.SphereGeometry(WRECK_MARK_R, 16, 12),
+      shellW,
+    );
+    ball.position.set(wreck.pos.x, wreck.pos.y, wreck.pos.z);
+    ball.raycast = () => {};
+    group.add(ball);
+    if (tex) {
+      const sprite = new THREE.Sprite(
+        new THREE.SpriteMaterial({
+          map: tex,
+          color: WRECK_COLOR,
+          transparent: true,
+          opacity: 0.85,
+          blending: THREE.AdditiveBlending,
+          depthWrite: false,
+          depthTest: false,
+        }),
+      );
+      sprite.position.set(wreck.pos.x, wreck.pos.y, wreck.pos.z);
+      sprite.scale.setScalar(WRECK_BEACON);
+      sprite.renderOrder = 999;
+      group.add(sprite);
+    }
+  }
+  routeMarkerGroup = group;
   parent.add(group);
 }
 
-export function setSoftSpotMarkers(on: boolean): void {
-  softSpotsOn = on;
-  if (softSpotGroup) softSpotGroup.visible = on;
+export function setRouteMarkers(on: boolean): void {
+  routeMarkersOn = on;
+  if (routeMarkerGroup) routeMarkerGroup.visible = on;
 }
 
 // Nearest open water outside a soft spot — where a debug teleport should
@@ -1431,6 +1523,28 @@ export function softSpotApproach(s: SoftSpot): Vec3 {
     if (worldDistance(p.x, p.y, p.z) > 2) return p;
   }
   return { x: s.x + nx * d, y: s.y + ny * d, z: s.z + nz * d };
+}
+
+// Open water off the entrance mouth — where a debug teleport should land,
+// facing the bore. The mouth itself sits 6 u off the husk but a vein chunk
+// can still be parked on it, so step further out along the same axis.
+export function entranceApproach(e: EntranceSpec): Vec3 {
+  const ax = e.mouth.x - e.surface.x,
+    ay = e.mouth.y - e.surface.y,
+    az = e.mouth.z - e.surface.z;
+  const len = Math.hypot(ax, ay, az) || 1;
+  const nx = ax / len,
+    ny = ay / len,
+    nz = az / len;
+  for (let d = 0; d < 60; d += 1.5) {
+    const p = {
+      x: e.mouth.x + nx * d,
+      y: e.mouth.y + ny * d,
+      z: e.mouth.z + nz * d,
+    };
+    if (worldDistance(p.x, p.y, p.z) > 2) return p;
+  }
+  return { x: e.mouth.x, y: e.mouth.y, z: e.mouth.z };
 }
 
 // --- Per-frame updates ------------------------------------------------------------------------
@@ -3027,6 +3141,7 @@ export async function buildGoudaWorld(
   worldSpine = data.plan.spine;
   worldSoftSpots = data.plan.softSpots;
   worldProps = data.plan.props;
+  worldEntrance = data.plan.entrance;
   hasSpin = data.chunks.some((c) => c.spin);
   blastPoints.push(...data.blastPoints);
   const total = specs.length + 1;
@@ -3119,7 +3234,7 @@ export async function buildGoudaWorld(
   // Wheel is an item (game/items.ts), world only seeds position.
   createBoundarySphere(extrasGroup, world.boundaryR);
   createBlastMarkers(extrasGroup);
-  createSoftSpotMarkers(extrasGroup);
+  createRouteMarkers(extrasGroup);
   scene.add(extrasGroup);
 
   spawnPoint = new THREE.Vector3(
@@ -3159,6 +3274,7 @@ export function disposeWorld(scene: THREE.Scene): void {
   worldSpine = [];
   worldSoftSpots = [];
   worldProps = [];
+  worldEntrance = null;
   hasSpin = false;
   chunkGrid = null;
   unmeshed = [];
@@ -3169,7 +3285,7 @@ export function disposeWorld(scene: THREE.Scene): void {
   remeshDirty.clear();
   wireframeOn = false;
   wireMaterial = null;
-  softSpotGroup = null;
+  routeMarkerGroup = null;
 }
 
 // Seeded gold position; read once at world build.
@@ -3193,6 +3309,12 @@ export function getSpinePoints(): SpinePoint[] {
 
 export function getSoftSpots(): SoftSpot[] {
   return worldSoftSpots;
+}
+
+// The melt shell's hidden bore (WG-08) — the terminus the dark veins' sight-
+// line trail leads to. Null for worlds whose hull has no entrance.
+export function getEntrance(): EntranceSpec | null {
+  return worldEntrance;
 }
 
 // Seeded prop positions of the built world (WG-11) — air pockets, melt

@@ -41,16 +41,24 @@
       <div id="carry-prompt"></div>
       <div id="event-center"></div>
       <!-- TESTER-ONLY debug aid: jumps straight to the Golden Gouda,
-           bypassing the search entirely (register D4). Remove before
-           shipping — see teleportToGouda() in main.ts. -->
-      <button id="tp-gouda-btn" title="Debug: teleport to the Golden Gouda">
-        🧀 TP to Gouda
+           bypassing the search entirely (register D4). DEBUG-ONLY (O key
+           toggles it) — remove before shipping,
+           see teleportToGouda() in main.ts. -->
+      <button
+        id="tp-gouda-btn"
+        class="hidden"
+        title="Debug: teleport to the Golden Gouda ([K])"
+      >
+        🧀 TP to Gouda [K]
       </button>
       <!-- DEBUG-ONLY (O key toggles) -->
       <div id="debug-panel" class="hidden">
         <div id="debug-coords"></div>
         <div id="debug-hint">
-          [P] teleport · [N] freecam · [I] wireframe · [L] soft spots ·
+          [P] teleport<br />
+          [N] freecam<br />
+          [I] wireframe<br />
+          [L] soft spots + melt entrance + driller<br />
           [Shift+L] hop to one
         </div>
       </div>

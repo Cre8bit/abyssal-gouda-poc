@@ -45,9 +45,12 @@ import {
   chunkLocalToWorld,
   raycastSolid,
   setWireframeOverlay,
-  setSoftSpotMarkers,
+  setRouteMarkers,
   softSpotApproach,
+  entranceApproach,
   getSoftSpots,
+  getEntrance,
+  getSeededProps,
   WORLD_R,
 } from "./world/gouda.ts";
 import {
@@ -306,7 +309,8 @@ async function buildWorld(rebuild = false) {
   loaderEl.classList.add("done");
   // Debug wireframe preference survives a rebuild; the overlay itself doesn't.
   if (game.mapWireframe) setWireframeOverlay(true);
-  logSoftSpots();
+  if (game.debug.routeMarkers) setRouteMarkers(true);
+  logRouteTargets();
 
   // Spawn catfish (host simulates, joiners get puppets).
   catfishSys.spawn(game.difficulty);
@@ -456,6 +460,8 @@ window.addEventListener("keydown", (e) => {
     game.debug.mode = !game.debug.mode;
     if (!game.debug.mode) game.debug.freeCam = false;
     debugPanel.classList.toggle("hidden", !game.debug.mode);
+    // The TP-to-Gouda aid rides along with the panel: debug-mode only.
+    tpGoudaBtn.classList.toggle("hidden", !game.debug.mode);
     playClick();
     showEvent(
       game.debug.mode
@@ -470,6 +476,9 @@ window.addEventListener("keydown", (e) => {
     showEvent(
       game.mapWireframe ? "🕸 [DEBUG] Wireframe ON" : "🕸 [DEBUG] Wireframe OFF",
     );
+  } else if (e.code === "KeyK" && game.debug.mode) {
+    // DEBUG: same jump as the TP-to-Gouda button.
+    teleportToGouda();
   } else if (e.code === "KeyN" && game.debug.mode) {
     // DEBUG: noclip flight, debug-mode only.
     game.debug.freeCam = !game.debug.freeCam;
@@ -492,55 +501,94 @@ window.addEventListener("keydown", (e) => {
     playWhoosh();
     showEvent(`🐞 [DEBUG] Teleported to ${parts.join(", ")}`);
   } else if (e.code === "KeyL" && game.debug.mode) {
-    // DEBUG: hull soft spots — Shift+L hops to the next one, L toggles the
+    // DEBUG: the two ways through the seals — hull soft spots and the melt
+    // shell's hidden entrance. Shift+L hops to the next one, L toggles the
     // markers (and re-prints the coordinate list).
     if (e.shiftKey) {
-      teleportToSoftSpot();
+      teleportToRouteTarget();
       return;
     }
-    game.debug.softSpots = !game.debug.softSpots;
-    setSoftSpotMarkers(game.debug.softSpots);
+    game.debug.routeMarkers = !game.debug.routeMarkers;
+    setRouteMarkers(game.debug.routeMarkers);
     playClick();
-    logSoftSpots();
+    logRouteTargets();
     showEvent(
-      game.debug.softSpots
-        ? "🕳 [DEBUG] Soft-spot markers ON — Shift+L to hop there"
-        : "🕳 [DEBUG] Soft-spot markers OFF",
+      game.debug.routeMarkers
+        ? "🕳 [DEBUG] Route markers ON — Shift+L to hop there"
+        : "🕳 [DEBUG] Route markers OFF",
     );
   }
 });
 
-// DEBUG: the drillable hull bulges, printed with a teleport-ready approach
-// point (paste into the P prompt) beside the spot itself.
-function logSoftSpots(): void {
-  const spots = getSoftSpots();
-  if (!spots.length) {
-    console.log("soft spots: none in this world");
+// DEBUG (L): every seal breach of the built world in one list — the drillable
+// hull bulges, then the melt shell's hidden entrance (the terminus the dark
+// veins lead to), then the driller itself (no breach without it). Each carries
+// the point itself, a teleport-ready approach point in open water, and the
+// label the HUD/console print.
+interface RouteTarget {
+  label: string;
+  pos: Vec3;
+  approach: Vec3;
+  note: string;
+}
+
+function routeTargets(): RouteTarget[] {
+  const targets: RouteTarget[] = getSoftSpots().map((s, i) => ({
+    label: `soft spot #${i}`,
+    pos: { x: s.x, y: s.y, z: s.z },
+    approach: softSpotApproach(s),
+    note: `r ${s.r.toFixed(1)}`,
+  }));
+  const e = getEntrance();
+  if (e)
+    targets.push({
+      label: "melt-shell entrance",
+      pos: e.surface,
+      approach: entranceApproach(e),
+      note: `bore r ${e.r.toFixed(1)}`,
+    });
+  // The driller's seeded home is the drift wreck; once anyone has touched it
+  // the live item is the honest answer (same rule as teleportToGouda).
+  const wreck = getSeededProps().find((p) => p.kind === "wreck");
+  const driller = getItem("driller");
+  const drillerPos = driller ?? wreck?.pos;
+  if (drillerPos)
+    targets.push({
+      label: "driller",
+      pos: { x: drillerPos.x, y: drillerPos.y, z: drillerPos.z },
+      approach: findOpenSpot(drillerPos, 1.5, 2.8),
+      note: driller ? "live" : "wreck spawn",
+    });
+  return targets;
+}
+
+function logRouteTargets(): void {
+  const targets = routeTargets();
+  if (!targets.length) {
+    console.log("route targets: none in this world");
     return;
   }
   const f = (n: number) => n.toFixed(1);
-  console.log(`soft spots (seed ${game.seed}): ${spots.length}`);
-  spots.forEach((s, i) => {
-    const a = softSpotApproach(s);
+  console.log(`route targets (seed ${game.seed}): ${targets.length}`);
+  for (const t of targets)
     console.log(
-      `  #${i} r ${f(s.r)} at ${f(s.x)}, ${f(s.y)}, ${f(s.z)} — ` +
-        `TP outside: ${f(a.x)}, ${f(a.y)}, ${f(a.z)}`,
+      `  ${t.label} ${t.note} at ${f(t.pos.x)}, ${f(t.pos.y)}, ${f(t.pos.z)} — ` +
+        `TP outside: ${f(t.approach.x)}, ${f(t.approach.y)}, ${f(t.approach.z)}`,
     );
-  });
 }
 
-function teleportToSoftSpot(): void {
-  const spots = getSoftSpots();
-  if (!spots.length) {
-    showEvent("🕳 [DEBUG] No soft spots in this world.");
+function teleportToRouteTarget(): void {
+  const targets = routeTargets();
+  if (!targets.length) {
+    showEvent("🕳 [DEBUG] No soft spots or entrance in this world.");
     return;
   }
-  const i = game.debug.softSpotIdx % spots.length;
-  game.debug.softSpotIdx = (i + 1) % spots.length;
-  const a = softSpotApproach(spots[i]);
-  teleportLocal(a.x, a.y, a.z);
+  const i = game.debug.routeIdx % targets.length;
+  game.debug.routeIdx = (i + 1) % targets.length;
+  const t = targets[i];
+  teleportLocal(t.approach.x, t.approach.y, t.approach.z);
   playWhoosh();
-  showEvent(`🕳 [DEBUG] Teleported to soft spot #${i}`);
+  showEvent(`🕳 [DEBUG] Teleported to ${t.label}`);
 }
 
 // Replayed/remote digs go through the same hardness gate as local ones —
