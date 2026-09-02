@@ -25,12 +25,18 @@ import {
   createDiverRig,
   updateDiverRig,
   applyArmPoseSides,
+  blendArmPose,
   fpBodyPitch,
   configureFpBody,
+  gripPlacements,
   holdAnchor,
+  solveHeldAnchor,
+  PHASE_EASE,
+  PHASE_EASE_DEFAULT,
   type ArmPose,
   type CarryKind,
   type DiverRig,
+  type GripKind,
 } from "../entities/diverRig.ts";
 import { prepareCatfishTemplate } from "../entities/catfish.ts";
 import { toonMaterial } from "../render/toon.ts";
@@ -45,6 +51,11 @@ import {
   prepareDrillerTemplate,
   DRILLER_LENGTH,
 } from "../entities/driller.ts";
+import {
+  createLightStickVisual,
+  prepareLightStickTemplate,
+  LIGHT_STICK_LENGTH,
+} from "../entities/lightStick.ts";
 import { CARGO, holdPose } from "../game/cargo.ts";
 import { applyFpBodyParams } from "./shots.ts";
 import { button, markOn, section, sliderRow } from "./ui.ts";
@@ -109,10 +120,42 @@ const BONE_UP = new THREE.Vector3(0, 1, 0);
 const ORIGIN = new THREE.Vector3();
 
 // The hold cycle both diver entries share: nothing → the wheel → the tool.
-const CARRY_CYCLE: CarryKind[] = ["none", "gouda", "driller"];
+const CARRY_CYCLE: CarryKind[] = ["none", "gouda", "driller", "lightStick"];
 const nextCarry = (c: CarryKind) =>
   CARRY_CYCLE[(CARRY_CYCLE.indexOf(c) + 1) % CARRY_CYCLE.length];
-// Deep link: ?hold=gouda|driller opens with something already in the paws.
+// The light stick's throw, as a bench-side driver: name the phase each frame
+// and diverRig blends between its authored states. This is the shape a game
+// system will have — a timeline of [state, seconds], nothing more.
+const THROW_SEQ: [string, number][] = [
+  ["grab", 0.45],
+  ["hold", 0.9],
+  ["throw", 0.55],
+];
+function makeThrow() {
+  let step = -1; // -1 = idle, resting in "hold"
+  let timer = 0;
+  return {
+    start() {
+      step = 0;
+      timer = 0;
+    },
+    get running() {
+      return step >= 0;
+    },
+    phase(dt: number): string {
+      if (step < 0) return "hold";
+      timer += dt;
+      if (timer >= THROW_SEQ[step][1]) {
+        timer = 0;
+        step += 1;
+        if (step >= THROW_SEQ.length) step = -1;
+      }
+      return step < 0 ? "hold" : THROW_SEQ[step][0];
+    },
+  };
+}
+
+// Deep link: ?hold=gouda|driller|lightStick opens with something in the paws.
 const startCarry = ((): CarryKind => {
   const p = new URLSearchParams(location.search).get("hold") as CarryKind;
   return CARRY_CYCLE.includes(p) ? p : "none";
@@ -242,6 +285,11 @@ function buildDiver(gltf: GLTF): BenchInstance {
   const driller = createDrillerVisual();
   driller.group.visible = false;
   holdAnchor(rig, "driller")?.add(driller.group);
+  // …and so does the light stick, through its own grip's paw anchor.
+  const stick = createLightStickVisual();
+  stick.group.visible = false;
+  holdAnchor(rig, "lightStick")?.add(stick.group);
+  const thrower = makeThrow();
   const R = 7; // swim circle radius
 
   let modeBtns: Record<string, HTMLButtonElement> = {};
@@ -298,11 +346,14 @@ function buildDiver(gltf: GLTF): BenchInstance {
         lookPitch,
         vel,
         carry: st.carry,
+        carryPhase: thrower.phase(dt),
       });
       // Cargo at game/cargo.ts position — test carry pose
       cargo.visible = st.carry === "gouda";
       driller.group.visible = st.carry === "driller";
       driller.update(t, true);
+      stick.group.visible = st.carry === "lightStick";
+      stick.update(t, true);
       holdPose(ORIGIN, st.yaw, lookPitch, _hold);
       cargo.position.set(_hold.x, _hold.y, _hold.z).add(swim.position);
 
@@ -335,6 +386,12 @@ function buildDiver(gltf: GLTF): BenchInstance {
         b.classList.toggle("on", st.carry !== "none");
       });
       carryBtn.textContent = `hold: ${st.carry}`;
+      button(modes, "throw stick", () => {
+        st.carry = "lightStick";
+        carryBtn.textContent = "hold: lightStick";
+        carryBtn.classList.add("on");
+        thrower.start();
+      });
 
       // Slider touch → manual mode (stop and look)
       const hold = section(panel, "Hold (manual)").parentElement!;
@@ -442,6 +499,10 @@ function buildGloves(gltf: GLTF): BenchInstance {
   const driller = createDrillerVisual();
   driller.group.visible = false;
   holdAnchor(rig, "driller")?.add(driller.group);
+  const stick = createLightStickVisual();
+  stick.group.visible = false;
+  holdAnchor(rig, "lightStick")?.add(stick.group);
+  const thrower = makeThrow();
 
   // Joint camera-space positions: shoulder (cut), wrist (frame edge)
   const shoulder = rig.bones.get("R_Upperarm");
@@ -485,10 +546,13 @@ function buildGloves(gltf: GLTF): BenchInstance {
         lookPitch: st.pitch,
         vel,
         carry: st.carry,
+        carryPhase: thrower.phase(dt),
       });
       cargo.visible = st.carry === "gouda";
       driller.group.visible = st.carry === "driller";
       driller.update(t, true);
+      stick.group.visible = st.carry === "lightStick";
+      stick.update(t, true);
       // Eye cam: follow-lerp chases look target, not rig
       if (st.eyeCam) focus.set(0, Math.tan(-st.pitch) * 4, -4);
       else focus.set(0, -0.3, -0.6);
@@ -515,6 +579,12 @@ function buildGloves(gltf: GLTF): BenchInstance {
         b.classList.toggle("on", st.carry !== "none");
       });
       carryBtn.textContent = `hold: ${st.carry}`;
+      button(cams, "throw stick", () => {
+        st.carry = "lightStick";
+        carryBtn.textContent = "hold: lightStick";
+        carryBtn.classList.add("on");
+        thrower.start();
+      });
       const hold = section(panel, "Pose").parentElement!;
       sliderRow(hold, "look pitch", -1.2, 1.2, 0.01, 0, (v) => {
         st.pitch = v;
@@ -1076,41 +1146,139 @@ function buildArmJoints(rig: DiverRig): ArmJoint[] {
   return joints;
 }
 
-// --- Mode: driller hold-pose editor -------------------------------------------
-// Author a held-tool pose by hand: per-side ArmPose sliders lock the diver's
-// arms (applyArmPoseSides overrides whatever updateDiverRig's swim blend
-// just wrote), a "mirror L/R" toggle collapses them to one symmetric set
-// when arms don't need to differ, a "gizmo select" mode lets any of the 6
-// posable joints be grabbed straight off the model with a rotate handle
-// instead of hunting sliders, and 6 more sliders place the tool in the
-// diver's own root frame. Generic by construction — swap createDrillerVisual
-// for any other held prop (gouda, light stick) and the same rig +
-// tool-transform sliders still apply.
-function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
+// --- Mode: the held-prop pose editor ------------------------------------------
+// Author what a diver's arms do around a prop, by hand, against the real rig.
+// One editor serves every held prop: hand it a prop factory and the grip it
+// belongs to, and it opens ON THE POSE THAT ALREADY SHIPS (diverRig's
+// gripPlacements()) — a pose editor that started from a T-pose would show none
+// of the work already done. Per-side ArmPose sliders lock the arms
+// (applyArmPoseSides overrides whatever updateDiverRig's swim blend just
+// wrote), a "mirror L/R" toggle collapses them to one symmetric set when the
+// arms don't need to differ, "gizmo select" grabs any of the 6 posable joints
+// — or the prop — straight off the model with a handle instead of hunting
+// sliders, and 6 more sliders place the prop in the diver's own root frame.
+//
+// Grips with several named STATES (the light stick's belt grab → hold →
+// throw) get one tab per state, a "snap to paw" that drops the prop into the
+// hand wherever this state's arm just put it, and a "play" button that walks
+// the states in sequence through the same smoothstep blend updateDiverRig
+// runs — prop riding the paw anchor exactly as it does in game, so what plays
+// here is the animation that ships.
+interface ToolXf {
+  px: number;
+  py: number;
+  pz: number;
+  rx: number;
+  ry: number;
+  rz: number;
+}
+
+interface EditorState {
+  key: string;
+  label: string;
+  L: ArmPose;
+  R: ArmPose;
+  tool: ToolXf;
+  /** What diverRig ships for this state — the "shipped" reset. */
+  shipped: { L: ArmPose; R: ArmPose; tool: ToolXf };
+  /** This state's placement in the paw's frame, re-solved when it's edited. */
+  anchor: THREE.Object3D;
+}
+
+interface PoseEditorSpec {
+  id: string; // MODELS id — the DOM listeners below check it
+  kind: GripKind; // which grip's placements to open on
+  makeProp(): { group: THREE.Group; update(t: number, held: boolean): void };
+  open?: string; // state to open on (default: the first)
+  /** [state key, seconds to dwell] — the loop "play" walks. */
+  play?: [string, number][];
+  /** A state whose placement is a fixture on the body: ghost the prop there. */
+  ghost?: string;
+}
+
+const zeroPose = (): ArmPose => ({
+  uy: 0,
+  ux: 0,
+  fy: 0,
+  fx: 0,
+  fz: 0,
+  hx: 0,
+  hy: 0,
+  hz: 0,
+});
+
+const _xfP = new THREE.Vector3();
+const _xfQ = new THREE.Quaternion();
+const _xfS = new THREE.Vector3();
+const _xfE = new THREE.Euler();
+const _xfM = new THREE.Matrix4();
+
+function toolXfFrom(m: THREE.Matrix4 | null): ToolXf {
+  if (!m) return { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0 };
+  m.decompose(_xfP, _xfQ, _xfS);
+  _xfE.setFromQuaternion(_xfQ);
+  return { px: _xfP.x, py: _xfP.y, pz: _xfP.z, rx: _xfE.x, ry: _xfE.y, rz: _xfE.z }; // prettier-ignore
+}
+function toolMatrix(t: ToolXf, out: THREE.Matrix4): THREE.Matrix4 {
+  return out.compose(
+    _xfP.set(t.px, t.py, t.pz),
+    _xfQ.setFromEuler(_xfE.set(t.rx, t.ry, t.rz)),
+    _xfS.set(1, 1, 1),
+  );
+}
+const sameArmPose = (a: ArmPose, b: ArmPose) =>
+  (Object.keys(a) as (keyof ArmPose)[]).every(
+    (k) => Math.abs(a[k] - b[k]) < 1e-9,
+  );
+
+function buildPoseEditor(gltf: GLTF, spec: PoseEditorSpec): BenchInstance {
   const template = diverTemplateFrom(gltf);
   const rig = createDiverRig(template);
-  const driller = createDrillerVisual();
-  rig.root.add(driller.group);
+  const prop = spec.makeProp();
+  rig.root.add(prop.group);
 
   const group = new THREE.Group();
   group.add(rig.root);
 
-  const zeroPose = (): ArmPose => ({
-    uy: 0,
-    ux: 0,
-    fy: 0,
-    fx: 0,
-    fz: 0,
-    hx: 0,
-    hy: 0,
-    hz: 0,
+  // Open on what ships. Every state carries its own copy AND the original,
+  // so "shipped" is a reset and not a reload of the page.
+  const states: EditorState[] = gripPlacements(spec.kind).map((p) => {
+    const tool = toolXfFrom(p.tool);
+    return {
+      key: p.key,
+      label: p.label,
+      L: { ...p.left },
+      R: { ...p.right },
+      tool,
+      shipped: { L: { ...p.left }, R: { ...p.right }, tool: { ...tool } },
+      anchor: new THREE.Object3D(),
+    };
   });
-  const poseL = zeroPose();
-  const poseR = zeroPose();
-  let mirror = true;
-  const tool = { px: 0, py: 0, pz: 0, rx: 0, ry: 0, rz: 0 };
+  const stateOf = (key: string) => states.find((s) => s.key === key);
+  let active = (spec.open && stateOf(spec.open)) || states[0];
+  // The shipped grips are asymmetric wherever a prop is held one-handed, so
+  // the mirror default follows what we opened on rather than forcing it.
+  let mirror = sameArmPose(active.L, active.R);
+
+  // The prop's live paw anchor — the same node holdAnchor() hangs a game prop
+  // from, driven here from the states being edited instead of the constants.
+  const live = new THREE.Object3D();
+  rig.bones.get("R_Hand")?.add(live);
+  let anchorsDirty = true;
+
+  // A second, dimmed prop pinned at the belt state, so the holster stays
+  // visible while the other states are being posed.
+  const ghost = spec.ghost ? spec.makeProp() : null;
+  let ghostDimmed = false;
+  if (ghost) {
+    ghost.group.visible = false;
+    rig.root.add(ghost.group);
+  }
+
   const vel = new THREE.Vector3();
-  let exportStr = '(click "Export Pose")';
+  const blendL = zeroPose();
+  const blendR = zeroPose();
+  let exportStr = '(click "Export")';
 
   const armJoints = buildArmJoints(rig);
   const toolMaterial = new THREE.MeshBasicMaterial({
@@ -1123,7 +1291,7 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
     toolMaterial,
   );
   toolMarker.visible = false;
-  driller.group.add(toolMarker);
+  prop.group.add(toolMarker);
   const toolJoint: ToolJoint = {
     kind: "tool",
     marker: toolMarker,
@@ -1144,6 +1312,14 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
   let hoveredMarker: THREE.Mesh | null = null;
   let constrainAxis: "x" | "y" | "z" | null = null;
 
+  // --- Playback of the state sequence ---------------------------------------
+  let playing = false;
+  let stepIdx = 0;
+  let from = active;
+  let to = active;
+  let phaseU = 1;
+  let dwell = 0;
+
   gizmo.addEventListener("dragging-changed", (e) => {
     dragging = !!e.value;
     controls.enabled = !dragging;
@@ -1153,19 +1329,16 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
   const refreshSliders = () => {
     for (const [key, handle] of sliderHandles) {
       const [side, field] = key.split(".") as ["L" | "R", keyof ArmPose];
-      handle.set((side === "L" ? poseL : poseR)[field]);
+      handle.set((side === "L" ? active.L : active.R)[field]);
     }
   };
-  const toolSliderHandles = new Map<
-    keyof typeof tool,
-    ReturnType<typeof sliderRow>
-  >();
+  const toolSliderHandles = new Map<keyof ToolXf, ReturnType<typeof sliderRow>>(); // prettier-ignore
   const refreshToolSliders = () => {
-    for (const [key, handle] of toolSliderHandles) handle.set(tool[key]);
+    for (const [key, handle] of toolSliderHandles) handle.set(active.tool[key]);
   };
 
   function syncProxyFromPose(j: ArmJoint) {
-    const p = j.side === "L" ? poseL : poseR;
+    const p = j.side === "L" ? active.L : active.R;
     j.proxy.quaternion
       .copy(j.base)
       .multiply(
@@ -1177,18 +1350,22 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
       j.base.clone().invert().multiply(j.proxy.quaternion),
       ARM_JOINT_ORDER[j.kind],
     );
-    const mine = j.side === "L" ? poseL : poseR;
+    const mine = j.side === "L" ? active.L : active.R;
     jointWritePose(j.kind, j.side, e, mine);
-    if (mirror) jointCopyFields(j.kind, mine, j.side === "L" ? poseR : poseL);
+    if (mirror) {
+      jointCopyFields(j.kind, mine, j.side === "L" ? active.R : active.L);
+    }
+    anchorsDirty = true;
     refreshSliders();
   }
   function syncToolFromGizmo() {
-    tool.px = driller.group.position.x;
-    tool.py = driller.group.position.y;
-    tool.pz = driller.group.position.z;
-    tool.rx = driller.group.rotation.x;
-    tool.ry = driller.group.rotation.y;
-    tool.rz = driller.group.rotation.z;
+    active.tool.px = prop.group.position.x;
+    active.tool.py = prop.group.position.y;
+    active.tool.pz = prop.group.position.z;
+    active.tool.rx = prop.group.rotation.x;
+    active.tool.ry = prop.group.rotation.y;
+    active.tool.rz = prop.group.rotation.z;
+    anchorsDirty = true;
     refreshToolSliders();
   }
   function setToolMode(m: "translate" | "rotate") {
@@ -1199,9 +1376,7 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
     if (selected) {
       selected.material.color.setHex(targetColor(selected));
       // Reset marker scale when deselecting (unless still hovered)
-      if (selected.marker !== hoveredMarker) {
-        selected.marker.scale.setScalar(1);
-      }
+      if (selected.marker !== hoveredMarker) selected.marker.scale.setScalar(1);
     }
     selected = t;
     constrainAxis = null; // Reset axis constraint when switching targets
@@ -1214,7 +1389,7 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
       gizmo.setSpace("world");
       gizmo.showX = gizmo.showY = gizmo.showZ = true;
       gizmo.setMode(toolMode);
-      gizmo.attach(driller.group);
+      gizmo.attach(prop.group);
     } else {
       syncProxyFromPose(t);
       gizmo.setSpace("local");
@@ -1226,19 +1401,91 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
     t.material.color.setHex(TARGET_SELECTED);
   }
 
+  // Drop the prop into the paw at this state's arm pose — position AND
+  // orientation, i.e. straight into the hand bone's own frame, which is the
+  // starting point every grip is a rotation away from.
+  function snapToPaw() {
+    const hand = rig.bones.get("R_Hand");
+    if (!hand) return;
+    applyArmPoseSides(rig, active.L, active.R);
+    rig.root.updateMatrixWorld(true);
+    // A prop transform is read in the rig-root frame, so the paw's own place
+    // in that frame IS the transform that lands the prop in the paw.
+    _xfM.copy(rig.root.matrixWorld).invert().multiply(hand.matrixWorld);
+    _xfM.decompose(_xfP, _xfQ, _xfS);
+    _xfE.setFromQuaternion(_xfQ);
+    active.tool.px = _xfP.x;
+    active.tool.py = _xfP.y;
+    active.tool.pz = _xfP.z;
+    active.tool.rx = _xfE.x;
+    active.tool.ry = _xfE.y;
+    active.tool.rz = _xfE.z;
+    anchorsDirty = true;
+    refreshToolSliders();
+  }
+
+  // Re-solve every state's placement in the paw's frame. Cheap, and only run
+  // when something was actually dragged.
+  function resolveAnchors() {
+    for (const st of states) {
+      solveHeldAnchor(rig, st.L, st.R, toolMatrix(st.tool, _xfM), st.anchor);
+    }
+    anchorsDirty = false;
+  }
+
+  function setPlaying(on: boolean) {
+    if (on === playing) return;
+    playing = on;
+    if (on) {
+      selectTarget(null);
+      resolveAnchors();
+      stepIdx = 0;
+      const seq = spec.play!;
+      from = stateOf(seq[seq.length - 1][0]) ?? active;
+      to = stateOf(seq[0][0]) ?? active;
+      phaseU = 0;
+      dwell = 0;
+      live.add(prop.group);
+      prop.group.position.set(0, 0, 0);
+      prop.group.rotation.set(0, 0, 0);
+    } else {
+      rig.root.add(prop.group);
+    }
+  }
+
+  function advance(dt: number) {
+    const seq = spec.play!;
+    const rate = PHASE_EASE[to.key] ?? PHASE_EASE_DEFAULT;
+    if (phaseU < 1) {
+      phaseU = Math.min(1, phaseU + dt * rate);
+      return;
+    }
+    dwell += dt;
+    if (dwell < seq[stepIdx][1]) return;
+    stepIdx = (stepIdx + 1) % seq.length;
+    from = to;
+    to = stateOf(seq[stepIdx][0]) ?? to;
+    phaseU = 0;
+    dwell = 0;
+  }
+
   const raycaster = new THREE.Raycaster();
   const ndc = new THREE.Vector2();
-
-  // Hover feedback on markers
-  renderer.domElement.addEventListener("pointermove", (ev) => {
-    if (ACTIVE_DEF.id !== "driller-pose" || !gizmoOn) return;
+  const pickable = () => targets.map((j) => j.marker);
+  const setNdc = (ev: PointerEvent) => {
     const rect = renderer.domElement.getBoundingClientRect();
     ndc.set(
       ((ev.clientX - rect.left) / rect.width) * 2 - 1,
       -((ev.clientY - rect.top) / rect.height) * 2 + 1,
     );
     raycaster.setFromCamera(ndc, camera);
-    const hits = raycaster.intersectObjects(targets.map((j) => j.marker));
+  };
+
+  // Hover feedback on markers
+  renderer.domElement.addEventListener("pointermove", (ev) => {
+    if (ACTIVE_DEF.id !== spec.id || !gizmoOn || playing) return;
+    setNdc(ev);
+    const hits = raycaster.intersectObjects(pickable());
     const hovered = hits.length > 0 ? (hits[0].object as THREE.Mesh) : null;
     if (hoveredMarker !== hovered) {
       if (hoveredMarker && hoveredMarker !== selected?.marker) {
@@ -1252,20 +1499,16 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
   });
 
   renderer.domElement.addEventListener("pointerdown", (ev) => {
-    if (ACTIVE_DEF.id !== "driller-pose" || !gizmoOn || gizmo.dragging) return;
-    const rect = renderer.domElement.getBoundingClientRect();
-    ndc.set(
-      ((ev.clientX - rect.left) / rect.width) * 2 - 1,
-      -((ev.clientY - rect.top) / rect.height) * 2 + 1,
-    );
-    raycaster.setFromCamera(ndc, camera);
-    const hit = raycaster.intersectObjects(targets.map((j) => j.marker))[0];
+    if (ACTIVE_DEF.id !== spec.id || !gizmoOn || gizmo.dragging || playing)
+      return;
+    setNdc(ev);
+    const hit = raycaster.intersectObjects(pickable())[0];
     selectTarget(hit ? targets.find((j) => j.marker === hit.object)! : null);
   });
 
   // Keyboard controls for gizmo mode switching and axis constraints
   const handleGizmoKeys = (e: KeyboardEvent) => {
-    if (ACTIVE_DEF.id !== "driller-pose" || !gizmoOn) return;
+    if (ACTIVE_DEF.id !== spec.id || !gizmoOn) return;
     if (e.target instanceof HTMLInputElement) return; // Don't override text input
 
     const lower = e.key.toLowerCase();
@@ -1299,11 +1542,38 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
 
   document.addEventListener("keydown", handleGizmoKeys);
 
+  // The export block: what gets pasted back into diverRig.ts. One state
+  // editors keep the flat shape; multi-state ones key it by state.
+  function exportPayload(st: EditorState) {
+    const same = sameArmPose(st.L, st.R);
+    return {
+      ...(same ? { armPose: { ...st.L } } : { armPoseL: { ...st.L }, armPoseR: { ...st.R } }), // prettier-ignore
+      tool: {
+        position: [st.tool.px, st.tool.py, st.tool.pz],
+        rotation: [st.tool.rx, st.tool.ry, st.tool.rz],
+      },
+    };
+  }
+
   return {
     group,
     update(dt: number, t: number) {
+      // The ghost holster: the prop, dimmed, wherever the belt state puts it.
+      if (ghost) {
+        const belt = stateOf(spec.ghost!);
+        if (belt) {
+          ghost.group.position.set(belt.tool.px, belt.tool.py, belt.tool.pz);
+          ghost.group.rotation.set(belt.tool.rx, belt.tool.ry, belt.tool.rz);
+        }
+        if (!ghostDimmed && ghost.group.children.length) {
+          dimProp(ghost.group);
+          ghostDimmed = true;
+        }
+        ghost.update(t, true);
+      }
+
       const toolDragging = selected?.kind === "tool" && dragging;
-      if (selected && dragging) {
+      if (!playing && selected && dragging) {
         if (selected.kind === "tool") syncToolFromGizmo();
         else syncPoseFromProxy(selected);
       }
@@ -1315,27 +1585,73 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
         vel,
         carry: "none",
       });
-      applyArmPoseSides(rig, poseL, poseR); // locks the arms, overriding the swim blend
-      for (const j of armJoints) {
-        if (j === selected && dragging) continue;
-        syncProxyFromPose(j);
+
+      if (playing) {
+        if (anchorsDirty) resolveAnchors();
+        advance(dt);
+        const k = phaseU * phaseU * (3 - 2 * phaseU); // same smoothstep the rig runs
+        applyArmPoseSides(
+          rig,
+          blendArmPose(from.L, to.L, k, blendL),
+          blendArmPose(from.R, to.R, k, blendR),
+        );
+        live.position.lerpVectors(from.anchor.position, to.anchor.position, k);
+        live.quaternion.slerpQuaternions(
+          from.anchor.quaternion,
+          to.anchor.quaternion,
+          k,
+        );
+        live.scale.lerpVectors(from.anchor.scale, to.anchor.scale, k);
+      } else {
+        applyArmPoseSides(rig, active.L, active.R); // locks the arms, overriding the swim blend
+        for (const j of armJoints) {
+          if (j === selected && dragging) continue;
+          syncProxyFromPose(j);
+        }
+        if (!toolDragging) {
+          const x = active.tool;
+          prop.group.position.set(x.px, x.py, x.pz);
+          prop.group.rotation.set(x.rx, x.ry, x.rz);
+        }
       }
-      if (!toolDragging) {
-        driller.group.position.set(tool.px, tool.py, tool.pz);
-        driller.group.rotation.set(tool.rx, tool.ry, tool.rz);
-      }
-      driller.update(t, true); // held: no idle world-bob fighting the sliders
+      prop.update(t, true); // held: no idle world-bob fighting the sliders
     },
     ui(panel: HTMLElement, api: BenchUiApi) {
       function renderPanel() {
         panel.innerHTML = "";
         sliderHandles.clear();
+        toolSliderHandles.clear();
+
+        // State tabs — only worth the room when the grip has more than one.
+        if (states.length > 1) {
+          const sec = api.section(panel, "State");
+          const btns: Record<string, HTMLButtonElement> = {};
+          for (const st of states) {
+            btns[st.key] = api.button(sec, st.label, () => {
+              active = st;
+              setPlaying(false);
+              selectTarget(null);
+              markOn(btns, st.key);
+              renderPanel();
+            });
+          }
+          markOn(btns, active.key);
+          if (spec.play) {
+            api
+              .button(sec, "play", (b) => {
+                setPlaying(!playing);
+                b.classList.toggle("on", playing);
+              })
+              .classList.toggle("on", playing);
+          }
+        }
 
         const editSec = api.section(panel, "Editing");
         api
           .button(editSec, "mirror L/R", (b) => {
             mirror = !mirror;
-            if (mirror) Object.assign(poseR, poseL);
+            if (mirror) Object.assign(active.R, active.L);
+            anchorsDirty = true;
             b.classList.toggle("on", mirror);
             renderPanel();
           })
@@ -1349,6 +1665,14 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
             renderPanel();
           })
           .classList.toggle("on", gizmoOn);
+        if (ghost) {
+          api
+            .button(editSec, "belt ghost", (b) => {
+              ghost.group.visible = !ghost.group.visible;
+              b.classList.toggle("on", ghost.group.visible);
+            })
+            .classList.toggle("on", ghost.group.visible);
+        }
 
         const toolModeBtns: Record<string, HTMLButtonElement> = {
           translate: api.button(editSec, "tool: move (T)", () => {
@@ -1381,21 +1705,28 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
         const resetBtnContainer = document.createElement("div");
         resetBtnContainer.className = "row";
         gizmoSec.appendChild(resetBtnContainer);
+        api.button(resetBtnContainer, "shipped", () => {
+          Object.assign(active.L, active.shipped.L);
+          Object.assign(active.R, active.shipped.R);
+          Object.assign(active.tool, active.shipped.tool);
+          mirror = sameArmPose(active.L, active.R);
+          anchorsDirty = true;
+          renderPanel();
+          for (const j of armJoints) syncProxyFromPose(j);
+        });
         api.button(resetBtnContainer, "reset arm", () => {
-          const zero = zeroPose();
-          Object.assign(poseL, zero);
-          if (!mirror) Object.assign(poseR, zero);
-          else Object.assign(poseR, zero);
+          Object.assign(active.L, zeroPose());
+          Object.assign(active.R, zeroPose());
+          anchorsDirty = true;
           refreshSliders();
           for (const j of armJoints) syncProxyFromPose(j);
         });
         api.button(resetBtnContainer, "reset tool", () => {
-          tool.px = tool.py = tool.pz = 0;
-          tool.rx = tool.ry = tool.rz = 0;
+          Object.assign(active.tool, toolXfFrom(null));
+          anchorsDirty = true;
           refreshToolSliders();
-          driller.group.position.set(0, 0, 0);
-          driller.group.rotation.set(0, 0, 0);
         });
+        api.button(resetBtnContainer, "snap to paw", () => snapToPaw());
 
         const addSide = (label: string, side: "L" | "R", p: ArmPose) => {
           const sec = api.section(panel, label);
@@ -1419,8 +1750,9 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
               p[f],
               (v) => {
                 p[f] = v;
+                anchorsDirty = true;
                 if (mirror) {
-                  const other = side === "L" ? poseR : poseL;
+                  const other = side === "L" ? active.R : active.L;
                   other[f] = v;
                   sliderHandles.get(`${side === "L" ? "R" : "L"}.${f}`)?.set(v);
                 }
@@ -1429,30 +1761,32 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
             sliderHandles.set(`${side}.${f}`, h);
           }
         };
-        if (mirror) addSide("Arm Pose", "L", poseL);
+        if (mirror) addSide(`Arm Pose · ${active.label}`, "L", active.L);
         else {
-          addSide("Left Arm", "L", poseL);
-          addSide("Right Arm", "R", poseR);
+          addSide(`Left Arm · ${active.label}`, "L", active.L);
+          addSide(`Right Arm · ${active.label}`, "R", active.R);
         }
 
         const exportSec = api.section(panel, "Export");
-        api.button(exportSec, "Export Pose", () => {
-          const payload = mirror
-            ? { armPose: { ...poseL } }
-            : { armPoseL: { ...poseL }, armPoseR: { ...poseR } };
-          const full = {
-            ...payload,
-            tool: {
-              position: [tool.px, tool.py, tool.pz],
-              rotation: [tool.rx, tool.ry, tool.rz],
-            },
-          };
+        const dump = () =>
+          states.length > 1
+            ? Object.fromEntries(states.map((s) => [s.key, exportPayload(s)]))
+            : exportPayload(active);
+        api.button(exportSec, "Export", () => {
+          const full = dump();
           exportStr = JSON.stringify(full);
-          console.log("driller hold pose:\n" + JSON.stringify(full, null, 2));
+          console.log(`${spec.kind} pose:\n` + JSON.stringify(full, null, 2));
+        });
+        api.button(exportSec, "copy", () => {
+          const text = JSON.stringify(dump(), null, 2);
+          exportStr = "copied";
+          void navigator.clipboard?.writeText(text).catch(() => {
+            console.log(text); // clipboard is origin-gated; the log always works
+          });
         });
 
-        const toolSec = api.section(panel, "Tool Transform");
-        const toolFields: [keyof typeof tool, string, number, number][] = [
+        const toolSec = api.section(panel, `Prop Transform · ${active.label}`);
+        const toolFields: [keyof ToolXf, string, number, number][] = [
           ["px", "pos x", -2, 2],
           ["py", "pos y", -2, 2],
           ["pz", "pos z", -2, 2],
@@ -1467,9 +1801,10 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
             min,
             max,
             0.01,
-            tool[key],
+            active.tool[key],
             (v) => {
-              tool[key] = v;
+              active.tool[key] = v;
+              anchorsDirty = true;
             },
           );
           toolSliderHandles.set(key, h);
@@ -1478,26 +1813,121 @@ function buildDrillerPoseEditor(gltf: GLTF): BenchInstance {
         const note = document.createElement("div");
         note.className = "hint";
         note.textContent =
-          '"mirror L/R" (default on) keeps both arms symmetric. "gizmo select" shows ' +
-          "clickable handles at each joint and the tool. " +
-          "Keyboard shortcuts when gizmo is active: " +
-          "T=translate, R=rotate (tool only), X/Y/Z=lock axis, ESC=deselect. " +
-          'Hover over markers to highlight. "Reset" buttons clear poses quickly. ' +
+          "opens on the pose that ships (diverRig's GRIPS) — edit it and " +
+          '"Export"/"copy" the block back into diverRig.ts. "shipped" puts ' +
+          'this state back. "snap to paw" drops the prop into the hand ' +
+          "bone's own frame wherever this arm pose left it — rotate from there" +
+          (states.length > 1
+            ? '. The state tabs are the grip\'s animation states; "play" walks ' +
+              "them through the rig's own blend, prop on the paw anchor"
+            : "") +
+          '. "mirror L/R" keeps both arms symmetric. "gizmo select" shows ' +
+          "clickable handles at each joint and the prop — T=translate, " +
+          "R=rotate (prop only), X/Y/Z=lock axis, ESC=deselect. " +
           "Click any slider's number to type an exact value.";
         panel.appendChild(note);
       }
       renderPanel();
     },
-    lines: () => {
-      const parts: [string, string][] = [["export", exportStr]];
-      if (gizmoOn && selected) {
-        parts.push([
-          "gizmo",
-          `${selected.kind}${selected.kind === "tool" ? ` (${toolMode})` : ""} ${constrainAxis ? `[${constrainAxis.toUpperCase()}]` : ""}`,
-        ]);
-      }
-      return parts;
+    // Fixed row set: the HUD binds these by index when the model mounts.
+    lines: () => [
+      ["state", playing ? `${from.label} → ${to.label}` : active.label],
+      ["blend", playing ? phaseU.toFixed(2) : "—"],
+      [
+        "gizmo",
+        gizmoOn && selected
+          ? `${selected.kind}${selected.kind === "tool" ? ` (${toolMode})` : ""}${constrainAxis ? ` [${constrainAxis.toUpperCase()}]` : ""}`
+          : "—",
+      ],
+      ["export", exportStr],
+    ],
+  };
+}
+
+// Fade a prop clone down to a hint of itself (the belt ghost) and snuff any
+// light it carries — a holster marker must not relight the scene. Materials
+// are cloned first: the real prop shares them.
+function dimProp(root: THREE.Object3D): void {
+  root.traverse((o) => {
+    const light = o as THREE.Light;
+    if (light.isLight) light.visible = false;
+    const m = o as THREE.Mesh;
+    if (!m.isMesh) return;
+    const mats = Array.isArray(m.material) ? m.material : [m.material];
+    m.material = mats.map((mat) => {
+      const c = mat.clone();
+      c.transparent = true;
+      c.opacity = 0.3;
+      c.depthWrite = false;
+      return c;
+    });
+  });
+}
+
+// --- Model: the light stick ------------------------------------------------
+// Prop: static mesh, no rig. Test the scale-fit (the "length" slider is the
+// LIGHT_STICK_LENGTH knob, live) and the burn.
+function buildLightStick(gltf: GLTF | null): BenchInstance {
+  const stick = createLightStickVisual(
+    gltf ? prepareLightStickTemplate(gltf) : null,
+  );
+  let held = false;
+  let length = LIGHT_STICK_LENGTH;
+
+  // Diver stand-in at the carry offset, to read the baton against a body.
+  const stand = new THREE.Mesh(
+    new THREE.CapsuleGeometry(0.6, 0.7, 6, 12),
+    toonMaterial({ color: 0x2b4756, transparent: true, opacity: 0.5 }),
+  );
+  stand.position.set(0, CARGO.HOLD_DOWN, CARGO.HOLD_FORWARD);
+  stand.visible = false;
+  stick.group.add(stand);
+
+  return {
+    group: stick.group,
+    update(_dt: number, t: number) {
+      stick.update(t, held);
     },
+    ui(panel: HTMLElement, api: BenchUiApi) {
+      const parts = api.section(panel, "Haul");
+      api.button(parts, "held", (b) => {
+        held = !held;
+        stand.visible = held;
+        b.classList.toggle("on", held);
+      });
+      api
+        .button(parts, "lit", (b) => {
+          stick.setLit(!stick.isLit());
+          b.classList.toggle("on", stick.isLit());
+        })
+        .classList.toggle("on", stick.isLit());
+
+      const size = api.section(panel, "Size");
+      api.sliderRow(size, "length", 0.15, 1, 0.01, length, (v) => {
+        length = v;
+        stick.setLength(v);
+      });
+
+      const note = document.createElement("div");
+      note.className = "hint";
+      note.textContent =
+        `light stick length ${LIGHT_STICK_LENGTH} u — a rat diver is ~1.3 u ` +
+        'tall, and the driller is 0.8. "length" is that constant, live: park ' +
+        "it where the baton reads as one paw's worth and paste the number " +
+        'into LIGHT_STICK_LENGTH. "lit" strikes or snuffs the burn — the tip ' +
+        "mesh is unlit and carries the point light, so the cel ramp can never " +
+        'blow it out. Pose the diver around it in "light stick poses".';
+      panel.appendChild(note);
+    },
+    action() {
+      stick.setLit(!stick.isLit());
+    },
+    lines: () => [
+      ["held", held ? "yes" : "no"],
+      ["vial", stick.vial ? "found" : "MISSING"],
+      ["length", `${length.toFixed(2)} u`],
+      ["burn", stick.burn().toFixed(2)],
+    ],
   };
 }
 
@@ -1547,11 +1977,50 @@ const MODELS: BenchModelDef[] = [
     build: buildDriller,
   },
   {
+    id: "light-stick",
+    label: "light stick",
+    url: `${BASE}models/light_stick.glb`,
+    cam: { dist: 1.6, height: 0, gridY: -0.6 },
+    build: buildLightStick,
+  },
+  {
     id: "driller-pose",
     label: "driller hold pose",
     url: `${BASE}models/ratdiverAbyssalGouda.glb`,
-    cam: { dist: 4, height: -0.3, gridY: -1.6 },
-    build: buildDrillerPoseEditor,
+    cam: { dist: 3, height: -0.3, gridY: -1.6 },
+    build: (gltf) =>
+      buildPoseEditor(gltf!, {
+        id: "driller-pose",
+        kind: "driller",
+        makeProp: () => createDrillerVisual(),
+      }),
+  },
+  {
+    id: "stick-pose",
+    label: "light stick poses",
+    url: `${BASE}models/ratdiverAbyssalGouda.glb`,
+    cam: { dist: 3, height: -0.3, gridY: -1.6 },
+    build: (gltf) =>
+      buildPoseEditor(gltf!, {
+        id: "stick-pose",
+        kind: "lightStick",
+        // No light: a lamp this close would put every band of the diver on
+        // white, and this bench is about where the paws are.
+        makeProp: () => {
+          const stick = createLightStickVisual();
+          stick.setLightOn(false);
+          return stick;
+        },
+        open: "hold",
+        // The throw cycle: reach to the belt, carry it, whip it away, and
+        // (after the paw comes back empty) reach for the next one.
+        play: [
+          ["grab", 0.35],
+          ["hold", 1.1],
+          ["throw", 0.5],
+        ],
+        ghost: "grab",
+      }),
   },
 ];
 
@@ -1566,10 +2035,24 @@ let spin = true;
 let showBones = false;
 let wire = false;
 
+// Deep-link camera, for headless capture and for linking someone a view:
+// ?yaw= swings the default vantage about the model (degrees, + = leftward),
+// ?dist= scales how far back it sits, ?spin=0 stops the idle orbit so two
+// shots of the same URL frame the same thing.
+const QUERY = new URLSearchParams(location.search);
+const qNum = (k: string) => {
+  const v = Number(QUERY.get(k));
+  return QUERY.has(k) && Number.isFinite(v) ? v : null;
+};
+const CAM_UP = new THREE.Vector3(0, 1, 0);
+
 function frameCamera(cam: BenchCamSpec) {
   camera.fov = 52;
   camera.updateProjectionMatrix();
-  camera.position.set(cam.dist, cam.height + cam.dist * 0.45, cam.dist * 1.25);
+  const dist = qNum("dist") ?? cam.dist;
+  const eye = new THREE.Vector3(dist, 0, dist * 1.25);
+  eye.applyAxisAngle(CAM_UP, ((qNum("yaw") ?? 0) * Math.PI) / 180);
+  camera.position.set(eye.x, cam.height + dist * 0.45, eye.z);
   controls.target.set(0, cam.height, 0);
 }
 
@@ -1681,7 +2164,8 @@ toggle("wireframe", (on) => {
   wire = on;
   applyWire();
 });
-toggle("spin", (on) => (spin = on), true);
+spin = qNum("spin") !== 0;
+toggle("spin", (on) => (spin = on), spin);
 toggle(
   "fog",
   (on) => {

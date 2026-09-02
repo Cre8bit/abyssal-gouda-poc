@@ -268,13 +268,36 @@ Gouda was the last code-built one), but the contract still allows it.
 Current entries: rat diver (procedural swim, `entities/diverRig.ts`),
 first-person gloves (the local player's FP body), lantern-catfish (baked
 swim/bite/flicker clips + lantern moods), tin bell (the bathyscaphe prop,
-`world/bathyscaphe.ts`), golden gouda (the cargo, `entities/goldenGouda.ts`).
+`world/bathyscaphe.ts`), golden gouda (the cargo, `entities/goldenGouda.ts`),
+driller (`entities/driller.ts`), light stick (`entities/lightStick.ts`), plus
+the two **pose editors** below.
 
-Both diver entries carry a **carrying** toggle that blends the rig into its
-carry pose and drops a stand-in Golden Gouda at exactly the offset
-`game/cargo.ts` hands it — third person at `HOLD_*`, first person at
-`FP_HOLD_*` (see below). The arms have to land ON the wheel at every look
-pitch, and that toggle is how you check it without a second player.
+Both diver entries carry a **hold** toggle that cycles what is in the paws
+(nothing → the wheel → the driller → the light stick), blends the rig into
+that grip and mounts the real prop on the paw anchor the game uses — the
+Golden Gouda at exactly the offset `game/cargo.ts` hands it, third person at
+`HOLD_*` and first person at `FP_HOLD_*` (see below). The arms have to land ON
+the wheel at every look pitch, and that toggle is how you check it without a
+second player. **throw stick** on the same two entries runs the light stick's
+state machine (belt grab → hold → throw) inside the live swim rig.
+
+### The held-prop pose editors
+
+`buildPoseEditor()` is one editor serving every held prop; a registry entry
+hands it a prop factory and the grip it belongs to, and it **opens on the pose
+that already ships** (`gripPlacements()` in diverRig.ts). Per-side `ArmPose`
+sliders lock the arms, "gizmo select" puts a rotate handle on any of the 6
+posable joints or a move/rotate handle on the prop itself, "snap to paw" drops
+the prop into the hand bone's own frame at the current arm pose, and
+"Export"/"copy" print the block to paste back into `diverRig.ts`. Two entries
+use it today: **driller hold pose** (one state) and **light stick poses**
+(three).
+
+A grip whose `Grip.states` names several placements gets one tab per state, a
+**belt ghost** of the prop at whichever state is the body fixture, and a
+**play** button that walks the states through `updateDiverRig`'s own
+smoothstep blend with the prop riding the paw anchor — so the preview is the
+animation that ships, not a second implementation of it.
 
 **Lighting gotcha for anything that glows from inside itself:** the shared
 cel ramp (`render/toon.ts`) floors at 40/255, so an "unlit" face still takes
@@ -351,6 +374,15 @@ async GLB mount, so it captures the loading screen — drive CDP instead
 (`Page.navigate`, real `setTimeout` wait, `Page.captureScreenshot`). The
 bench logs `bench: built <id>` to the console when the model is mounted.
 
+Frame the shot from the URL as well: `?spin=0` stops the idle orbit (two
+captures of one URL then frame the same thing), `?yaw=<deg>` swings the
+default vantage about the model, `?dist=<u>` moves it in or out, and
+`?hold=gouda|driller|lightStick` opens a diver entry with something already
+in its paws. Driving the panel from `Runtime.evaluate` is fair game — the
+buttons are plain DOM, and that is how the light stick's placements were
+authored (click a state, click "snap to paw", click "Export", read the
+console).
+
 ## The first-person body (`entities/diverRig.ts`)
 
 `buildFpGeometry()` keeps the two ARMS — shoulder to fingertip — and deletes
@@ -385,6 +417,31 @@ simply get longer while they are holding something (`FP_SCALE_CARRY`); nothing
 but the arms is rendered, so there is no body to be out of proportion with.
 All three cross-fade on `rig.carrySm`, and the FP pivot switches to tracking
 the look EXACTLY (`fpBodyPitch`) because the wheel does.
+
+## Grips and their states (`entities/diverRig.ts`)
+
+What a diver has in its paws is a **grip**: one authored `GripPose` — both
+arms plus the prop's transform in the rig-root frame — and the FP body offset
+and arm length that go with it. `holdAnchor()` solves that placement once into
+a node under the RIGHT HAND bone (`anchorLocal = boneChain⁻¹ · model⁻¹ ·
+tool`, measured at `DIVER_SCALE`), so the prop inherits every stroke and sway
+of the arm instead of being re-placed from the diver's position each frame.
+`solveHeldAnchor()` is that solve, exported, because the bench pose editor
+runs it on placements that are still being dragged around.
+
+A grip can also name several placements in `states` and animate between them.
+The light stick ships three — `grab` (the paw down at the belt, closing on a
+holstered baton), `hold` (up and out in front, lighting the way) and `throw`
+(swung through, paw open) — and `updateDiverRig({ carry, carryPhase })` blends
+whichever is asked for over a smoothstep, at a per-state rate (`PHASE_EASE`: a
+throw snaps, a reach to the belt reads as a movement). The prop's paw anchor
+is interpolated across the same blend from the per-state solves, so it is
+always exactly where the arms holding it put it — never a second animation
+that can drift out of sync with the first. `rig.gripPhase`/`rig.gripU` are the
+read-back a game system times a release off.
+
+Every number in those states was authored in the bench, not by hand: see the
+pose editors above.
 
 ## Two hold offsets (`game/cargo.ts`)
 

@@ -181,22 +181,158 @@ const DRILLER_TOOL = new THREE.Matrix4().compose(
   new THREE.Vector3(1, 1, 1),
 );
 
+// --- The light stick's three states ----------------------------------------
+// A throw is an animation, not a pose. The paw drops to the belt and closes
+// on a baton (grab), brings it up in front of the chest (hold), then whips
+// forward and lets go (throw) — three authored placements the rig blends
+// between on `carryPhase`. Authored in the bench pose editor (preview.ts,
+// "light stick poses"), which exports exactly the block below.
+export type StickPhase = "grab" | "hold" | "throw";
+
+// The paw at the belt, closing on a stick in its holster.
+const ARM_POSE_STICK_GRAB_L: ArmPose = {
+  uy: 1.45,
+  ux: -0.45,
+  fy: 0.25,
+  fx: -0.15,
+  fz: 0.0,
+  hx: 0.18,
+  hy: 0.0,
+  hz: 0.0,
+};
+const ARM_POSE_STICK_GRAB_R: ArmPose = {
+  uy: 0.3,
+  ux: 0.35,
+  fy: 0.95,
+  fx: -0.25,
+  fz: -0.3,
+  hx: -0.55,
+  hy: -0.35,
+  hz: 0.45,
+};
+// Carried: the baton up in front of the chest, left paw free to swim.
+const ARM_POSE_STICK_HOLD_L: ArmPose = {
+  uy: 1.45,
+  ux: -0.45,
+  fy: 0.25,
+  fx: -0.15,
+  fz: 0.0,
+  hx: 0.18,
+  hy: 0.0,
+  hz: 0.0,
+};
+const ARM_POSE_STICK_HOLD_R: ArmPose = {
+  uy: 1.15,
+  ux: -0.75,
+  fy: 1.0,
+  fx: 0.35,
+  fz: -0.4,
+  hx: -0.9,
+  hy: -0.35,
+  hz: 0.55,
+};
+// The release: arm swung through, paw open, baton on its way.
+const ARM_POSE_STICK_THROW_L: ArmPose = {
+  uy: 1.45,
+  ux: -0.45,
+  fy: 0.25,
+  fx: -0.15,
+  fz: 0.0,
+  hx: 0.18,
+  hy: 0.0,
+  hz: 0.0,
+};
+const ARM_POSE_STICK_THROW_R: ArmPose = {
+  uy: 1.5,
+  ux: -1.0,
+  fy: 0.2,
+  fx: 0.1,
+  fz: -0.2,
+  hx: -0.25,
+  hy: -0.2,
+  hz: 0.3,
+};
+
+// …and where the baton itself sits in the rig-root frame in each of them —
+// on the belt for the grab, in the paw for the other two.
+const STICK_TOOL_GRAB = new THREE.Matrix4().compose(
+  new THREE.Vector3(
+    0.4139278259411805,
+    0.7913388263309536,
+    -0.3036914931857932,
+  ),
+  new THREE.Quaternion().setFromEuler(
+    new THREE.Euler(
+      -2.60053028003624,
+      -0.6239465458274682,
+      -0.20363178184985195,
+    ),
+  ),
+  new THREE.Vector3(1, 1, 1),
+);
+const STICK_TOOL_HOLD = new THREE.Matrix4().compose(
+  new THREE.Vector3(
+    0.23206276194688746,
+    0.9128471055252174,
+    -0.3724180349714392,
+  ),
+  new THREE.Quaternion().setFromEuler(
+    new THREE.Euler(
+      -0.9946774947876209,
+      -0.29390880714610024,
+      0.9029821928507756,
+    ),
+  ),
+  new THREE.Vector3(1, 1, 1),
+);
+const STICK_TOOL_THROW = new THREE.Matrix4().compose(
+  new THREE.Vector3(
+    0.21351864105545448,
+    0.8128744515214128,
+    -0.43844498947247396,
+  ),
+  new THREE.Quaternion().setFromEuler(
+    new THREE.Euler(
+      -1.731628513712519,
+      -0.3963512764677859,
+      0.31450605419632144,
+    ),
+  ),
+  new THREE.Vector3(1, 1, 1),
+);
+
+// The stick is small and one-handed: the FP body drops less than the driller
+// makes it, and the arms stay near true length — a 0.4 u baton at a paw's
+// reach already fills a corner of a 72° lens without help. Screenshot-tuned
+// in the gloves bench (?m=gloves&hold=lightStick, eye cam).
+const FP_OFFSET_STICK = new THREE.Vector3(0.12, -0.2, 0.06);
+
 // What the diver has in its paws. "none" is the idle/swim blend; every other
 // kind is a grip in GRIPS below.
-export type GripKind = "gouda" | "driller";
+export type GripKind = "gouda" | "driller" | "lightStick";
 export type CarryKind = "none" | GripKind;
 
-interface Grip {
+// One authored placement: both arms, plus where the prop sits while they are
+// in it. A grip is a default placement; grips that animate list more of them
+// in `states` and name them (see StickPhase).
+interface GripPose {
   left: ArmPose;
   right: ArmPose;
   fpLeft: ArmPose;
   fpRight: ArmPose;
+  /** Prop transform in the rig-root frame; null = placed by game/cargo.ts. */
+  tool: THREE.Matrix4 | null;
+}
+
+interface Grip extends GripPose {
   /** Where the FP body parks while gripping (see FP_OFFSET_CARRY). */
   fpOffset: THREE.Vector3;
   /** How long the FP arms are while gripping (see FP_SCALE). */
   fpScale: number;
-  /** Prop transform in the rig-root frame; null = placed by game/cargo.ts. */
-  tool: THREE.Matrix4 | null;
+  /** Named states this grip animates through, blended on `carryPhase`. */
+  states?: Record<string, GripPose>;
+  /** Which of `states` the grip rests in when no phase is asked for. */
+  base?: string;
 }
 
 const GRIPS: Record<GripKind, Grip> = {
@@ -223,7 +359,76 @@ const GRIPS: Record<GripKind, Grip> = {
     fpScale: 1.7,
     tool: DRILLER_TOOL,
   },
+  // Three states, blended on `carryPhase`; the grip itself mirrors "hold" so
+  // callers that never name a phase still get a diver carrying a light stick.
+  lightStick: {
+    left: ARM_POSE_STICK_HOLD_L,
+    right: ARM_POSE_STICK_HOLD_R,
+    fpLeft: ARM_POSE_STICK_HOLD_L,
+    fpRight: ARM_POSE_STICK_HOLD_R,
+    fpOffset: FP_OFFSET_STICK,
+    fpScale: 1.45,
+    tool: STICK_TOOL_HOLD,
+    base: "hold",
+    states: {
+      grab: {
+        left: ARM_POSE_STICK_GRAB_L,
+        right: ARM_POSE_STICK_GRAB_R,
+        fpLeft: ARM_POSE_STICK_GRAB_L,
+        fpRight: ARM_POSE_STICK_GRAB_R,
+        tool: STICK_TOOL_GRAB,
+      },
+      hold: {
+        left: ARM_POSE_STICK_HOLD_L,
+        right: ARM_POSE_STICK_HOLD_R,
+        fpLeft: ARM_POSE_STICK_HOLD_L,
+        fpRight: ARM_POSE_STICK_HOLD_R,
+        tool: STICK_TOOL_HOLD,
+      },
+      throw: {
+        left: ARM_POSE_STICK_THROW_L,
+        right: ARM_POSE_STICK_THROW_R,
+        fpLeft: ARM_POSE_STICK_THROW_L,
+        fpRight: ARM_POSE_STICK_THROW_R,
+        tool: STICK_TOOL_THROW,
+      },
+    },
+  },
 };
+
+// How fast each named state takes over once it becomes the target (1/s).
+// A throw snaps; reaching down to the belt is a movement you can read.
+export const PHASE_EASE: Record<string, number> = {
+  grab: 7,
+  hold: 6,
+  throw: 16,
+};
+export const PHASE_EASE_DEFAULT = 6;
+
+// One authored placement, handed out by value. The bench pose editor opens
+// on these — a pose editor that started from a T-pose would show none of the
+// work already shipped — and the export it prints replaces them in the block
+// above. Single-state grips come back as one entry with an empty key.
+export interface GripPlacement {
+  key: string;
+  label: string;
+  left: ArmPose;
+  right: ArmPose;
+  tool: THREE.Matrix4 | null;
+}
+export function gripPlacements(kind: GripKind): GripPlacement[] {
+  const grip = GRIPS[kind];
+  const one = (key: string, p: GripPose): GripPlacement => ({
+    key,
+    label: key || kind,
+    left: { ...p.left },
+    right: { ...p.right },
+    tool: p.tool ? p.tool.clone() : null,
+  });
+  const states = grip.states;
+  if (!states) return [one("", grip)];
+  return Object.entries(states).map(([key, p]) => one(key, p));
+}
 
 // FP body RIGIDLY follows camera (yaw + pitch 1:1). Shoulder cut stays fixed
 // in camera space—behind lens at all angles/banks. Reveal job belongs to pose
@@ -389,8 +594,18 @@ export interface DiverRig {
   poseTmp: ArmPose;
   /** 0 = idle, 1 = carrying. Eased, so a hand-off reads as a movement. */
   carrySm: number;
+  /** Named state of a phased grip (see StickPhase): where it is heading… */
+  gripPhase: string;
+  /** …where it came from, and how far through (0…1, unsmoothed). */
+  gripFrom: string;
+  gripU: number;
+  /** Scratch the phase blend lands in — never allocated per frame. */
+  gripPoseL: ArmPose;
+  gripPoseR: ArmPose;
   /** Solved lazily by holdAnchor(), one paw node per grip. */
   anchors: Map<GripKind, THREE.Object3D>;
+  /** …plus one solved placement per "<grip>:<state>" for phased grips. */
+  anchorStates: Map<string, THREE.Object3D>;
   head: THREE.Object3D | null;
   chain: THREE.Object3D[];
   cycle: number;
@@ -668,7 +883,13 @@ export function createDiverRig(
     poseR: { uy: 0, ux: 0, fy: 0, fx: 0, fz: 0, hx: 0, hy: 0, hz: 0 },
     poseTmp: { uy: 0, ux: 0, fy: 0, fx: 0, fz: 0, hx: 0, hy: 0, hz: 0 },
     carrySm: 0,
+    gripPhase: "",
+    gripFrom: "",
+    gripU: 1,
+    gripPoseL: { uy: 0, ux: 0, fy: 0, fx: 0, fz: 0, hx: 0, hy: 0, hz: 0 },
+    gripPoseR: { uy: 0, ux: 0, fy: 0, fx: 0, fz: 0, hx: 0, hy: 0, hz: 0 },
     anchors: new Map(),
+    anchorStates: new Map(),
     head: bones.get("Head") ?? null,
     chain: HEAD_CHAIN.map((n) => bones.get(n)).filter(
       Boolean,
@@ -720,6 +941,8 @@ function applyRootPose(rig: DiverRig, swayX = 0, swayZ = 0) {
 const CARRY_EASE = 5;
 
 // Blend two arm poses into `out` (a per-rig scratch, never allocated here).
+// Exported as blendArmPose: the bench's pose editor plays its states through
+// the very same blend, so a preview there is the animation that ships.
 function blendPose(a: ArmPose, b: ArmPose, k: number, out: ArmPose): ArmPose {
   out.uy = a.uy + (b.uy - a.uy) * k;
   out.ux = a.ux + (b.ux - a.ux) * k;
@@ -748,6 +971,47 @@ function poseAdd(rig: DiverRig, name: string, axis: AxisName, angle: number) {
   b.quaternion.multiply(_qa.setFromAxisAngle(d[axis], angle));
 }
 
+// This frame's grip poses, for grips with named states: advance the phase
+// machine, blend the two states either side of it, and slide the prop's paw
+// anchor the same way — so a held prop is always exactly where the arms that
+// hold it put it. Single-state grips return their authored pair unchanged.
+function gripPoses(
+  rig: DiverRig,
+  grip: Grip,
+  phase: string | undefined,
+  dt: number,
+): [ArmPose, ArmPose] {
+  const fp = rig.firstPerson;
+  const states = grip.states;
+  if (!states) return [fp ? grip.fpLeft : grip.left, fp ? grip.fpRight : grip.right]; // prettier-ignore
+  const want = (phase && states[phase] ? phase : grip.base) ?? "";
+  if (want !== rig.gripPhase) {
+    rig.gripFrom = rig.gripPhase || want;
+    rig.gripPhase = want;
+    rig.gripU = 0;
+  }
+  rig.gripU = Math.min(
+    1,
+    rig.gripU + dt * (PHASE_EASE[rig.gripPhase] ?? PHASE_EASE_DEFAULT),
+  );
+  const to = states[rig.gripPhase] ?? grip;
+  const from = states[rig.gripFrom] ?? to;
+  const u = rig.gripU;
+  const k = u * u * (3 - 2 * u); // smoothstep: no corner at either end
+  const a = rig.anchorStates.get(`${rig.carryKind}:${rig.gripFrom}`);
+  const b = rig.anchorStates.get(`${rig.carryKind}:${rig.gripPhase}`);
+  const live = rig.anchors.get(rig.carryKind);
+  if (live && a && b) {
+    live.position.lerpVectors(a.position, b.position, k);
+    live.quaternion.slerpQuaternions(a.quaternion, b.quaternion, k);
+    live.scale.lerpVectors(a.scale, b.scale, k);
+  }
+  return [
+    blendPose(fp ? from.fpLeft : from.left, fp ? to.fpLeft : to.left, k, rig.gripPoseL), // prettier-ignore
+    blendPose(fp ? from.fpRight : from.right, fp ? to.fpRight : to.right, k, rig.gripPoseR), // prettier-ignore
+  ];
+}
+
 // Per-frame procedural swim. Caller has already set its yaw group /
 // pitch pivot; bodyYaw/bodyPitch must mirror those values.
 //  - vel drives effort (kick rate/amplitude) AND direction adaptation:
@@ -764,6 +1028,7 @@ export function updateDiverRig(
     lookPitch,
     vel,
     carry = "none",
+    carryPhase,
   }: {
     bodyYaw: number;
     bodyPitch: number;
@@ -773,6 +1038,9 @@ export function updateDiverRig(
     // What's in the paws: hold that grip, stop stroking. Driven by the local
     // carry systems and, for remotes, by the replicated status mask.
     carry?: CarryKind;
+    // Which named state of that grip (see StickPhase) — ignored by grips
+    // that only have one. Unset rests in the grip's `base`.
+    carryPhase?: string;
   },
 ) {
   // --- Carry blend --------------------------------------------------------
@@ -794,8 +1062,7 @@ export function updateDiverRig(
     ),
   );
   blendPose(rig.armPose, rig.downPose, down, rig.poseTmp);
-  const gripL = rig.firstPerson ? grip.fpLeft : grip.left;
-  const gripR = rig.firstPerson ? grip.fpRight : grip.right;
+  const [gripL, gripR] = gripPoses(rig, grip, carryPhase, dt);
   blendPose(rig.poseTmp, gripL, rig.carrySm, rig.poseL);
   blendPose(rig.poseTmp, gripR, rig.carrySm, rig.poseR);
 
@@ -979,6 +1246,8 @@ export function applyArmPoseSides(
   poseAdd(rig, "R_Hand", "aZ", right.hz);
 }
 
+export { blendPose as blendArmPose };
+
 // Symmetric case: both arms mirror the same authored pose.
 export function applyArmPose(rig: DiverRig, p: ArmPose): void {
   applyArmPoseSides(rig, p, p);
@@ -988,14 +1257,41 @@ const _m1 = new THREE.Matrix4();
 const _m2 = new THREE.Matrix4();
 const _m3 = new THREE.Matrix4();
 
-// The node a held prop hangs from: a child of the right hand BONE, so the
-// prop inherits the paw's every stroke, sway and lean for free instead of
-// being re-placed from the diver's position each frame. Its transform is
-// solved once per rig, from the grip's authored rig-root placement:
+// Solve where a prop sits in the RIGHT HAND bone's frame, given the arm pose
+// it was authored with and its placement in the rig-root frame:
 //   anchorLocal = boneChain⁻¹ · modelMatrix⁻¹ · tool
 // measured at DIVER_SCALE whatever the rig's own scale is — so a first-person
-// body (scaled up so the arms read) carries a proportionally scaled tool.
-// Returns null for grips whose prop is placed by game/cargo.ts instead.
+// body (scaled up so the arms read) carries a proportionally scaled prop.
+// The arms are left in the authored pose; the next updateDiverRig() overwrites
+// them anyway. Exported because the bench pose editor solves the same thing
+// for poses that are still being dragged around and have no constant yet.
+export function solveHeldAnchor(
+  rig: DiverRig,
+  left: ArmPose,
+  right: ArmPose,
+  tool: THREE.Matrix4,
+  out: THREE.Object3D,
+): boolean {
+  const hand = rig.bones.get("R_Hand");
+  if (!hand) return false;
+  applyArmPoseSides(rig, left, right);
+  rig.root.updateMatrixWorld(true);
+  _m1.copy(rig.model.matrixWorld).invert().multiply(hand.matrixWorld);
+  _m2.makeRotationY(-Math.PI).multiply(tool); // model node's own flip
+  const inv = 1 / DIVER_SCALE;
+  _m2.premultiply(_m3.makeScale(inv, inv, inv));
+  _m2.premultiply(_m1.invert());
+  _m2.decompose(out.position, out.quaternion, out.scale);
+  return true;
+}
+
+// The node a held prop hangs from: a child of the right hand BONE, so the
+// prop inherits the paw's every stroke, sway and lean for free instead of
+// being re-placed from the diver's position each frame. Solved once per rig
+// from the grip's authored placement (see solveHeldAnchor) — and once more
+// per named state for a phased grip, which updateDiverRig then slides the
+// live node between. Returns null for grips whose prop is placed by
+// game/cargo.ts instead.
 export function holdAnchor(
   rig: DiverRig,
   kind: GripKind,
@@ -1003,22 +1299,22 @@ export function holdAnchor(
   const cached = rig.anchors.get(kind);
   if (cached) return cached;
   const grip = GRIPS[kind];
-  const hand = rig.bones.get("R_Hand");
-  if (!grip.tool || !hand) return null;
-
-  // The placement only means anything with the arms in that exact grip; the
-  // next updateDiverRig() overwrites these bones anyway.
-  applyArmPoseSides(rig, grip.left, grip.right);
-  rig.root.updateMatrixWorld(true);
-  _m1.copy(rig.model.matrixWorld).invert().multiply(hand.matrixWorld);
-  _m2.makeRotationY(-Math.PI).multiply(grip.tool); // model node's own flip
-  const inv = 1 / DIVER_SCALE;
-  _m2.premultiply(_m3.makeScale(inv, inv, inv));
-  _m2.premultiply(_m1.invert());
+  const rest = grip.states?.[grip.base ?? ""] ?? grip;
+  if (!rest.tool || !rig.bones.get("R_Hand")) return null;
 
   const anchor = new THREE.Object3D();
-  _m2.decompose(anchor.position, anchor.quaternion, anchor.scale);
-  hand.add(anchor);
+  if (!solveHeldAnchor(rig, rest.left, rest.right, rest.tool, anchor)) {
+    return null;
+  }
+  rig.bones.get("R_Hand")!.add(anchor);
   rig.anchors.set(kind, anchor);
+
+  for (const [name, st] of Object.entries(grip.states ?? {})) {
+    if (!st.tool) continue;
+    const solved = new THREE.Object3D();
+    if (solveHeldAnchor(rig, st.left, st.right, st.tool, solved)) {
+      rig.anchorStates.set(`${kind}:${name}`, solved);
+    }
+  }
   return anchor;
 }
