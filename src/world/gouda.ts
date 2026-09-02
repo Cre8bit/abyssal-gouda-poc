@@ -226,6 +226,9 @@ let wireMaterial: THREE.LineBasicMaterial | null = null;
 let worldEntrance: EntranceSpec | null = null;
 let routeMarkersOn = false; // debug route markers (L key, main.ts)
 let routeMarkerGroup: THREE.Group | null = null;
+let chunkBoundsOn = false; // debug chunk-border overlay (J key, main.ts)
+let boundsMaterial: THREE.LineBasicMaterial | null = null;
+const boundsGeos = new Map<number, THREE.BufferGeometry>(); // per res, shared
 
 const uGoudaTime = { value: 0 };
 
@@ -643,6 +646,58 @@ export function setWireframeOverlay(on: boolean): void {
   }
 }
 
+// Debug chunk-border overlay (J key, main.ts): the box each chunk actually
+// marches — half-width s(1 - 3/res), centred s/res back from the chunk centre,
+// which is why adjacent layer tiles abut seam-free. Rides the chunk mesh like
+// the wireframe overlay, so it inherits position, spin and culling; a chunk
+// streamed in later builds its own on mount.
+function ensureBoundsMaterial(): THREE.LineBasicMaterial {
+  boundsMaterial ??= new THREE.LineBasicMaterial({
+    color: 0xffb03d,
+    transparent: true,
+    opacity: 0.5,
+    depthWrite: false,
+  });
+  return boundsMaterial;
+}
+
+function boundsGeometry(res: number): THREE.BufferGeometry {
+  let geo = boundsGeos.get(res);
+  if (!geo) {
+    const w = 2 * (1 - 3 / res);
+    const off = 1 / res;
+    const box = new THREE.BoxGeometry(w, w, w).translate(-off, -off, -off);
+    geo = new THREE.EdgesGeometry(box);
+    box.dispose();
+    boundsGeos.set(res, geo);
+  }
+  return geo;
+}
+
+function buildBoundsOverlay(c: Chunk): void {
+  if (!c.mesh) return;
+  const box = new THREE.LineSegments(
+    boundsGeometry(c.res),
+    ensureBoundsMaterial(),
+  );
+  box.visible = chunkBoundsOn;
+  box.raycast = () => {}; // debug-only, never picked
+  c.mesh.add(box);
+  c.mesh.userData.bounds = box;
+}
+
+// Toggle the overlay for every meshed chunk, and flag future (streamed-in)
+// chunks to build theirs on mount.
+export function setChunkBounds(on: boolean): void {
+  chunkBoundsOn = on;
+  for (const c of chunks) {
+    if (!c.mesh) continue;
+    const box = c.mesh.userData.bounds as THREE.LineSegments | undefined;
+    if (on && !box) buildBoundsOverlay(c);
+    else if (box) box.visible = on;
+  }
+}
+
 // Wrap ready buffers into the chunk's live mesh (build + worker upload path).
 function mountChunkMesh(
   c: Chunk,
@@ -656,6 +711,7 @@ function mountChunkMesh(
   mesh.receiveShadow = true;
   c.mesh = mesh;
   if (wireframeOn) buildWireOverlay(mesh);
+  if (chunkBoundsOn) buildBoundsOverlay(c);
   return mesh;
 }
 
@@ -3285,6 +3341,11 @@ export function disposeWorld(scene: THREE.Scene): void {
   remeshDirty.clear();
   wireframeOn = false;
   wireMaterial = null;
+  // Box geometries are shared across chunks: the traverse above disposed
+  // them, so the cache must not survive into the next world.
+  chunkBoundsOn = false;
+  boundsMaterial = null;
+  boundsGeos.clear();
   routeMarkerGroup = null;
 }
 

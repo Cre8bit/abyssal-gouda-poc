@@ -53,6 +53,7 @@ export interface GameState {
   digTool: DigTool; // "driller" iff drillerSystem says you're holding it
   debug: DebugState;
   mapWireframe: boolean; // [I] key — overlay only, survives independent of debug.mode
+  chunkBounds: boolean; // [J] key — chunk-border overlay, same lifetime as [I]
 
   // Session roles.
   hostedId: string | null; // our shareable id when we are the host
@@ -78,6 +79,7 @@ export const game: GameState = {
   digTool: "hands",
   debug: { mode: false, freeCam: false, routeMarkers: false, routeIdx: 0 },
   mapWireframe: false,
+  chunkBounds: false,
   hostedId: null,
   fishAuthority: true,
   fishAuthorityId: null,

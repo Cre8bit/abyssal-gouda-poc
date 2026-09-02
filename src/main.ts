@@ -44,6 +44,7 @@ import {
   digAtChunkLocal,
   chunkLocalToWorld,
   raycastSolid,
+  setChunkBounds,
   setWireframeOverlay,
   setRouteMarkers,
   softSpotApproach,
@@ -309,6 +310,7 @@ async function buildWorld(rebuild = false) {
   loaderEl.classList.add("done");
   // Debug wireframe preference survives a rebuild; the overlay itself doesn't.
   if (game.mapWireframe) setWireframeOverlay(true);
+  if (game.chunkBounds) setChunkBounds(true);
   if (game.debug.routeMarkers) setRouteMarkers(true);
   logRouteTargets();
 
@@ -475,6 +477,16 @@ window.addEventListener("keydown", (e) => {
     playClick();
     showEvent(
       game.mapWireframe ? "🕸 [DEBUG] Wireframe ON" : "🕸 [DEBUG] Wireframe OFF",
+    );
+  } else if (e.code === "KeyJ" && game.debug.mode) {
+    // DEBUG: chunk borders — the box each chunk marches, wireframed.
+    game.chunkBounds = !game.chunkBounds;
+    setChunkBounds(game.chunkBounds);
+    playClick();
+    showEvent(
+      game.chunkBounds
+        ? "🧱 [DEBUG] Chunk borders ON"
+        : "🧱 [DEBUG] Chunk borders OFF",
     );
   } else if (e.code === "KeyK" && game.debug.mode) {
     // DEBUG: same jump as the TP-to-Gouda button.
