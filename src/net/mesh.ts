@@ -152,10 +152,16 @@ function newPeer(useLocal: boolean): Peer {
     config: ICE_CONFIG,
     debug: import.meta.env.DEV ? 2 : 0,
   };
+  // The local server is reached through the DEV SERVER'S OWN ORIGIN (Vite
+  // proxies /abyssal to it, websocket upgrade included). 
   return useLocal
     ? new Peer({
         host: location.hostname,
-        port: 9004,
+        port: location.port
+          ? Number(location.port)
+          : location.protocol === "https:"
+            ? 443
+            : 80,
         path: "/abyssal",
         ...opts,
       })
@@ -189,7 +195,7 @@ function createPeer({
         } else if (forceMode === "local") {
           reject(
             new Error(
-              "The host is on the local dev signaling server, which isn't reachable from here. Is `npm run dev` still running?",
+              `The local dev signaling server isn't reachable at ${location.host}. Open the invite link on the HOST's address (not localhost), and check \`npm run dev\` is still running there.`,
             ),
           );
         } else {

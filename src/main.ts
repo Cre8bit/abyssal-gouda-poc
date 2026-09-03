@@ -91,6 +91,7 @@ import {
   isPointerLocked,
 } from "./input/input.ts";
 import { SnapshotBuffer } from "./net/interpolation.ts";
+import { LAN_HOST } from "virtual:lan-host";
 import { getShotConfig, applyShot } from "./bench/shots.ts";
 import { setLook } from "./input/input.ts";
 import {
@@ -381,8 +382,19 @@ hostBtn.addEventListener("click", async () => {
 });
 
 // Invite link with signaling mode for server consistency.
+//
+// The origin is rewritten to this machine's LAN address when we are browsing
+// on localhost: "http://localhost:5173/..."
+function inviteOrigin() {
+  const local = ["localhost", "127.0.0.1", "[::1]", "::1"].includes(
+    location.hostname,
+  );
+  if (!local || !LAN_HOST) return location.origin;
+  return `${location.protocol}//${LAN_HOST}${location.port ? `:${location.port}` : ""}`;
+}
+
 function inviteUrl() {
-  return `${location.origin}${location.pathname}?join=${encodeURIComponent(game.hostedId ?? "")}&s=${getSignalingMode()}&seed=${game.seed}&d=${game.difficulty}`;
+  return `${inviteOrigin()}${location.pathname}?join=${encodeURIComponent(game.hostedId ?? "")}&s=${getSignalingMode()}&seed=${game.seed}&d=${game.difficulty}`;
 }
 
 copyLinkBtn.addEventListener("click", async () => {

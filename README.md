@@ -112,15 +112,41 @@ npm run dev
 ```
 
 1. Open http://localhost:5173 in one window → **Host Game** → **Copy invite link**.
-2. Open the copied link in a second window (or another device on your LAN —
-   the dev server listens on your local IP too). It joins automatically.
+2. Open the copied link in a second window. It joins automatically.
+
+To test from **another device**, start with LAN exposure turned on:
+
+```bash
+LAN=1 npm run dev
+```
+
+Vite then prints a `Network:` URL and the invite link points at it. Without
+`LAN=1` the dev server is bound to loopback only — a dev server on `0.0.0.0`
+serves the whole project root to everyone on the same wifi, so it is opt-in
+rather than the default.
 
 Notes:
 
-- `npm run dev` also starts a **local PeerJS signaling server** (port 9004) —
-  local games don't depend on the public PeerJS cloud at all. If the local
-  server can't start (e.g. `peer` not installed yet), the app falls back to
-  the public cloud automatically.
+- `npm run dev` also starts a **local PeerJS signaling server**, proxied at
+  `/abyssal` on the dev server's own port — local games don't depend on the
+  public PeerJS cloud at all, and a joiner only ever has to reach the one
+  port that is already in the invite link (no second firewall hole, and
+  `wss://` for free behind an https tunnel). If the local server can't start
+  (e.g. `peer` not installed yet), the app falls back to the public cloud.
+- Under `LAN=1`, the invite link is rewritten to this machine's **LAN
+  address** when you are browsing on `localhost` — a `localhost` link pasted
+  into someone else's browser points at _their_ machine ("server not
+  found"). The address is read at dev-server start, so restart after
+  switching networks.
+- Signaling being local does **not** make the session local: the data
+  channels themselves are peer-to-peer WebRTC. On a network with client
+  isolation, or one that blocks mDNS (so Chrome's `*.local` host candidates
+  never resolve), two devices on the same wifi still cannot reach each
+  other, and ICE falls back to the public STUN/TURN servers in
+  `src/net/mesh.ts`. If those are blocked too, the join times out. Fully
+  offline-proof fallbacks: both windows on one machine, a phone hotspot, or
+  a tunnel (`cloudflared tunnel --url http://localhost:5173`) — the invite
+  link then works from anywhere.
 - Both windows will ask for mic access (proximity voice) — press V in one
   window to avoid feedback.
 - Clipboard may be blocked on non-HTTPS LAN URLs — the invite URL is then
