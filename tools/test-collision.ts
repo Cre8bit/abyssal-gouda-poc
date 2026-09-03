@@ -22,6 +22,10 @@
 //        compose. A scatter chunk's rendered surface buried in another
 //        scatter chunk's solid is a wall you can see through and cannot
 //        enter — the dark veins before Fix B raised their placement guard.
+//   T6 — an empty tile is empty (WG-25). A layer tile the generator proved
+//        surface-free is never meshed and caches no field; if the proof were
+//        wrong the tile would be an invisible collider, so every flagged one
+//        is filled here, at the SHIPPED resolutions, and must yield 0 tris.
 //
 // The world is built at res 32 (the predicates are resolution-independent and
 // a full-res node build costs ~80 s); tile size grows the blind shell, so the
@@ -527,6 +531,37 @@ const rng = mulberry32(9);
     `${st.fails}/${st.digs} still solid after the dig`,
   );
   console.log(`  · ${report(st)}`);
+}
+
+// T6 — a tile PROVEN empty really is empty (WG-25). Such a tile is never
+// meshed and never caches a field, so a proof that admitted one surface
+// triangle would leave an invisible collider behind. Checked at the SHIPPED
+// resolutions (a bigger marched box than this file's res 32), which is where
+// the proof runs thinnest — only the flagged tiles are filled, and they are
+// the cheap ones by construction.
+{
+  const shipped = buildWorldData({ seed: SEED, difficulty: 1 });
+  let flagged = 0;
+  let leaked = 0;
+  let tris = 0;
+  for (const c of shipped.chunks) {
+    if (!c.empty) continue;
+    flagged++;
+    const b = meshChunkBuffers(c);
+    c.field = null;
+    if (b.count) {
+      leaked++;
+      tris += b.count / 3;
+    }
+  }
+  check(
+    "T6: every tile proven surface-free meshes to zero triangles",
+    flagged > 0 && leaked === 0,
+    `${flagged} flagged, ${leaked} leaked ${Math.round(tris)} tris`,
+  );
+  console.log(
+    `  · ${flagged}/${shipped.chunks.length} tiles skipped at shipped res`,
+  );
 }
 
 console.log(

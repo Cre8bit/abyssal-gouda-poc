@@ -61,8 +61,9 @@ tools/               node-run (node 24 strips types natively)
   test-recipes.ts      worldgen recipe-table sanity checks (npm test)
   test-worldgen.ts     route verifier + world fingerprint (npm test)
   test-collision.ts    collision == render: chunkCovers parity, dig-then-swim,
-                       the effective collision radius, and mesh ⊆ open for
-                       scatter pairs, against a real node build (npm test)
+                       the effective collision radius, mesh ⊆ open for
+                       scatter pairs and the empty-tile proof, against a
+                       real node build (npm test)
 ```
 
 ## Conventions
@@ -239,11 +240,49 @@ up to 2.2×. Never compare it against a length directly: push through
 `tools/test-collision.ts` T4 pins the resulting effective collision radius.
 Dig remeshes run async through the pool (one in-flight per chunk, latest
 field wins) — collision is exact the
-moment digAt returns. Node and the tests keep the sync path
+moment digAt returns; a dig further than the meshing radius (a peer's, across
+the map) only queues the swap and waits for someone to come look. Node and
+the tests keep the sync path
 (`workers: false` or no Worker global); a full-res node build still costs
-~80 s — iterate at half res (the bench default). Biome wax is ONE shader
+~50 s — iterate at half res (the bench default). Biome wax is ONE shader
 program: colors/veinStrength/edge-glow are uniforms (WG-24), so bench skin
 edits write uniforms in place and never recompile.
+
+**The WG-25 pass** cut that build 27.7 → 16.0 s of fill (worst single chunk,
+which is what the pool's wall time floors at, 4.6 → 1.3 s) and bounded the
+memory, with the fingerprint and every field value untouched:
+
+- **Carve buckets** (`sdf.ts`). shareCarves can bury one chunk under
+  thousands of carves (the heart takes 3,978 from the galleries tiles it
+  interpenetrates) and every one of them was swept per voxel. Past 192
+  carves a chunk gets a dense per-cell index and sweeps one cell's worth.
+  The cell is a strict SUPERSET of what the per-carve `lim` test admits and
+  keeps carves in ascending order, and the lim test still runs on every
+  bucketed carve — so the applied sequence, and the field, is bit-identical
+  (verified chunk-by-chunk over the whole wheel world). `chunkSdf` therefore
+  dispatches to `plainSdf`/`bucketedSdf`: ONE function serving both leaves
+  V8 with a mixed hot loop that costs the carve-free hull tiles ~35%.
+- **Provably-empty tiles** (`gouda.ts`). 323 of the wheel world's 610 layer
+  tiles hold no cheese at all. `tileMeshesEmpty()` proves it from the body
+  alone — carves only remove material, so a marched box the body's surface
+  cannot enter can never hold a triangle — and those tiles never fill, never
+  cache a field and never enter the scene graph. The proof is conservative
+  (bodySdfWorld is not a metric, so box clearance is measured against a
+  Lipschitz bound on the body plus the crust-noise amplitude; an
+  inconclusive box subdivides, and at the depth limit the tile is simply
+  kept), it costs 4 ms for the whole world, and `test-collision.ts` T6 fills
+  every flagged tile at the SHIPPED resolutions to prove it yields 0 tris.
+  Tiles the proof misses are dropped by `mountOrDrop()` after the fill, on
+  the measured triangle count. A dropped tile is diggable as ever (chunkSdf)
+  and a dig re-queues it through the pump — except a PROVEN one, which has
+  no cheese to dig.
+- **Bounded field cache.** Fields are res³ Float32Arrays: a fully explored
+  world used to hold 484 MB of them and streaming only deferred that. Empty
+  chunks now cache none (−240 MB) and `pumpFieldCache` drops the rest for
+  undug chunks past `FIELD_KEEP` (60 u — well past dig reach, so a dig
+  always lands warm), which holds the dense inner biomes near 100 MB. A dig
+  into an evicted chunk refills cold through the pool, digs included, since
+  chunkSdf carries them.
 
 ## Model bench — standing rule
 

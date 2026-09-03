@@ -33,6 +33,15 @@
 // on that single chunk. Collision stays exact because the same dig list is
 // part of the chunk's SDF. The world is fully destructible.
 //
+// WHAT IS NEVER MESHED, AND WHAT IS NEVER KEPT (WG-25) — half of a layer's
+// lattice cells hold no cheese at all. tileMeshesEmpty() PROVES that from
+// the body alone (carves only remove material) and those tiles skip the fill
+// entirely; mountOrDrop() catches the rest after it, keeping neither an empty
+// mesh nor its field. Fields for undug chunks past FIELD_KEEP are evicted
+// (pumpFieldCache) and refilled cold on demand, and a dig out of meshing
+// range only queues the geometry swap (remeshDeferred) — chunkSdf is the
+// collider throughout, so none of this is ever felt as a phantom wall.
+//
 // ROTATION (WG-12) — band biomes may tumble: each chunk gets a seeded axis +
 // rate from a SIDE rng stream (the main stream, and so the fingerprint,
 // never moves). Orientation = rate × the clock fed to updateGouda; queries
@@ -143,6 +152,7 @@ export interface Chunk extends ChunkShape {
   zone?: ZoneName; // set by buildGoudaWorld
   sealed?: boolean; // seal tiles never receive foreign carves (noCarveWithin)
   spin?: SpinState; // rotating scatter chunk (WG-12); queries un-rotate probes
+  empty?: boolean; // layer tile PROVEN to hold no surface (WG-25): never meshed
 }
 
 export interface ChunkSpec {
@@ -715,6 +725,8 @@ function mountChunkMesh(
   return mesh;
 }
 
+// One chunk, meshed on the main thread. Exported for the worldgen bench,
+// which previews single chunks; the world itself goes through mountOrDrop.
 export function meshChunk(c: Chunk, material: THREE.Material): THREE.Mesh {
   const buffers = meshChunkBuffers(c);
   // Cache field; digs edit incrementally.
@@ -722,10 +734,31 @@ export function meshChunk(c: Chunk, material: THREE.Material): THREE.Mesh {
   return mountChunkMesh(c, buffers, material);
 }
 
-// Re-runs marching cubes for one chunk from its cached (dug) field.
+// First meshing of a world chunk — or its DROP (WG-25). Zero triangles means
+// no surface inside the marched box, so neither an empty mesh in the scene
+// graph nor a res³ cached field is worth keeping: chunkSdf still collides,
+// and a dig that gives the chunk a surface re-queues it (requestMesh).
+function mountOrDrop(
+  c: Chunk,
+  b: Omit<ChunkMeshBuffers, "field"> & { field?: Float32Array | null },
+  material: THREE.Material,
+): THREE.Mesh | null {
+  if (!b.count) {
+    c.field = null;
+    return null;
+  }
+  c.field = b.field ?? null;
+  return mountChunkMesh(c, b, material);
+}
+
+// Re-runs marching cubes for one chunk: from its cached (dug) field, or cold
+// from the SDF when the field was evicted (WG-25) — chunkSdf carries the digs
+// either way, so the two produce the same geometry.
 function remeshChunk(c: Chunk): void {
-  if (!c.mesh || !c.field) return; // chunk never finished building
-  const geometry = buffersToGeometry(meshChunkBuffers(c, c.field));
+  if (!c.mesh) return; // chunk never finished building
+  const buffers = meshChunkBuffers(c, c.field);
+  c.field = buffers.field;
+  const geometry = buffersToGeometry(buffers);
   c.mesh.geometry.dispose();
   c.mesh.geometry = geometry;
   refreshWireOverlay(c.mesh);
@@ -839,9 +872,33 @@ function submitMeshJob(
 // the collider) — only the visual swap is deferred.
 const remeshInFlight = new Set<Chunk>();
 const remeshDirty = new Set<Chunk>();
+// Digs beyond the meshing radius (a peer's, across the map): the geometry
+// swap is work nobody can see, so it waits for the player to come near.
+const remeshDeferred = new Set<Chunk>();
+// Where the local player was on the last frame that had a camera — copied,
+// never aliased, and absent in node/the bench (which never defer).
+const lastCamera = new THREE.Vector3();
+let hasCamera = false;
+
+function outOfMeshRange(c: Chunk): boolean {
+  return (
+    hasCamera && c.center.distanceTo(lastCamera) - chunkReach(c) > MESH_AHEAD
+  );
+}
 
 function scheduleRemesh(c: Chunk): void {
-  if (!c.mesh || !c.field) return; // never meshed yet: WG-22 bakes on arrival
+  if (!c.mesh) {
+    // Never meshed (WG-22 bakes the dig on arrival) or dropped as empty
+    // (WG-25) — either way the pump owns it now.
+    requestMesh(c);
+    return;
+  }
+  if (outOfMeshRange(c)) {
+    // The dig is already in the field (or in the dig list, for an evicted
+    // one); pumpDeferredRemesh runs this again in range.
+    remeshDeferred.add(c);
+    return;
+  }
   if (!getMeshPool()) {
     remeshChunk(c);
     return;
@@ -851,12 +908,26 @@ function scheduleRemesh(c: Chunk): void {
     return;
   }
   remeshInFlight.add(c);
-  submitMeshJob(c, c.field.slice(), false)
+  // Warm: the cached field, already carrying the dig. Cold (WG-25 eviction):
+  // the worker refills from the SDF — chunkSdf carries the digs — and hands
+  // the field back, minus any dig that landed after dispatch.
+  const warm = c.field;
+  let digsAtDispatch = 0;
+  submitMeshJob(c, warm ? warm.slice() : null, !warm, () => {
+    digsAtDispatch = c.digs.length;
+  })
     .then((r) => {
       if (!c.mesh) return;
       c.mesh.geometry.dispose();
       c.mesh.geometry = buffersToGeometry(r);
       refreshWireOverlay(c.mesh);
+      if (!r.field) return;
+      c.field = r.field;
+      if (c.digs.length > digsAtDispatch) {
+        for (let i = digsAtDispatch; i < c.digs.length; i++)
+          applyDigToField(c, c.digs[i]);
+        remeshDirty.add(c);
+      }
     })
     .catch((err) => {
       console.warn("gouda: remesh worker failed, remeshing on main", err);
@@ -875,11 +946,22 @@ function scheduleRemesh(c: Chunk): void {
 // unmeshed cheese is solid — and diggable — from frame one.
 const MESH_AHEAD = 120;
 let unmeshed: Chunk[] = [];
+const streamQueued = new Set<Chunk>(); // membership test for unmeshed
 let zoneMaterialsLive: Partial<Record<ZoneName, THREE.MeshToonMaterial>> = {};
 let streamBusy = 0;
 
 function chunkReach(c: Chunk): number {
   return c.body ? c.s * 1.75 : c.s * 1.4;
+}
+
+// Queue a chunk for (re)meshing through the distance pump. A chunk with no
+// mesh is either still streaming or was dropped for having no triangles
+// (WG-25); a dig can give the second kind a surface — unless it was PROVEN
+// surface-free, where there is no cheese to dig and never will be.
+function requestMesh(c: Chunk): void {
+  if (c.empty || c.mesh || !worldGroup || streamQueued.has(c)) return;
+  streamQueued.add(c);
+  unmeshed.push(c);
 }
 
 // A chunk that never meshes is an invisible solid, forever: chunkSdf collides
@@ -903,14 +985,15 @@ function streamChunk(c: Chunk): void {
     .then((r) => {
       if (worldGroup !== group || !group || c.mesh) return;
       streamFails.delete(c);
-      c.field = r.field;
-      mountStreamed(
-        c,
-        group,
-        mountChunkMesh(c, r, zoneMaterialsLive[c.zone!]!),
-      );
+      const mesh = mountOrDrop(c, r, zoneMaterialsLive[c.zone!]!);
+      if (mesh) mountStreamed(c, group, mesh);
       // Digs that landed after dispatch aren't in this field — bake + swap.
+      // A dropped chunk has no field to bake into: re-queue it instead.
       if (c.digs.length > digsAtDispatch) {
+        if (!mesh) {
+          requestMesh(c);
+          return;
+        }
         for (let i = digsAtDispatch; i < c.digs.length; i++)
           applyDigToField(c, c.digs[i]);
         scheduleRemesh(c);
@@ -927,7 +1010,7 @@ function streamChunk(c: Chunk): void {
           `gouda: streamed meshing failed (${fails}/${STREAM_RETRIES}), requeueing`,
           err,
         );
-        unmeshed.push(c);
+        requestMesh(c);
         return;
       }
       console.warn(
@@ -936,7 +1019,12 @@ function streamChunk(c: Chunk): void {
       );
       streamFails.delete(c);
       try {
-        mountStreamed(c, group, meshChunk(c, zoneMaterialsLive[c.zone!]!));
+        const mesh = mountOrDrop(
+          c,
+          meshChunkBuffers(c),
+          zoneMaterialsLive[c.zone!]!,
+        );
+        if (mesh) mountStreamed(c, group, mesh);
       } catch (err2) {
         // Out of options: the chunk stays a solid with no geometry. Say so.
         console.error(
@@ -983,7 +1071,37 @@ function pumpStreaming(cameraPos: THREE.Vector3): void {
     const c = unmeshed[0];
     if (c.center.distanceTo(cameraPos) - chunkReach(c) > MESH_AHEAD) break;
     unmeshed.shift();
+    streamQueued.delete(c);
     streamChunk(c);
+  }
+}
+
+// Deferred dig remeshes whose chunk came back into meshing range.
+function pumpDeferredRemesh(cameraPos: THREE.Vector3): void {
+  for (const c of remeshDeferred) {
+    if (c.center.distanceTo(cameraPos) - chunkReach(c) > MESH_AHEAD) continue;
+    remeshDeferred.delete(c);
+    scheduleRemesh(c);
+  }
+}
+
+// --- Field cache eviction (WG-25) ------------------------------------------------------
+
+// A cached field is a res³ Float32Array — a fully explored wheel world holds
+// ~480 MB of them, and streaming only DEFERS that cost, it never bounds it.
+// An undug chunk far from the player is dropped: its geometry stays mounted,
+// and a dig refills the field cold through the pool (4–90 ms outside the
+// heart) with the digs already in it, because chunkSdf carries them. A DUG
+// chunk keeps its field — that is the cheap way back to its carved surface.
+// Well past the player's dig reach and its own 4 Hz refresh, so a dig always
+// lands on a chunk whose field is still cached.
+const FIELD_KEEP = 60;
+
+function pumpFieldCache(cameraPos: THREE.Vector3): void {
+  for (const c of chunks) {
+    if (!c.field || c.digs.length) continue;
+    if (c.center.distanceTo(cameraPos) - chunkReach(c) > FIELD_KEEP)
+      c.field = null;
   }
 }
 
@@ -1127,10 +1245,8 @@ export function digAt(
     // Collision is correct from here (chunkSdf includes the dig). A chunk
     // not yet meshed (WG-22) has no field to edit — its eventual first
     // meshing includes the dig via chunkSdf.
-    if (c.field) {
-      applyDigToField(c, dig);
-      scheduleRemesh(c);
-    }
+    if (c.field) applyDigToField(c, dig);
+    scheduleRemesh(c); // fieldless chunks refill cold / re-queue (WG-25)
     changed = true;
   }
 
@@ -1613,6 +1729,10 @@ export function updateGouda(
   visibility = 90,
 ): void {
   uGoudaTime.value = elapsed;
+  if (cameraPos) {
+    lastCamera.copy(cameraPos);
+    hasCamera = true;
+  }
 
   // WG-12: orientation = rate × clock, refreshed once per frame — queries
   // un-rotate probes through the same cos/sin, so collision == render holds
@@ -1642,6 +1762,8 @@ export function updateGouda(
   if (cameraPos && worldGroup && elapsed - lastCull > 0.25) {
     lastCull = elapsed;
     pumpStreaming(cameraPos); // WG-22: mesh what the player is approaching
+    pumpDeferredRemesh(cameraPos); // digs that landed out of meshing range
+    pumpFieldCache(cameraPos); // WG-25: drop far, undug voxel fields
     const cullDist = Math.min(Math.max(visibility * 1.25, 80), 720);
     for (const child of worldGroup.children) {
       const reach =
@@ -2257,6 +2379,89 @@ function addWorldTunnel(
     });
 }
 
+// --- Provably-empty layer tiles (WG-25) -------------------------------------------
+
+// A tile whose marched box the body's surface cannot enter meshes to ZERO
+// triangles, because carves only remove cheese — they never add a surface.
+// Proving it before meshing skips a res³ field fill, the Float32Array it
+// would have cached and an empty mesh in the scene graph (94% of the wheel
+// world's 339 such tiles; the rest are caught by mountOrDrop after the fill).
+//
+// bodySdfWorld is NOT a metric, so a box is cleared only when its centre
+// clears the box half-diagonal scaled by a Lipschitz bound on the body, plus
+// the crust noise's own amplitude. An inconclusive box subdivides, and at the
+// depth limit the tile is simply kept — the proof only ever errs toward
+// meshing, never toward an invisible collider.
+const FBM_MAX = 1.5; // |fbm3| — two ImprovedNoise octaves at 1 + 0.5
+const FBM_GRAD = 8; // |∇fbm3|
+const SMIN_SLACK = 1.15; // the soft spots' smoothMin stretches the gradient
+const EMPTY_DEPTH = 6;
+const SQRT3 = Math.sqrt(3);
+
+function bodyLipschitz(b: LayerBody): number {
+  if (b.kind === "band") {
+    // frameRadius stretches by 1/squash, the warp by its own slope — and
+    // bodySdfWorld then scales the whole band distance back by squash.
+    const squash = b.frame?.squash ?? 1;
+    return (
+      (1 / squash + b.warpAmp * b.warpFreq * FBM_GRAD) * Math.min(1, squash)
+    );
+  }
+  return (1 + b.ridgeAmp * b.ridgeFreq) * SMIN_SLACK;
+}
+
+function boxClearsBody(
+  b: LayerBody,
+  lip: number,
+  margin: number,
+  x: number,
+  y: number,
+  z: number,
+  half: number,
+  depth: number,
+): boolean {
+  const d = bodySdfWorld(b, x, y, z);
+  const reach = lip * half * SQRT3 + margin;
+  if (d > reach) return true; // the whole box is outside the body
+  if (d < -reach || depth >= EMPTY_DEPTH) return false; // inside, or unproven
+  const q = half / 2;
+  for (let i = -1; i <= 1; i += 2)
+    for (let j = -1; j <= 1; j += 2)
+      for (let k = -1; k <= 1; k += 2)
+        if (
+          !boxClearsBody(
+            b,
+            lip,
+            margin,
+            x + i * q,
+            y + j * q,
+            z + k * q,
+            q,
+            depth + 1,
+          )
+        )
+          return false;
+  return true;
+}
+
+// The box a tile actually marches: half-width s(1 - 3/res), centred s/res
+// back from the tile centre (the same box the J overlay draws).
+function tileMeshesEmpty(c: Chunk): boolean {
+  const body = c.body;
+  if (!body) return false;
+  const off = c.s / c.res;
+  return boxClearsBody(
+    body,
+    bodyLipschitz(body),
+    FBM_MAX * c.amp * c.s,
+    c.center.x - off,
+    c.center.y - off,
+    c.center.z - off,
+    c.s * (1 - 3 / c.res),
+    0,
+  );
+}
+
 // One layer-body biome → tile chunks. Carves are generated in WORLD units:
 // per-tile eye clusters + trees, an inter-tile spanning tree + loops, side
 // exits, and the spine doors, then distributed into every tile they touch.
@@ -2644,6 +2849,7 @@ export function buildLayerChunks(
       body,
     };
     if (part.noCarveWithin != null) c.sealed = true;
+    if (tileMeshesEmpty(c)) c.empty = true;
     let biggest: SphereCarve | null = null;
     for (const e of tileEyes[t]) if (!biggest || e.r > biggest.r) biggest = e;
     c.biggestEye = biggest
@@ -3209,11 +3415,17 @@ export async function buildGoudaWorld(
   for (const chunk of data.chunks) chunks.push(chunk);
 
   let built = 0;
-  const finishChunk = (chunk: Chunk, i: number, mesh: THREE.Mesh): void => {
-    mesh.userData.reach = chunkReach(chunk);
-    mesh.userData.zone = chunk.zone; // bench perf HUD groups triangles by this
-    triangles += mesh.geometry.attributes.position.count / 3;
-    group.add(mesh);
+  const finishChunk = (
+    chunk: Chunk,
+    i: number,
+    mesh: THREE.Mesh | null,
+  ): void => {
+    if (mesh) {
+      mesh.userData.reach = chunkReach(chunk);
+      mesh.userData.zone = chunk.zone; // bench perf HUD groups triangles by this
+      triangles += mesh.geometry.attributes.position.count / 3;
+      group.add(mesh);
+    }
     onProgress(++built, total, specs[i].label);
   };
 
@@ -3230,6 +3442,11 @@ export async function buildGoudaWorld(
   if (useWorkers) {
     await Promise.all(
       data.chunks.map(async (chunk, i) => {
+        // Proven surface-free (WG-25): no fill, no field, no mesh.
+        if (chunk.empty) {
+          onProgress(++built, total, specs[i].label);
+          return;
+        }
         if (
           streaming &&
           Math.hypot(
@@ -3246,22 +3463,33 @@ export async function buildGoudaWorld(
         }
         try {
           const r = await submitMeshJob(chunk, null, true);
-          chunk.field = r.field;
+          finishChunk(chunk, i, mountOrDrop(chunk, r, materials[chunk.zone!]!));
+        } catch (err) {
+          console.warn("gouda: mesh worker failed, meshing on main", err);
           finishChunk(
             chunk,
             i,
-            mountChunkMesh(chunk, r, materials[chunk.zone!]!),
+            mountOrDrop(
+              chunk,
+              meshChunkBuffers(chunk),
+              materials[chunk.zone!]!,
+            ),
           );
-        } catch (err) {
-          console.warn("gouda: mesh worker failed, meshing on main", err);
-          finishChunk(chunk, i, meshChunk(chunk, materials[chunk.zone!]!));
         }
       }),
     );
   } else {
     for (let i = 0; i < data.chunks.length; i++) {
       const chunk = data.chunks[i];
-      finishChunk(chunk, i, meshChunk(chunk, materials[chunk.zone!]!));
+      if (chunk.empty) {
+        onProgress(++built, total, specs[i].label);
+        continue;
+      }
+      finishChunk(
+        chunk,
+        i,
+        mountOrDrop(chunk, meshChunkBuffers(chunk), materials[chunk.zone!]!),
+      );
       await nextTick();
     }
   }
@@ -3334,11 +3562,14 @@ export function disposeWorld(scene: THREE.Scene): void {
   hasSpin = false;
   chunkGrid = null;
   unmeshed = [];
+  streamQueued.clear();
   streamFails.clear();
   streamWarned.clear();
   zoneMaterialsLive = {};
   remeshInFlight.clear();
   remeshDirty.clear();
+  remeshDeferred.clear();
+  hasCamera = false;
   wireframeOn = false;
   wireMaterial = null;
   // Box geometries are shared across chunks: the traverse above disposed

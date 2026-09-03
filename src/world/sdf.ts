@@ -7,7 +7,9 @@
 //
 //   · shape math: smooth ops, fbm3 crust noise, world frame, layer bodies
 //   · chunkSdf(): the full per-chunk SDF (base + carves + player digs) —
-//     the single source of truth for meshing, collision and digging
+//     the single source of truth for meshing, collision and digging. Chunks
+//     shareCarves has buried under hundreds of carves take the BUCKETED
+//     sweep (WG-25): same carves, same order, one cell's worth per sample
 //   · fillField()/extractBuffers()/meshChunkBuffers(): voxel field fill +
 //     compact geometry extraction (positions/normals/aCrust/aVein) as plain
 //     typed arrays — transferable, wrapped into THREE geometry by callers
@@ -332,12 +334,22 @@ export function baseSdf(
 }
 
 // Full chunk SDF, local [-1,1]. Used for meshing, collision, digging.
+// The carve sweep comes in two shapes: the plain one, and the bucketed one
+// for chunks shareCarves has buried under hundreds of carves (WG-25). They
+// stay SEPARATE functions on purpose — one function serving both leaves V8
+// with a mixed hot loop that costs the carve-free hull tiles ~35%.
 export function chunkSdf(
   c: ChunkShape,
   x: number,
   y: number,
   z: number,
 ): number {
+  return c.holes.length + c.tunnels.length > CARVE_BUCKET_THRESHOLD
+    ? bucketedSdf(c, x, y, z)
+    : plainSdf(c, x, y, z);
+}
+
+function plainSdf(c: ChunkShape, x: number, y: number, z: number): number {
   let d = baseSdf(c, x, y, z);
 
   if (d > CARVE_SKIP) return d;
@@ -378,11 +390,73 @@ export function chunkSdf(
     if (d > 0.45) return d;
   }
 
-  // Player digs (runtime carves) — kept in the SDF so collision matches the
-  // re-meshed geometry exactly. Same lim bounding as holes (WG-23a); heavily
-  // dug chunks fall over to a per-cell bucket (WG-23c) — both exclusions are
-  // strict supersets of what the smoothCut would have no-op'd, so the values
-  // near the isosurface are bit-identical to the plain sweep.
+  return applyDigs(c, x, y, z, d);
+}
+
+// Same sweep over the sample's carve cell only. The cell is a superset of
+// what the `lim` tests admit and keeps carves in ascending order, so the
+// applied sequence — and every field value — matches plainSdf exactly.
+function bucketedSdf(c: ChunkShape, x: number, y: number, z: number): number {
+  let d = baseSdf(c, x, y, z);
+
+  if (d > CARVE_SKIP) return d;
+
+  const grid = carveGrid(c);
+  const cell =
+    (carveCell(x) * CARVE_NC + carveCell(y)) * CARVE_NC + carveCell(z);
+
+  const holes = c.holes;
+  const hIdx = grid.hIdx;
+  const hTo = grid.hStart[cell + 1];
+  for (let i = grid.hStart[cell]; i < hTo; i++) {
+    const h = holes[hIdx[i]];
+    const lim = d < -0.25 ? h.r + 0.31 : h.r - d + 0.06;
+    const dx = x - h.x;
+    if (dx > lim || dx < -lim) continue;
+    const dy = y - h.y;
+    if (dy > lim || dy < -lim) continue;
+    const dz = z - h.z;
+    if (dz > lim || dz < -lim) continue;
+    d = smoothCut(d, Math.sqrt(dx * dx + dy * dy + dz * dz) - h.r, SMOOTH_K);
+    if (d > 0.45) return d;
+  }
+
+  const tunnels = c.tunnels;
+  const tIdx = grid.tIdx;
+  const tTo = grid.tStart[cell + 1];
+  for (let i = grid.tStart[cell]; i < tTo; i++) {
+    const t = tunnels[tIdx[i]];
+    const lim = d < -0.25 ? t.r + 0.31 : t.r - d + 0.06;
+    if (x > Math.max(t.ax, t.bx) + lim || x < Math.min(t.ax, t.bx) - lim)
+      continue;
+    if (y > Math.max(t.ay, t.by) + lim || y < Math.min(t.ay, t.by) - lim)
+      continue;
+    if (z > Math.max(t.az, t.bz) + lim || z < Math.min(t.az, t.bz) - lim)
+      continue;
+    d = smoothCut(
+      d,
+      segDist(x, y, z, t.ax, t.ay, t.az, t.bx, t.by, t.bz) - t.r,
+      SMOOTH_K,
+    );
+    if (d > 0.45) return d;
+  }
+
+  return applyDigs(c, x, y, z, d);
+}
+
+// Player digs (runtime carves) — kept in the SDF so collision matches the
+// re-meshed geometry exactly. Same lim bounding as holes (WG-23a); heavily
+// dug chunks fall over to a per-cell bucket (WG-23c) — both exclusions are
+// strict supersets of what the smoothCut would have no-op'd, so the values
+// near the isosurface are bit-identical to the plain sweep.
+function applyDigs(
+  c: ChunkShape,
+  x: number,
+  y: number,
+  z: number,
+  d0: number,
+): number {
+  let d = d0;
   const digs = c.digs;
   const bucket =
     digs.length > DIG_BUCKET_THRESHOLD
@@ -400,8 +474,116 @@ export function chunkSdf(
     if (dz > lim || dz < -lim) continue;
     d = smoothCut(d, Math.sqrt(dx * dx + dy * dy + dz * dz) - g.r, SMOOTH_K);
   }
-
   return d;
+}
+
+// --- Carve buckets (WG-25) --------------------------------------------------------
+
+// shareCarves can bury one chunk under thousands of carves (the heart takes
+// ~4k from the galleries tiles it interpenetrates), and every one of them was
+// swept per voxel. Past the threshold a chunk gets a lazy dense grid over its
+// local box instead, in CSR form (per-cell slices of one index array), built
+// once per ChunkShape — so the worker builds it once per job and the game's
+// live chunks keep theirs for collision queries too.
+//
+// A cell holds every carve whose AABB, grown by CARVE_PAD, touches it. That
+// is a strict SUPERSET of what the `lim` test admits (lim never exceeds
+// r + 0.31, because d only grows through the sweep), the lim test still runs
+// on every bucketed carve, and cell contents stay in ascending carve order —
+// so the applied carve sequence, and every field value, is unchanged.
+const CARVE_BUCKET_THRESHOLD = 192;
+const CARVE_PAD = 0.4; // ≥ the largest lim excess over r (r + 0.31)
+const CARVE_NC = 16; // cells per axis
+const CARVE_LO = -1.5; // the local box carves live in: [-1.5, 1.5]
+const CARVE_CELL = 3 / CARVE_NC;
+const CARVE_CELLS = CARVE_NC * CARVE_NC * CARVE_NC;
+
+interface CarveGrid {
+  count: number; // holes + tunnels when built (a later push rebuilds)
+  hStart: Int32Array;
+  hIdx: Int32Array;
+  tStart: Int32Array;
+  tIdx: Int32Array;
+}
+
+const carveGrids = new WeakMap<ChunkShape, CarveGrid>();
+
+function carveCell(v: number): number {
+  const i = Math.floor((v - CARVE_LO) / CARVE_CELL);
+  return i < 0 ? 0 : i >= CARVE_NC ? CARVE_NC - 1 : i;
+}
+
+// Bin one list by its per-carve cell ranges (6 entries each: lo/hi per axis).
+function buildCsr(
+  n: number,
+  ranges: Int32Array,
+): { start: Int32Array; idx: Int32Array } {
+  const start = new Int32Array(CARVE_CELLS + 1);
+  for (let i = 0; i < n; i++) {
+    const o = i * 6;
+    for (let cx = ranges[o]; cx <= ranges[o + 3]; cx++)
+      for (let cy = ranges[o + 1]; cy <= ranges[o + 4]; cy++)
+        for (let cz = ranges[o + 2]; cz <= ranges[o + 5]; cz++)
+          start[(cx * CARVE_NC + cy) * CARVE_NC + cz + 1]++;
+  }
+  for (let i = 0; i < CARVE_CELLS; i++) start[i + 1] += start[i];
+  const idx = new Int32Array(start[CARVE_CELLS]);
+  const cursor = start.slice(0, CARVE_CELLS);
+  for (let i = 0; i < n; i++) {
+    const o = i * 6;
+    for (let cx = ranges[o]; cx <= ranges[o + 3]; cx++)
+      for (let cy = ranges[o + 1]; cy <= ranges[o + 4]; cy++)
+        for (let cz = ranges[o + 2]; cz <= ranges[o + 5]; cz++)
+          idx[cursor[(cx * CARVE_NC + cy) * CARVE_NC + cz]++] = i;
+  }
+  return { start, idx };
+}
+
+function buildCarveGrid(c: ChunkShape): CarveGrid {
+  const holes = c.holes;
+  const hr = new Int32Array(holes.length * 6);
+  for (let i = 0; i < holes.length; i++) {
+    const h = holes[i];
+    const reach = h.r + CARVE_PAD;
+    const o = i * 6;
+    hr[o] = carveCell(h.x - reach);
+    hr[o + 1] = carveCell(h.y - reach);
+    hr[o + 2] = carveCell(h.z - reach);
+    hr[o + 3] = carveCell(h.x + reach);
+    hr[o + 4] = carveCell(h.y + reach);
+    hr[o + 5] = carveCell(h.z + reach);
+  }
+  const tunnels = c.tunnels;
+  const tr = new Int32Array(tunnels.length * 6);
+  for (let i = 0; i < tunnels.length; i++) {
+    const t = tunnels[i];
+    const reach = t.r + CARVE_PAD;
+    const o = i * 6;
+    tr[o] = carveCell(Math.min(t.ax, t.bx) - reach);
+    tr[o + 1] = carveCell(Math.min(t.ay, t.by) - reach);
+    tr[o + 2] = carveCell(Math.min(t.az, t.bz) - reach);
+    tr[o + 3] = carveCell(Math.max(t.ax, t.bx) + reach);
+    tr[o + 4] = carveCell(Math.max(t.ay, t.by) + reach);
+    tr[o + 5] = carveCell(Math.max(t.az, t.bz) + reach);
+  }
+  const h = buildCsr(holes.length, hr);
+  const t = buildCsr(tunnels.length, tr);
+  const grid: CarveGrid = {
+    count: holes.length + tunnels.length,
+    hStart: h.start,
+    hIdx: h.idx,
+    tStart: t.start,
+    tIdx: t.idx,
+  };
+  carveGrids.set(c, grid);
+  return grid;
+}
+
+function carveGrid(c: ChunkShape): CarveGrid {
+  const grid = carveGrids.get(c);
+  return grid && grid.count === c.holes.length + c.tunnels.length
+    ? grid
+    : buildCarveGrid(c);
 }
 
 // --- Dig buckets (WG-23c) ---------------------------------------------------------
