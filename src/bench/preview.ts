@@ -33,6 +33,7 @@ import {
   solveHeldAnchor,
   PHASE_EASE,
   PHASE_EASE_DEFAULT,
+  STICK_DWELL,
   type ArmPose,
   type CarryKind,
   type DiverRig,
@@ -124,12 +125,14 @@ const CARRY_CYCLE: CarryKind[] = ["none", "gouda", "driller", "lightStick"];
 const nextCarry = (c: CarryKind) =>
   CARRY_CYCLE[(CARRY_CYCLE.indexOf(c) + 1) % CARRY_CYCLE.length];
 // The light stick's throw, as a bench-side driver: name the phase each frame
-// and diverRig blends between its authored states. This is the shape a game
-// system will have — a timeline of [state, seconds], nothing more.
+// and diverRig blends between its authored states. The dwell times are the
+// SHIPPED ones (STICK_DWELL, walked by systems/lightStickSystem.ts); only the
+// hold is the bench's own, because in game it lasts until you throw.
+const BENCH_HOLD_S = 0.9;
 const THROW_SEQ: [string, number][] = [
-  ["grab", 0.45],
-  ["hold", 0.9],
-  ["throw", 0.55],
+  ["grab", STICK_DWELL.grab],
+  ["hold", BENCH_HOLD_S],
+  ["throw", STICK_DWELL.throw],
 ];
 function makeThrow() {
   let step = -1; // -1 = idle, resting in "hold"
@@ -2015,9 +2018,9 @@ const MODELS: BenchModelDef[] = [
         // The throw cycle: reach to the belt, carry it, whip it away, and
         // (after the paw comes back empty) reach for the next one.
         play: [
-          ["grab", 0.35],
-          ["hold", 1.1],
-          ["throw", 0.5],
+          ["grab", STICK_DWELL.grab],
+          ["hold", BENCH_HOLD_S],
+          ["throw", STICK_DWELL.throw],
         ],
         ghost: "grab",
       }),

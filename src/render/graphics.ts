@@ -36,6 +36,11 @@ import {
 import { initCatfishSystem } from "../entities/catfish.ts";
 import { setGoudaScene } from "../entities/goldenGouda.ts";
 import { setDrillerScene, getMountedDriller } from "../entities/driller.ts";
+import {
+  setLightStickScene,
+  createLightStickVisual,
+  type LightStickVisual,
+} from "../entities/lightStick.ts";
 import { toonMaterial } from "./toon.ts";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
@@ -130,6 +135,12 @@ interface RemotePlayer {
   lastPos: THREE.Vector3;
   hasLast: boolean;
   carry: CarryKind;
+  /** Named state of a phased grip (the light stick's grab/hold/throw). */
+  carryPhase: string | undefined;
+  /** Set while this diver should have a stick in its paw… */
+  wantStick: boolean;
+  /** …and the visual that lands there once the rig has loaded. */
+  stick: LightStickVisual | null;
 }
 
 // traverse() hands back plain Object3Ds; disposables are found by probing.
@@ -268,6 +279,9 @@ const localState = {
   swimPitch: 0,
   vel: new THREE.Vector3(),
   carry: "none" as CarryKind,
+  carryPhase: undefined as string | undefined,
+  wantStick: false,
+  stick: null as LightStickVisual | null,
 };
 
 // FP suit: double-sided, darkened to prevent blown-out arms in torch core
@@ -312,9 +326,11 @@ export function updateLocalPlayer(
   swimPitch: number,
   vel: Vec3,
   carry: CarryKind = "none",
+  carryPhase?: string,
 ): void {
   localState.active = true;
   localState.carry = carry;
+  localState.carryPhase = carryPhase;
   localState.pos.set(pos.x, pos.y, pos.z);
   localState.yaw = yaw;
   localState.pitch = pitch;
@@ -338,7 +354,47 @@ function updateLocalBody(delta: number): void {
     lookPitch: localState.pitch,
     vel: localState.vel,
     carry: localState.carry,
+    carryPhase: localState.carryPhase,
   });
+  localState.stick = reconcileStick(
+    localBody.rig,
+    localState.wantStick,
+    localState.stick,
+  );
+  localState.stick?.update(elapsed, true);
+}
+
+// Give a diver a lit stick in its right paw, or take it away. One visual per
+// diver (unlike the shared driller — several divers can hold one at once),
+// hung off the grip's own paw anchor so the rig's state blend carries it.
+// Returns the visual the caller should keep; null once there is none.
+function reconcileStick(
+  rig: DiverRig | null,
+  want: boolean,
+  stick: LightStickVisual | null,
+): LightStickVisual | null {
+  if (want) {
+    if (stick) return stick;
+    const anchor = rig ? holdAnchor(rig, "lightStick") : null;
+    if (!anchor) return null; // rig still loading — retried next frame
+    const fresh = createLightStickVisual();
+    anchor.add(fresh.group);
+    return fresh;
+  }
+  if (!stick) return null;
+  stick.group.removeFromParent();
+  stick.dispose();
+  return null;
+}
+
+// Which diver holds a light stick: null id is the local first-person body.
+export function setDiverStick(id: string | null, on: boolean): void {
+  if (id === null) {
+    localState.wantStick = on;
+    return;
+  }
+  const player = players.get(id);
+  if (player) player.wantStick = on;
 }
 
 function renderPixelRatio(): number {
@@ -390,6 +446,7 @@ export function initGraphics(container: HTMLElement): HTMLCanvasElement {
   initCatfishSystem(scene);
   setGoudaScene(scene); // the Golden Gouda mounts itself here when it spawns
   setDrillerScene(scene); // the driller mounts itself here when it spawns
+  setLightStickScene(scene); // …and every thrown light stick, by item id
   createSnow();
   createBubbles();
   createBursts();
@@ -1537,6 +1594,9 @@ export function addPlayer(id: string, color: THREE.ColorRepresentation): void {
     lastPos: new THREE.Vector3(),
     hasLast: false,
     carry: "none",
+    carryPhase: undefined,
+    wantStick: false,
+    stick: null,
   };
   players.set(id, player);
 
@@ -1600,7 +1660,10 @@ function updateRemoteDiver(player: RemotePlayer, delta: number): void {
     lookPitch: player.lookPitch,
     vel: player.velEst,
     carry: player.carry,
+    carryPhase: player.carryPhase,
   });
+  player.stick = reconcileStick(rig, player.wantStick, player.stick);
+  player.stick?.update(elapsed, true);
 
   // Torch: positioned/oriented along look direction
   _v1.copy(TORCH_OFFSET).applyQuaternion(rig.lookQuat);
@@ -1613,6 +1676,11 @@ function updateRemoteDiver(player: RemotePlayer, delta: number): void {
 export function removePlayer(id: string): void {
   const player = players.get(id);
   if (!player) return;
+  // The stick in this paw is this diver's own (unlike the shared driller
+  // rescued below): free its light and clone with the body.
+  player.stick?.group.removeFromParent();
+  player.stick?.dispose();
+  player.stick = null;
   // A prop in this diver's paw is shared, not theirs: rescue it before the
   // traversal below disposes the geometry every other driller would reuse.
   const prop = getMountedDriller()?.group;
@@ -1667,6 +1735,18 @@ export function updatePlayerPosition(
 export function setPlayerCarry(id: string, carry: CarryKind): void {
   const player = players.get(id);
   if (player) player.carry = carry;
+}
+
+// …and which state of it, for a grip that animates (the light stick's belt
+// grab → hold → throw). Kept off setPlayerCarry because the two arrive by
+// different roads: the carry kind rides the status mask at the packet rate,
+// the phase is published once per transition by systems/lightStickSystem.ts.
+export function setPlayerCarryPhase(
+  id: string,
+  phase: string | undefined,
+): void {
+  const player = players.get(id);
+  if (player) player.carryPhase = phase;
 }
 
 // Park the driller in its carrier's right paw, where it inherits the arm's

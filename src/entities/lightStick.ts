@@ -273,3 +273,40 @@ export function loadLightStickTemplate(): Promise<LightStickTemplate | null> {
     });
   return templatePromise;
 }
+
+// --- Game-side world instances -----------------------------------------------
+// graphics.ts hands us the scene at boot (same contract as driller.ts). Unlike
+// the driller there is no single stick: every thrown baton is its own item, so
+// the registry is keyed by item id. Sticks held IN A PAW are not here — those
+// belong to the diver's rig and graphics.ts owns them.
+
+let gameScene: THREE.Scene | null = null;
+const mounted = new Map<string, LightStickVisual>();
+
+export function setLightStickScene(scene: THREE.Scene): void {
+  gameScene = scene;
+  void loadLightStickTemplate(); // warm it before the first throw
+}
+
+export function mountLightStick(id: string): LightStickVisual | null {
+  if (!gameScene) return null;
+  let visual = mounted.get(id);
+  if (!visual) {
+    visual = createLightStickVisual();
+    gameScene.add(visual.group);
+    mounted.set(id, visual);
+  }
+  return visual;
+}
+
+export function unmountLightStick(id: string): void {
+  const visual = mounted.get(id);
+  if (!visual) return;
+  mounted.delete(id);
+  visual.group.removeFromParent();
+  visual.dispose();
+}
+
+export function getMountedLightStick(id: string): LightStickVisual | null {
+  return mounted.get(id) ?? null;
+}

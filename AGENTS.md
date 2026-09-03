@@ -29,6 +29,7 @@ src/
   systems/           per-frame simulation slices + their registry
     types.ts registry.ts effectsSystem.ts oxygenSystem.ts
     catfishSystem.ts cargoSystem.ts itemsSystem.ts
+    drillerSystem.ts lightStickSystem.ts
   world/             the map
     gouda.ts           destructible SDF cheese world (marching cubes) —
                        the shape-family/placement IMPLEMENTATIONS, queries,
@@ -46,6 +47,8 @@ src/
     catfish.ts         lantern-catfish AI + model
     diverRig.ts        procedural skinned swim rig
     goldenGouda.ts     the Golden Gouda wheel + its levitating bits
+    driller.ts         the rind-opening power tool (one shared prop)
+    lightStick.ts      the throwable chem baton (one prop per thrown item)
   render/
     graphics.ts        scene, camera, post, particles, render loop
     toon.ts            shared cel-shading kit — the ONLY toon-material door
@@ -473,11 +476,24 @@ The light stick ships three — `grab` (the paw down at the belt, closing on a
 holstered baton), `hold` (up and out in front, lighting the way) and `throw`
 (swung through, paw open) — and `updateDiverRig({ carry, carryPhase })` blends
 whichever is asked for over a smoothstep, at a per-state rate (`PHASE_EASE`: a
-throw snaps, a reach to the belt reads as a movement). The prop's paw anchor
-is interpolated across the same blend from the per-state solves, so it is
-always exactly where the arms holding it put it — never a second animation
-that can drift out of sync with the first. `rig.gripPhase`/`rig.gripU` are the
-read-back a game system times a release off.
+throw snaps, a reach to the belt reads as a movement). How long the timeline
+SITS in each state before naming the next is `STICK_DWELL`, exported so the
+game (`systems/lightStickSystem.ts`) and the bench's "throw stick" preview
+walk one set of numbers. The prop's paw anchor is interpolated across the same
+blend from the per-state solves, so it is always exactly where the arms
+holding it put it — never a second animation that can drift out of sync with
+the first. `rig.gripPhase`/`rig.gripU` are the read-back a game system times a
+release off.
+
+The light stick's states carry a SECOND right arm for first person
+(`FP_STICK_*_R`), the same split `ARM_POSE_CARRY_FP` makes for the Gouda and
+for the same reason: the third-person poses are authored in the bench against
+a body seen from outside, and replayed at the eye they put the wrist 0.16 u
+from the lens with the shoulder cut about to swing into frame. The FP set is
+screenshot-tuned in the gloves bench instead. This costs nothing in
+consistency, because `holdAnchor()` solves the prop into the HAND BONE's frame
+from the third-person pose — so the baton is in the paw whichever arm the view
+is drawing.
 
 Every number in those states was authored in the bench, not by hand: see the
 pose editors above.
@@ -498,6 +514,44 @@ Both are RIGID IN THE VIEW FRAME — forward and down rotate with the look — s
 the wheel holds one spot relative to its carrier however they tilt. It has to:
 the arms are posed in that same frame, and a world-vertical drop would slide
 the wheel through the hands on every pitch.
+
+## Light sticks (`systems/lightStickSystem.ts`)
+
+Every diver dives with four chem batons (`LIGHT_STICKS_PER_DIVER`). `[G]`
+draws one from the belt or clips it back, left mouse throws it, and `[E]`
+picks a thrown one back up. The mechanic is split by what has to be agreed on:
+
+- **The belt is local.** `game.lightSticks` never crosses the wire — nobody
+  else needs your count, only what you put in the water. The DRAWN stick is
+  not an item either: it is a pose plus a visual in your own paw, published as
+  `STATUS.HOLDING_STICK` (the last of the 7 wire bits, which picks the grip)
+  plus a `stick` event per transition (which of the grip's three states the
+  arms are in). Two roads on purpose: the bit is in every state packet, so a
+  diver you swim up to is already holding what they are holding, while the
+  event only has to carry the four transitions an animation needs.
+- **A thrown stick is an item** (`game/items.ts`, kind `lightStick`),
+  replicated like any other. Its THROWER integrates the flight and resyncs at
+  `LOOSE_SYNC_S`; everyone else chases the synced position (`REMOTE_SMOOTH`)
+  so seven samples read as a flight and not as seven hops. Water is the whole
+  physics — drag until the throw is spent, then it hangs there, because a chem
+  baton is neutrally buoyant and that is what makes it a breadcrumb. Picking
+  one up is contested and goes through the host exactly like the driller:
+  the REMOVAL of the item is the grant, so no two clients can both believe
+  they took it.
+
+The visuals come from two places, because a stick in a paw belongs to a diver
+and a stick in the water does not. `entities/lightStick.ts` keeps a mount
+registry keyed by ITEM ID for the thrown ones (unlike `driller.ts`, where one
+shared prop is enough); `render/graphics.ts` owns the held ones, one per diver,
+hung off that diver's own `holdAnchor(rig, "lightStick")`. Only the nearest
+`MAX_LIVE_LIGHTS` thrown sticks keep a live `PointLight` — the vials still
+glow, being unlit geometry, but a diver who has salted a gallery with a dozen
+of them should not pay a uniform slot and a shader recompile for the ones
+behind them.
+
+`?shot=fp-stick` / `fp-stick-swim` capture a drawn stick in the real game (the
+harness dispatches the `[G]` keydown); `__abyssal.stick` drives the whole state
+machine from the console, which is how the throw was verified end to end.
 
 ## Comment Guidelines
 

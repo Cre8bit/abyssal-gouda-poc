@@ -9,6 +9,8 @@ export const STATUS = {
   SPEAKING: 1 << 4, // mic activity — bubble trail (phase 4)
   HOLDING_DRILLER: 1 << 5, // holding the driller (M3.1) — cosmetic only,
   // unlike CARRYING it never blocks digging: the driller IS the dig tool.
+  HOLDING_STICK: 1 << 6, // a light stick drawn from the belt (M3.2) — the
+  // last of the 7 wire bits. Cosmetic: it poses the right paw, nothing else.
 } as const;
 
 export type StatusBit = (typeof STATUS)[keyof typeof STATUS];
@@ -91,6 +93,7 @@ const ICONS: Array<[StatusBit, string]> = [
   [STATUS.TRAPPED, "🪤"],
   [STATUS.SPEAKING, "💬"],
   [STATUS.HOLDING_DRILLER, "🛠"],
+  [STATUS.HOLDING_STICK, "🔆"],
 ];
 
 export function statusIcons(mask: StatusMask): string {

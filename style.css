@@ -240,7 +240,7 @@ button:active {
    wheel is within reach or in your arms: a prompt, never a tracker (D4). */
 #carry-prompt {
   position: absolute;
-  top: 3.4rem;
+  top: 4rem;
   left: 50%;
   transform: translateX(-50%);
   font-size: 0.85rem;
@@ -397,6 +397,26 @@ button:active {
   to {
     opacity: 1;
   }
+}
+
+/* Light-stick belt, stacked above the O₂ gauge bottom-left. */
+#belt {
+  position: absolute;
+  bottom: 5rem;
+  left: 1.5rem;
+  font-size: 0.85rem;
+  letter-spacing: 0.08em;
+  text-shadow: 0 0 8px rgba(0, 20, 40, 0.9);
+  transition: opacity 0.25s linear;
+}
+
+#belt.empty {
+  opacity: 0.35;
+}
+
+#belt.lit {
+  color: #9fffdf;
+  text-shadow: 0 0 10px rgba(102, 255, 209, 0.6);
 }
 
 /* Mesh latency, tucked under the voice indicator. */

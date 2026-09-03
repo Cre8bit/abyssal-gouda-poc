@@ -16,6 +16,8 @@ import {
   setPlayerLight,
   setPlayerCarry,
   setDrillerHolder,
+  setDiverStick,
+  setPlayerCarryPhase,
   loadWorld,
   rebuildWorld,
   emitBreath,
@@ -86,6 +88,7 @@ import {
   getSwimPitch,
   getYawVelocity,
   isSprinting,
+  isPointerLocked,
 } from "./input/input.ts";
 import { SnapshotBuffer } from "./net/interpolation.ts";
 import { getShotConfig, applyShot } from "./bench/shots.ts";
@@ -135,6 +138,7 @@ import { createCatfishSystem } from "./systems/catfishSystem.ts";
 import { createItemsSystem } from "./systems/itemsSystem.ts";
 import { createCargoSystem } from "./systems/cargoSystem.ts";
 import { createDrillerSystem } from "./systems/drillerSystem.ts";
+import { createLightStickSystem } from "./systems/lightStickSystem.ts";
 import { getMountedGouda } from "./entities/goldenGouda.ts";
 import { carrySpeedCap, CARGO } from "./game/cargo.ts";
 import {
@@ -191,6 +195,7 @@ const deathOverlay = el("death-overlay");
 const winOverlay = el("win-overlay");
 const winSub = el("win-sub");
 const carryPrompt = el("carry-prompt");
+const beltText = el("belt");
 const debugPanel = el("debug-panel");
 const debugCoords = el("debug-coords");
 
@@ -216,13 +221,22 @@ initMouseLook(canvas);
 // Simulation systems in order (see systems/types.ts): one slot after input, before physics.
 registerSystem(createEffectsSystem()); // 10 — expire timed statuses
 registerSystem(createOxygenSystem({ o2Fill, o2Bar })); // 20 — drain + HUD
-// Cargo and the driller share one HUD line; the Gouda always wins the tie
-// (Gouda first, per the E-key contract below) when both have something to say.
+// The three carry systems share one HUD line, in the same order the E key
+// tries them: the Gouda wins the tie, then the driller, then the light stick.
 let cargoPrompt: string | null = null;
 let drillerPrompt: string | null = null;
+let stickPrompt: string | null = null;
 function renderCarryPrompt() {
-  carryPrompt.textContent = cargoPrompt ?? drillerPrompt ?? "";
+  carryPrompt.textContent = cargoPrompt ?? drillerPrompt ?? stickPrompt ?? "";
 }
+// Belt readout: how many light sticks are left, and whether one is burning
+// in the paw right now (M3.2).
+function renderBelt(count: number, drawn: boolean): void {
+  beltText.textContent = `🔆 ${count}`;
+  beltText.classList.toggle("empty", count === 0 && !drawn);
+  beltText.classList.toggle("lit", drawn);
+}
+
 const cargoSys = registerSystem(
   createCargoSystem({
     showEvent,
@@ -248,6 +262,19 @@ const drillerSys = registerSystem(
     holdInPaw: setDrillerHolder,
   }),
 ); // 36 — the driller (M3.1)
+const stickSys = registerSystem(
+  createLightStickSystem({
+    showEvent,
+    setPrompt: (text) => {
+      stickPrompt = text;
+      renderCarryPrompt();
+    },
+    holdInPaw: (on) => setDiverStick(null, on),
+    setPeerPhase: setPlayerCarryPhase,
+    setBelt: renderBelt,
+    onThrow: playWhoosh,
+  }),
+); // 37 — the light sticks (M3.2)
 const catfishSys = registerSystem(
   createCatfishSystem({
     showEvent,
@@ -429,6 +456,12 @@ if (joinParam) {
 
 tpGoudaBtn.addEventListener("click", teleportToGouda);
 
+// Left mouse: throw the drawn light stick. Pointer-lock-only, so the click
+// that RE-ENTERS the game after an Escape can never spend one.
+window.addEventListener("mousedown", (e) => {
+  if (e.button === 0 && isPointerLocked(canvas)) stickSys.hurl();
+});
+
 // Action keys (physical positions — layout-agnostic).
 window.addEventListener("keydown", (e) => {
   if (e.code === "KeyF") {
@@ -451,7 +484,10 @@ window.addEventListener("keydown", (e) => {
     // E key: pick up a nearby item; if already holding one, use it instead
     // (the driller digs, tryDig itself refuses to swing with the Gouda in
     // both arms) — never a handoff, that's R now.
-    if (!cargoSys.use() && !drillerSys.use()) tryDig();
+    if (!cargoSys.use() && !drillerSys.use() && !stickSys.use()) tryDig();
+  } else if (e.code === "KeyG") {
+    // G key: draw a light stick off the belt, or clip the drawn one back on.
+    stickSys.toggle();
   } else if (e.code === "KeyR") {
     // R key: let go of whatever's in your hands — Gouda or driller. With a
     // teammate close enough, it's a handoff instead of a drop.
@@ -810,6 +846,7 @@ onPeerDisconnected((peerId) => {
 function carryKind(status: number): CarryKind {
   if (status & STATUS.CARRYING) return "gouda";
   if (status & STATUS.HOLDING_DRILLER) return "driller";
+  if (status & STATUS.HOLDING_STICK) return "lightStick";
   return "none";
 }
 
@@ -821,6 +858,9 @@ onStateReceived((peerId, { x, y, z, yaw, pitch, light, sy, sp, status }) => {
     setPeerStatus(peerId, status);
     // Exterior carry animation (FP half on local body status).
     setPlayerCarry(peerId, carryKind(status));
+    // …and the stick itself, which is a per-diver visual and not the one
+    // shared prop the driller is.
+    setDiverStick(peerId, (status & STATUS.HOLDING_STICK) !== 0);
   }
 });
 
@@ -995,6 +1035,7 @@ renderLoop((delta) => {
     swimPitch,
     vel,
     carryKind(getLocalStatus()),
+    stickSys.phase(),
   );
   cargoSys.followCarrier();
   drillerSys.followCarrier();
@@ -1078,6 +1119,7 @@ initOxygen({
     // Carried items dropped on death.
     cargoSys.fumble("🧀 Your grip fails — the Gouda slips away.");
     drillerSys.drop("🛠 Your grip fails — the driller sinks away.");
+    stickSys.stow(); // a drawn stick clips back on the belt, not lost
     clearTimeout(respawnTimer);
     respawnTimer = setTimeout(() => {
       const s = game.spawnPoint;
@@ -1104,6 +1146,8 @@ if (import.meta.env.DEV) {
     setLook,
     // Haul API: goldPos() → teleport → cargo.use().
     cargo: cargoSys,
+    // Light sticks: toggle() draws one, hurl() throws it (M3.2).
+    stick: stickSys,
     goldPos: getGoldPos,
     gouda: () => getItem("gouda"),
     goudaVisual: getMountedGouda, // live light/emissive tuning from the console

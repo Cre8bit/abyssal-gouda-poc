@@ -51,6 +51,9 @@ export interface GameState {
   spawnPoint: Vec3; // bathyscaphe berth — also the O₂ recharge zone
   flashlightOn: boolean;
   digTool: DigTool; // "driller" iff drillerSystem says you're holding it
+  // Light sticks still yours — belt plus whatever is in the paw (M3.2).
+  // Purely local: nobody else needs your count, only what you throw.
+  lightSticks: number;
   debug: DebugState;
   mapWireframe: boolean; // [I] key — overlay only, survives independent of debug.mode
   chunkBounds: boolean; // [J] key — chunk-border overlay, same lifetime as [I]
@@ -67,6 +70,10 @@ export interface GameState {
 
 const DEFAULT_SPAWN: Vec3 = { x: 0, y: 5, z: 450 }; // pre-worldgen placeholder
 
+// What every diver dives with (M3.2). Also the cap a retrieved stick tops out
+// at, so scavenging a teammate's throws can never grow your belt.
+export const LIGHT_STICKS_PER_DIVER = 4;
+
 export const game: GameState = {
   seed: 0,
   difficulty: 1,
@@ -77,6 +84,7 @@ export const game: GameState = {
   spawnPoint: { ...DEFAULT_SPAWN },
   flashlightOn: true,
   digTool: "hands",
+  lightSticks: LIGHT_STICKS_PER_DIVER,
   debug: { mode: false, freeCam: false, routeMarkers: false, routeIdx: 0 },
   mapWireframe: false,
   chunkBounds: false,
@@ -107,6 +115,7 @@ export function resetGameState(
   if (opts.seed !== undefined) game.seed = opts.seed >>> 0;
   if (opts.difficulty !== undefined) game.difficulty = opts.difficulty;
   game.worldReady = false;
+  game.lightSticks = LIGHT_STICKS_PER_DIVER;
   // Discard old digs; new ones queue during build and replay after.
   game.pendingDigs.length = 0;
   game.velocity.x = game.velocity.y = game.velocity.z = 0;

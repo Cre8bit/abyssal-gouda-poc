@@ -201,14 +201,14 @@ const ARM_POSE_STICK_GRAB_L: ArmPose = {
   hz: 0.0,
 };
 const ARM_POSE_STICK_GRAB_R: ArmPose = {
-  uy: 0.3,
-  ux: 0.35,
-  fy: 0.95,
-  fx: -0.25,
-  fz: -0.3,
-  hx: -0.55,
-  hy: -0.35,
-  hz: 0.45,
+  uy: -0.36570375385087167,
+  ux: 0.7479197500760427,
+  fy: 0.9261985256430342,
+  fx: -0.9021669548500408,
+  fz: 0.5831561776265449,
+  hx: -0.2614268547362653,
+  hy: 0.272135132202188,
+  hz: 0.8786530093364617,
 };
 // Carried: the baton up in front of the chest, left paw free to swim.
 const ARM_POSE_STICK_HOLD_L: ArmPose = {
@@ -222,14 +222,14 @@ const ARM_POSE_STICK_HOLD_L: ArmPose = {
   hz: 0.0,
 };
 const ARM_POSE_STICK_HOLD_R: ArmPose = {
-  uy: 1.15,
-  ux: -0.75,
-  fy: 1.0,
-  fx: 0.35,
-  fz: -0.4,
-  hx: -0.9,
-  hy: -0.35,
-  hz: 0.55,
+  uy: 0.458407346410207,
+  ux: -0.901592653589793,
+  fy: 0.6484073308355277,
+  fx: -0.7715926356074155,
+  fz: 0.9494347583217078,
+  hx: -0.3049746926773733,
+  hy: 0.208407346410207,
+  hz: 0.318407346410207,
 };
 // The release: arm swung through, paw open, baton on its way.
 const ARM_POSE_STICK_THROW_L: ArmPose = {
@@ -242,7 +242,35 @@ const ARM_POSE_STICK_THROW_L: ArmPose = {
   hy: 0.0,
   hz: 0.0,
 };
-const ARM_POSE_STICK_THROW_R: ArmPose = {
+
+// First person walks the same three states with its own RIGHT arm, for the
+// same reason the Gouda does (ARM_POSE_CARRY_FP): the third-person poses are
+// authored against a body seen from outside, and replayed at the eye they put
+// the wrist 0.16 u from the lens with the shoulder cut about to swing into
+// frame. These are screenshot-tuned in the gloves bench instead
+// (?m=gloves&hold=lightStick, eye cam) and land the baton in the lower right.
+// The LEFT arm is the free swimming paw and is shared with the poses above.
+const FP_STICK_GRAB_R: ArmPose = {
+  uy: 0.3,
+  ux: 0.35,
+  fy: 0.95,
+  fx: -0.25,
+  fz: -0.3,
+  hx: -0.55,
+  hy: -0.35,
+  hz: 0.45,
+};
+const FP_STICK_HOLD_R: ArmPose = {
+  uy: 1.15,
+  ux: -0.75,
+  fy: 1.0,
+  fx: 0.35,
+  fz: -0.4,
+  hx: -0.9,
+  hy: -0.35,
+  hz: 0.55,
+};
+const FP_STICK_THROW_R: ArmPose = {
   uy: 1.5,
   ux: -1.0,
   fy: 0.2,
@@ -252,50 +280,60 @@ const ARM_POSE_STICK_THROW_R: ArmPose = {
   hy: -0.2,
   hz: 0.3,
 };
+const ARM_POSE_STICK_THROW_R: ArmPose = {
+  uy: 1.1759057045160608,
+  ux: -1.235221559985197,
+  fy: 1.4452891491851174,
+  fx: 0.22142460889629614,
+  fz: -0.40919898632021373,
+  hx: -1.4374342631488266,
+  hy: -0.35309413056574546,
+  hz: -0.06552954586439433,
+};
 
 // …and where the baton itself sits in the rig-root frame in each of them —
 // on the belt for the grab, in the paw for the other two.
 const STICK_TOOL_GRAB = new THREE.Matrix4().compose(
   new THREE.Vector3(
-    0.4139278259411805,
-    0.7913388263309536,
-    -0.3036914931857932,
+    0.308974817981264,
+    0.5694464239990582,
+    0.002128771133767186,
   ),
   new THREE.Quaternion().setFromEuler(
     new THREE.Euler(
-      -2.60053028003624,
-      -0.6239465458274682,
-      -0.20363178184985195,
+      -1.3556254399439494,
+      0.384366004657115,
+      0.15719926464091727,
     ),
   ),
   new THREE.Vector3(1, 1, 1),
 );
 const STICK_TOOL_HOLD = new THREE.Matrix4().compose(
   new THREE.Vector3(
-    0.23206276194688746,
-    0.9128471055252174,
-    -0.3724180349714392,
+    0.1737158548078075,
+    0.7992082692854906,
+    -0.3982206738020747,
   ),
   new THREE.Quaternion().setFromEuler(
     new THREE.Euler(
-      -0.9946774947876209,
-      -0.29390880714610024,
-      0.9029821928507756,
+      0.046881057141719334,
+      -0.6118868790477837,
+      -0.3400314541527877,
     ),
   ),
   new THREE.Vector3(1, 1, 1),
 );
 const STICK_TOOL_THROW = new THREE.Matrix4().compose(
   new THREE.Vector3(
-    0.21351864105545448,
-    0.8128744515214128,
-    -0.43844498947247396,
+    0.16802244957205234,
+    1.0437887690177587,
+    -0.25832327926947396,
   ),
   new THREE.Quaternion().setFromEuler(
     new THREE.Euler(
-      -1.731628513712519,
-      -0.3963512764677859,
-      0.31450605419632144,
+      0.31551138735845585,
+      -0.08041295509532478,
+      -0.21711791582697723,
     ),
   ),
   new THREE.Vector3(1, 1, 1),
@@ -365,7 +403,7 @@ const GRIPS: Record<GripKind, Grip> = {
     left: ARM_POSE_STICK_HOLD_L,
     right: ARM_POSE_STICK_HOLD_R,
     fpLeft: ARM_POSE_STICK_HOLD_L,
-    fpRight: ARM_POSE_STICK_HOLD_R,
+    fpRight: FP_STICK_HOLD_R,
     fpOffset: FP_OFFSET_STICK,
     fpScale: 1.45,
     tool: STICK_TOOL_HOLD,
@@ -375,21 +413,21 @@ const GRIPS: Record<GripKind, Grip> = {
         left: ARM_POSE_STICK_GRAB_L,
         right: ARM_POSE_STICK_GRAB_R,
         fpLeft: ARM_POSE_STICK_GRAB_L,
-        fpRight: ARM_POSE_STICK_GRAB_R,
+        fpRight: FP_STICK_GRAB_R,
         tool: STICK_TOOL_GRAB,
       },
       hold: {
         left: ARM_POSE_STICK_HOLD_L,
         right: ARM_POSE_STICK_HOLD_R,
         fpLeft: ARM_POSE_STICK_HOLD_L,
-        fpRight: ARM_POSE_STICK_HOLD_R,
+        fpRight: FP_STICK_HOLD_R,
         tool: STICK_TOOL_HOLD,
       },
       throw: {
         left: ARM_POSE_STICK_THROW_L,
         right: ARM_POSE_STICK_THROW_R,
         fpLeft: ARM_POSE_STICK_THROW_L,
-        fpRight: ARM_POSE_STICK_THROW_R,
+        fpRight: FP_STICK_THROW_R,
         tool: STICK_TOOL_THROW,
       },
     },
@@ -404,6 +442,20 @@ export const PHASE_EASE: Record<string, number> = {
   throw: 16,
 };
 export const PHASE_EASE_DEFAULT = 6;
+
+// How long a light stick's throw dwells in each state (seconds). The rig
+// blends at PHASE_EASE; these are how long the timeline SITS in a state
+// before naming the next one. Exported because two callers walk it and they
+// must agree: systems/lightStickSystem.ts (the game) and the bench's "throw
+// stick" preview — so what plays in the bench is the timing that ships.
+export const STICK_DWELL = {
+  /** Reaching down to the belt and back — the draw AND the stow. */
+  grab: 0.34,
+  /** The swing, from the paw opening to the arm finishing through. */
+  throw: 0.34,
+  /** …and where in that swing the baton actually leaves the paw. */
+  release: 0.13,
+} as const;
 
 // One authored placement, handed out by value. The bench pose editor opens
 // on these — a pose editor that started from a T-pose would show none of the

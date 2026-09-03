@@ -69,6 +69,9 @@ const SHOTS: Record<string, ShotPreset> = {
     keys: ["KeyE"],
     settle: 240,
   },
+  // Light stick (M3.2): [G] draws one, settle covers the reach-to-belt.
+  "fp-stick": { pitch: -0.45, keys: ["KeyG"], settle: 90 },
+  "fp-stick-swim": { pitch: -0.3, keys: ["KeyG", "KeyW"], settle: 90 },
   // Tin bell from gouda side; &bells=N previews multi-diver berth.
   bell: { x: 10, y: 20, z: 414, yaw: 2.68, pitch: -0.06 },
 };
