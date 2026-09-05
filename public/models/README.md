@@ -52,3 +52,15 @@ so the bit can spin without moving the body.
 
 The previous remote-player diver — **"Astronaut" by Quaternius**, CC0.
 Source page: https://poly.pizza/m/3hC2i0CTuO
+
+## The weld pass (`tools/weld-models.ts`)
+
+Every file here has been through `node tools/weld-models.ts`, which unifies
+the per-vertex data (position, normal, skin weights) shared by co-located
+vertices while leaving the UV splits — and therefore the atlas — alone. It
+fixes seam tearing under animation and seam stitching under the cel ramp; it
+does not meaningfully change the vertex count, and it cannot: see the
+"Welding a re-exported model" section in `AGENTS.md` for why.
+
+**Re-run it after any re-export from Tripo or Blender.** `--check` reports
+without writing, and a second pass over welded files reports zero work.

@@ -59,6 +59,7 @@ src/
     shots.ts           headless screenshot harness (?shot=)
 tools/               node-run (node 24 strips types natively)
   runner.ts            CDP screenshot runner
+  weld-models.ts       the glTF-native "merge by distance" for the GLBs
   test-protocol.ts     protocol unit tests (npm test)
   test-clock.ts        shared-clock unit tests (npm test)
   test-recipes.ts      worldgen recipe-table sanity checks (npm test)
@@ -419,6 +420,48 @@ Note the shipped armature is FLAT (no bone parented to another bone), so the
 bench's generic `SkeletonHelper` overlay has no segments to draw. The gouda
 panel's own **bones** button is the useful one: it parents an arrow to each bit
 bone along its +Y, so the arrows ride the real animated transform.
+
+### Welding a re-exported model (`tools/weld-models.ts`)
+
+Every shipped GLB carries ~3x more vertices than it has distinct positions
+(the rat diver: 4609 over 1526). Those are **not** removable duplicates. A
+glTF vertex is one tuple of ALL attributes, and the Tripo atlas gives nearly
+every seam vertex its own `TEXCOORD_0`, so the GPU genuinely needs them —
+welding them would smear the texture. A Blender "merge by distance" plus a
+re-export hands back the same file, because Blender keeps UVs per face-corner
+and the exporter re-splits on the way out. A lossless weld over all six models
+saves ONE vertex; the vertex count is not where the waste is (the rat diver is
+3.7 MB of atlas and 0.3 MB of everything else).
+
+What Blender's merge really unifies is the per-VERTEX data behind those
+corners, and in the exports that data has drifted apart between twins. THAT is
+the animation and lighting bug:
+
+- **skin** — co-located verts bound to different bones tear the mesh open
+  along every atlas seam as it deforms. The catfish had this on 1789 of 1789
+  split positions (worst weight delta 0.61), because `rig_catfish_blender.py`
+  smoothed weights over the raw split index buffer and let twins diverge.
+- **normal** — twins a fraction of a degree apart straddle a band edge in the
+  cel ramp (`render/toon.ts`) and stitch a visible seam across the model.
+- **position** — float32 noise leaves twins ~1e-7 apart: a hairline crack.
+
+So the tool unifies position and skin across a whole position cluster, unifies
+normals only within a cluster's near-parallel sub-groups (a genuine hard edge
+keeps its distinct normals — 4 on the diver, 16 on the catfish), and never
+touches a UV. Whatever comes out byte-identical then collapses for free. The
+rest pose is bit-identical (bind-pose skinning is the identity whatever the
+weights are, and weights stay normalised), the atlas, animations, skeletons
+and materials are untouched, and the triangle list is unchanged — only
+re-indexed.
+
+`--check` reports and writes nothing. It is a fixed point: a second pass over
+welded files reports zero work, which is the check to run. **Re-run it after
+any model re-export** — a fresh Tripo/Blender export brings the divergence
+straight back.
+
+Measuring a normal turn needs the stored length divided out first: a float32
+unit normal is 1 +/- 1e-7 long, and `acos` near 1 amplifies that into a
+phantom 0.02 deg that looks exactly like real work.
 
 ### Capturing the bench headlessly
 
