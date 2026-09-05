@@ -272,6 +272,7 @@ const stickSys = registerSystem(
     },
     holdInPaw: (on) => setDiverStick(null, on),
     setPeerPhase: setPlayerCarryPhase,
+    setPeerStick: setDiverStick,
     setBelt: renderBelt,
     onThrow: playWhoosh,
   }),
@@ -871,8 +872,10 @@ onStateReceived((peerId, { x, y, z, yaw, pitch, light, sy, sp, status }) => {
     // Exterior carry animation (FP half on local body status).
     setPlayerCarry(peerId, carryKind(status));
     // …and the stick itself, which is a per-diver visual and not the one
-    // shared prop the driller is.
-    setDiverStick(peerId, (status & STATUS.HOLDING_STICK) !== 0);
+    // shared prop the driller is. Through the system, because the mask stays
+    // set through the follow-through: it says they are throwing, not whether
+    // the baton is still in the paw.
+    stickSys.setPeerHolding(peerId, (status & STATUS.HOLDING_STICK) !== 0);
   }
 });
 

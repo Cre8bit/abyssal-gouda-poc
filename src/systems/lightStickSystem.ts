@@ -38,28 +38,41 @@ import { STICK_DWELL, type StickPhase } from "../entities/diverRig.ts";
 import { STATUS, setLocalStatus, hasLocalStatus } from "../game/effects.ts";
 import { resolveCollision } from "../world/gouda.ts";
 import { collideBathyscaphe } from "../world/bathyscaphe.ts";
-import { getHostId } from "../net/mesh.ts";
+import { getHostId, getRtt } from "../net/mesh.ts";
 import { sendEvent, sendEventTo } from "../net/sync.ts";
 import { getYaw, getPitch } from "../input/input.ts";
 import { game, LIGHT_STICKS_PER_DIVER, type Vec3 } from "../state.ts";
 import type { GameSystem } from "./types.ts";
 
 // --- Flight ------------------------------------------------------------------
-const THROW_SPEED = 15; // u/s out of the paw, along the look
-const STICK_DRAG = 1.7; // 1/s — water eats a throw in a couple of body lengths
-const REST_SPEED = 0.35; // u/s under which it is simply hanging there
+const THROW_SPEED = 5.5; // u/s out of the paw, along the look
+// 1/s. A baton is a light thing thrown through water, so drag is the whole
+// physics and THROW_SPEED / STICK_DRAG is the whole range: ~1.8 u, a body
+// length and a half. This is a PLACEMENT, not a throw — you set the baton
+// down in front of you and swim on, so a line of them reads as a trail you
+// can follow back rather than a scatter across the gallery.
+const STICK_DRAG = 3;
+const REST_SPEED = 0.5; // u/s under which it is simply hanging there
 const WALL_DAMP = 0.25; // a baton hitting cheese does not bounce, it stops
 const STICK_RADIUS = LIGHT_STICK_LENGTH * 0.6;
+// The tumble. A baton let go of underwater turns end over end about a random
+// axis and keeps turning long after the water has stopped it moving, which is
+// why the spin outlives the flight (SPIN_DRAG well under STICK_DRAG): what
+// finally comes to rest is a stick lying at some angle, never one that
+// happens to be axis-aligned.
+const SPIN_SPEED = 7; // rad/s about a random axis, out of the paw
+const SPIN_SPREAD = 0.45; // fraction of SPIN_SPEED the rate wanders by
+const SPIN_DRAG = 1.1; // 1/s
+const SPIN_REST = 0.08; // rad/s under which the tumble is simply over
 const LOOSE_SYNC_S = 0.12; // authoritative resync cadence while it flies
 
-// How many burning sticks light the scene at once. Past this the vials still
-// glow (they are unlit geometry) but their point lights are off: every live
-// light is a per-material uniform slot and a shader recompile when the count
-// moves, and a diver who has salted a gallery with a dozen of them should not
-// pay for the ones behind them.
-const MAX_LIVE_LIGHTS = 6;
-// A stick we do not own arrives at LOOSE_SYNC_S, i.e. ~7 samples across a
-// throw. Chasing them instead of snapping turns that into a flight (1/s).
+// Which burning sticks actually light the scene is entities/lightStick.ts's
+// business: a fixed pool of point lights, brightest-and-nearest into slots
+// that are never added or removed, so drawing, throwing or collecting one can
+// never change the scene's light count and relink every material in it.
+//
+// A stick we do not own is dead-reckoned from the velocity it carries (see
+// fly()), so this only has to absorb the small error each sync brings (1/s).
 const REMOTE_SMOOTH = 14;
 
 type Action = "draw" | "stow" | "throw";
@@ -69,12 +82,16 @@ export interface LightStickSystemDeps {
   // Contextual HUD line, or null to clear it. Lowest priority of the three
   // carry systems — the Gouda and the driller both speak over it.
   setPrompt(text: string | null): void;
-  // The local first-person paw gains or loses its stick. Remote paws are
-  // driven from STATUS.HOLDING_STICK instead — the bit is in every packet, so
-  // a diver you swim up to is already holding what they are holding.
+  // The local first-person paw gains or loses its stick. Remote paws go
+  // through setPeerHolding/setPeerStick below — their steady state is the
+  // status bit, which is in every packet, so a diver you swim up to is
+  // already holding what they are holding.
   holdInPaw(on: boolean): void;
   // A remote diver moved to another grip state (undefined = back to rest).
   setPeerPhase(peerId: string, phase: string | undefined): void;
+  // A remote diver's paw gains or loses the baton itself. Split from the
+  // status mask because the mask cannot say WHERE in the swing it left.
+  setPeerStick(peerId: string, on: boolean): void;
   // Belt readout: how many are left, and whether one is in the paw.
   setBelt(count: number, drawn: boolean): void;
   // The throw itself, so main.ts can put a sound on it.
@@ -92,6 +109,9 @@ export interface LightStickSystem extends GameSystem {
   phase(): string | undefined;
   // Death and other forced releases: the drawn stick goes back on the belt.
   stow(): void;
+  // A peer's status mask says whether they are holding one; the system says
+  // whether their paw still has it (see the throw replay).
+  setPeerHolding(peerId: string, on: boolean): void;
 }
 
 export function createLightStickSystem({
@@ -99,6 +119,7 @@ export function createLightStickSystem({
   setPrompt,
   holdInPaw,
   setPeerPhase,
+  setPeerStick,
   setBelt,
   onThrow,
 }: LightStickSystemDeps): LightStickSystem {
@@ -112,9 +133,24 @@ export function createLightStickSystem({
   // that [G] immediately followed by a click throws, instead of eating the
   // press — the draw is a third of a second and nobody waits it out.
   let queuedThrow = false;
-  // Every thrown stick alive in the world, so the light budget and the flight
-  // integrator do not have to walk the whole item registry.
+  // Whether the paw has actually closed on the drawn baton yet — false through
+  // the first STICK_DWELL.clasp of a draw, while the arm is still reaching.
+  let clasped = false;
+  // Every thrown stick alive in the world, so the flight integrator does not
+  // have to walk the whole item registry.
   const live = new Set<string>();
+  // A peer's throw, replayed: which peers the status mask says are holding a
+  // stick, and how long until the one in their paw leaves it.
+  const peerHolding = new Set<string>();
+  const peerSwing = new Map<string, number>();
+  // …and how long until the paw of one still REACHING for their belt closes
+  // on a baton (the mask flips at the top of the reach — see the clasp note).
+  const peerClasp = new Map<string, number>();
+  // Every tumbling baton's angular velocity, rad/s about world axes. Local
+  // presentation, derived from the item id rather than sent: everyone hashes
+  // the same id to the same tumble, so the batons agree without a byte on the
+  // wire and nobody has to arbitrate which way a glow stick is lying.
+  const spins = new Map<string, Vec3>();
   let looseSyncTimer = 0;
   let mintCounter = 0;
 
@@ -124,6 +160,44 @@ export function createLightStickSystem({
 
   // Same arbiter test as cargoSystem/drillerSystem: null on the host AND solo.
   const isAuthority = () => getHostId() === null;
+
+  // FNV-1a, then a cheap LCG off it: an item id in, a repeatable stream of
+  // 0…1 out. Deterministic across clients, which is the whole point.
+  function seeded(id: string): () => number {
+    let h = 2166136261;
+    for (let i = 0; i < id.length; i++) {
+      h = Math.imul(h ^ id.charCodeAt(i), 16777619);
+    }
+    return () => {
+      h = (Math.imul(h, 1664525) + 1013904223) | 0;
+      return ((h >>> 8) & 0xffffff) / 0x1000000;
+    };
+  }
+
+  // Give a baton the attitude and the tumble its id says it has. A stick that
+  // is already at rest when we meet it (a late join, someone else's fixture)
+  // gets the attitude and no tumble — the turning is long over.
+  function tumble(item: ItemInstance): void {
+    const visual = getMountedLightStick(item.id);
+    if (!visual) return;
+    const rnd = seeded(item.id);
+    visual.setTilt(
+      (rnd() - 0.5) * Math.PI * 2,
+      (rnd() - 0.5) * Math.PI * 2,
+      (rnd() - 0.5) * Math.PI * 2,
+    );
+    if (!isMoving(item)) return;
+    // A uniform axis on the sphere, so no throw favours a plane.
+    const up = rnd() * 2 - 1;
+    const phi = rnd() * Math.PI * 2;
+    const flat = Math.sqrt(Math.max(0, 1 - up * up));
+    const rate = SPIN_SPEED * (1 + SPIN_SPREAD * (rnd() * 2 - 1));
+    spins.set(item.id, {
+      x: flat * Math.cos(phi) * rate,
+      y: up * rate,
+      z: flat * Math.sin(phi) * rate,
+    });
+  }
 
   // Reads into the scratch above — fly() runs per frame per airborne stick.
   const velOf = (item: ItemInstance): Vec3 => {
@@ -172,7 +246,9 @@ export function createLightStickSystem({
     action = "draw";
     actionT = 0;
     setLocalStatus(STATUS.HOLDING_STICK, true);
-    holdInPaw(true);
+    // The baton itself lands in the paw at STICK_DWELL.clasp, not now: the arm
+    // is still on its way down to the holster, and in first person a stick
+    // already in it slides up past the bottom of the lens out of nowhere.
     publish("grab");
     return true;
   }
@@ -193,6 +269,7 @@ export function createLightStickSystem({
   // an item, and the paw empties while the arm is still following through.
   function release(): void {
     drawn = false;
+    clasped = false;
     holdInPaw(false);
     game.lightSticks = Math.max(0, game.lightSticks - 1);
 
@@ -228,6 +305,10 @@ export function createLightStickSystem({
     if (!action) return;
     actionT += dt;
     if (action === "draw") {
+      if (!clasped && actionT >= STICK_DWELL.clasp) {
+        clasped = true;
+        holdInPaw(true); // the paw is at the belt — NOW it has a baton
+      }
       if (actionT < STICK_DWELL.grab) return;
       action = null;
       publish("hold");
@@ -241,6 +322,7 @@ export function createLightStickSystem({
       if (actionT < STICK_DWELL.grab) return;
       action = null;
       drawn = false;
+      clasped = false;
       holdInPaw(false);
       setLocalStatus(STATUS.HOLDING_STICK, false);
       publish(null);
@@ -257,12 +339,40 @@ export function createLightStickSystem({
   function stow(): void {
     queuedThrow = false;
     if (!drawn && !action) return;
-    if (drawn) holdInPaw(false);
+    if (clasped) holdInPaw(false);
     drawn = false;
+    clasped = false;
     action = null;
     actionT = 0;
     setLocalStatus(STATUS.HOLDING_STICK, false);
     publish(null);
+  }
+
+  // --- A peer's throw, replayed ----------------------------------------------
+  // Their status mask holds HOLDING_STICK set until the swing finishes, but
+  // the baton left their paw at STICK_DWELL.release — which, both messages
+  // having crossed the same wire, is exactly when their thrown item lands
+  // here. Without this the paw keeps a second baton through the whole
+  // follow-through, alongside the one already flying.
+
+  function pawFull(peerId: string): boolean {
+    if (!peerHolding.has(peerId)) return false;
+    if ((peerClasp.get(peerId) ?? 0) > 0) return false; // still reaching
+    return peerSwing.get(peerId) !== 0;
+  }
+
+  function setPeerHolding(peerId: string, on: boolean): void {
+    if (on) {
+      // The mask flips the instant they press [G], but their paw does not
+      // close on the baton until STICK_DWELL.clasp — same reach ours takes.
+      if (!peerHolding.has(peerId)) peerClasp.set(peerId, STICK_DWELL.clasp);
+      peerHolding.add(peerId);
+    } else {
+      peerHolding.delete(peerId);
+      peerSwing.delete(peerId);
+      peerClasp.delete(peerId);
+    }
+    setPeerStick(peerId, pawFull(peerId));
   }
 
   // --- Picking one back up (contested — the host decides) --------------------
@@ -327,10 +437,14 @@ export function createLightStickSystem({
   }
 
   // --- Flight ----------------------------------------------------------------
-  // Only the thrower integrates; everyone else renders what it syncs. Water
-  // is the whole physics: drag until the throw is spent, then it hangs where
-  // it stopped (a chem baton is neutrally buoyant — it neither sinks nor
-  // rises, which is exactly what makes it a breadcrumb).
+  // EVERYONE integrates, from the velocity the item carries. A sync every
+  // LOOSE_SYNC_S is ~7 samples across a throw, and a client that only chased
+  // those samples watched the baton crawl a body length behind where the
+  // thrower had already put it — the lag you see across the wire. The thrower
+  // is still the authority: its syncs are corrections, and drawWorld()'s
+  // smoother eats them. Water is the whole physics: drag until the throw is
+  // spent, then it hangs where it stopped (a chem baton is neutrally buoyant —
+  // it neither sinks nor rises, which is what makes it a breadcrumb).
   function fly(item: ItemInstance, dt: number): void {
     const v = velOf(item);
     const damp = Math.exp(-STICK_DRAG * dt);
@@ -358,18 +472,26 @@ export function createLightStickSystem({
     if (Math.hypot(v.x, v.y, v.z) < REST_SPEED) {
       item.data.moving = false;
       item.data.vx = item.data.vy = item.data.vz = 0;
-      syncItem(item.id);
+      // Where it came to rest is the thrower's to publish; everyone else has
+      // simply arrived at the same answer and waits to be corrected.
+      if (isMine(item)) syncItem(item.id);
     }
   }
 
+  // A flight state is already one trip old when it lands here. Wind it forward
+  // by that trip, so a baton is where the thrower has it, not where they had
+  // it: the two together are the whole of the throw lag.
+  function catchUp(item: ItemInstance): void {
+    if (!isMoving(item) || isMine(item)) return;
+    const rtt = getRtt(item.data.owner as string);
+    if (rtt) fly(item, Math.min(rtt / 2000, 0.15));
+  }
+
   // --- Presentation ----------------------------------------------------------
-  // Place every world stick and spend the light budget on the nearest few.
+  // Place every world stick; which of them light the scene is the pool's call.
   function drawWorld(now: number, dt: number): void {
-    let lit = 0;
-    const ordered =
-      live.size <= MAX_LIVE_LIGHTS ? [...live] : byDistance([...live]);
     const k = 1 - Math.exp(-REMOTE_SMOOTH * dt);
-    for (const id of ordered) {
+    for (const id of live) {
       const item = getItem(id);
       const visual = getMountedLightStick(id);
       if (!item || !visual) continue;
@@ -381,17 +503,10 @@ export function createLightStickSystem({
       } else {
         at.set(item.x, item.y, item.z);
       }
-      visual.setLightOn(lit++ < MAX_LIVE_LIGHTS);
+      const w = spins.get(id);
+      if (w) visual.spin(w.x, w.y, w.z, dt);
       visual.update(now, false);
     }
-  }
-
-  function byDistance(ids: string[]): string[] {
-    const d = (id: string) => {
-      const item = getItem(id);
-      return item ? distance(game.localPosition, item) : Infinity;
-    };
-    return ids.sort((a, b) => d(a) - d(b));
   }
 
   // --- HUD -------------------------------------------------------------------
@@ -417,11 +532,15 @@ export function createLightStickSystem({
         kind: "lightStick",
         onSpawn: (item) => {
           live.add(item.id);
+          catchUp(item);
           const visual = mountLightStick(item.id);
           visual?.group.position.set(item.x, item.y, item.z);
+          tumble(item);
         },
+        onSync: catchUp,
         onRemove: (item) => {
           live.delete(item.id);
+          spins.delete(item.id);
           unmountLightStick(item.id);
         },
       });
@@ -431,6 +550,7 @@ export function createLightStickSystem({
     hurl,
     use,
     stow,
+    setPeerHolding,
     phase: () => phase ?? undefined,
 
     update({ dt, now, connected }) {
@@ -440,12 +560,35 @@ export function createLightStickSystem({
       stepAction(dt);
       setBelt(game.lightSticks, drawn);
 
+      for (const [id, left] of peerSwing) {
+        if (left <= 0) continue;
+        const next = Math.max(0, left - dt);
+        peerSwing.set(id, next);
+        if (next === 0) setPeerStick(id, false);
+      }
+      for (const [id, left] of peerClasp) {
+        const next = Math.max(0, left - dt);
+        peerClasp.set(id, next);
+        if (next === 0 && left > 0) setPeerStick(id, pawFull(id));
+      }
+
       let anyMoving = false;
       for (const id of live) {
         const item = getItem(id);
         if (!item || !isMoving(item)) continue;
         anyMoving = true;
-        if (isMine(item)) fly(item, dt);
+        fly(item, dt);
+      }
+      // The tumble outlives the flight: the water stops a baton travelling
+      // long before it stops it turning, so this runs off `spins` and not off
+      // `moving`. When it dies the entry goes, and the stick simply hangs
+      // there at whatever angle it stopped.
+      for (const [id, w] of spins) {
+        const damp = Math.exp(-SPIN_DRAG * dt);
+        w.x *= damp;
+        w.y *= damp;
+        w.z *= damp;
+        if (Math.hypot(w.x, w.y, w.z) < SPIN_REST) spins.delete(id);
       }
       if (anyMoving && connected) {
         looseSyncTimer += dt;
@@ -466,6 +609,13 @@ export function createLightStickSystem({
       if (kind === "stick") {
         const p = typeof data.p === "string" ? data.p : "";
         setPeerPhase(fromPeerId, p || undefined);
+        // "throw" starts the countdown to the paw opening; the swing ending
+        // ("") means it is already open, whatever their status mask still
+        // says — the two ride different channels and can land in either order.
+        if (p === "throw") peerSwing.set(fromPeerId, STICK_DWELL.release);
+        else if (p) peerSwing.delete(fromPeerId);
+        else peerSwing.set(fromPeerId, 0);
+        setPeerStick(fromPeerId, pawFull(fromPeerId));
       } else if (kind === "stickGot") {
         grant();
       } else if (isAuthority()) {
@@ -475,6 +625,9 @@ export function createLightStickSystem({
 
     onPeerDisconnected(peerId) {
       setPeerPhase(peerId, undefined);
+      peerHolding.delete(peerId);
+      peerSwing.delete(peerId);
+      peerClasp.delete(peerId);
       if (!isAuthority()) return;
       // Their thrown sticks keep burning — nobody is left to integrate the
       // ones still in flight, so the host freezes them where they are.
@@ -492,6 +645,10 @@ export function createLightStickSystem({
       // empties `live` and unmounts the visuals.
       stow();
       queuedThrow = false;
+      peerHolding.clear();
+      peerSwing.clear();
+      peerClasp.clear();
+      spins.clear();
       sent = undefined;
       looseSyncTimer = 0;
       mintCounter = 0;

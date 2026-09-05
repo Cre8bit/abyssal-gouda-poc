@@ -31,6 +31,7 @@ import {
   gripPlacements,
   holdAnchor,
   solveHeldAnchor,
+  freezeHandChain,
   PHASE_EASE,
   PHASE_EASE_DEFAULT,
   STICK_DWELL,
@@ -1588,6 +1589,11 @@ function buildPoseEditor(gltf: GLTF, spec: PoseEditorSpec): BenchInstance {
         vel,
         carry: "none",
       });
+      // The prop's placement is read in the rig-root frame against a frozen
+      // torso (solveHeldAnchor), so freeze the same chain here: with the spine
+      // still breathing, the prop you drag sits somewhere the shipped solve
+      // will not put it.
+      freezeHandChain(rig);
 
       if (playing) {
         if (anchorsDirty) resolveAnchors();

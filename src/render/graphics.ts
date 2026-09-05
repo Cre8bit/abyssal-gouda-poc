@@ -38,6 +38,7 @@ import { setGoudaScene } from "../entities/goldenGouda.ts";
 import { setDrillerScene, getMountedDriller } from "../entities/driller.ts";
 import {
   setLightStickScene,
+  updateLightStickLights,
   createLightStickVisual,
   type LightStickVisual,
 } from "../entities/lightStick.ts";
@@ -1902,6 +1903,9 @@ export function renderLoop(onFrame?: (delta: number) => void): void {
     updateBathyscaphe(elapsed);
     updateLocalBody(delta);
     for (const player of players.values()) updateRemoteDiver(player, delta);
+    // Every baton has posed itself by now — the thrown ones in their system,
+    // the ones in paws just above — so the fixed light pool can be handed out.
+    updateLightStickLights(camera.position);
     updateSnowLightUniforms();
     composer.render();
   });

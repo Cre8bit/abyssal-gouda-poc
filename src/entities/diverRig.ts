@@ -291,8 +291,12 @@ const ARM_POSE_STICK_THROW_R: ArmPose = {
   hz: -0.06552954586439433,
 };
 
-// …and where the baton itself sits in the rig-root frame in each of them —
-// on the belt for the grab, in the paw for the other two.
+// …and where the baton itself sits in the rig-root frame in each of them.
+// Authored in the pose bench (?m=stick-pose) and pasted back verbatim — the
+// baton lies STRAIGHT across the fingers with the clip toward the wrist, which
+// is the read the arm poses were built around. Solved against a frozen torso
+// (see restHandChain) so the same numbers land the same way every time; the
+// bench freezes the same chain, so what is dragged there is what ships.
 const STICK_TOOL_GRAB = new THREE.Matrix4().compose(
   new THREE.Vector3(
     0.308974817981264,
@@ -310,16 +314,12 @@ const STICK_TOOL_GRAB = new THREE.Matrix4().compose(
 );
 const STICK_TOOL_HOLD = new THREE.Matrix4().compose(
   new THREE.Vector3(
-    0.1737158548078075,
-    0.7992082692854906,
-    -0.3982206738020747,
+    0.20817406447687387,
+    0.8430764552076017,
+    -0.41180161157247763,
   ),
   new THREE.Quaternion().setFromEuler(
-    new THREE.Euler(
-      0.046881057141719334,
-      -0.6118868790477837,
-      -0.3400314541527877,
-    ),
+    new THREE.Euler(0.238407346410207, -1.41159265358979, 0.008407346410207),
   ),
   new THREE.Vector3(1, 1, 1),
 );
@@ -451,6 +451,11 @@ export const PHASE_EASE_DEFAULT = 6;
 export const STICK_DWELL = {
   /** Reaching down to the belt and back — the draw AND the stow. */
   grab: 0.34,
+  /** How far into that reach the paw actually closes on the baton — before
+   *  this the holster is still empty, so the stick is not drawn at all. In
+   *  first person the paw crosses the bottom of the lens on its way down and
+   *  a baton already in it reads as conjured out of the air. */
+  clasp: 0.24,
   /** The swing, from the paw opening to the arm finishing through. */
   throw: 0.34,
   /** …and where in that swing the baton actually leaves the paw. */
@@ -1308,15 +1313,60 @@ export function applyArmPose(rig: DiverRig, p: ArmPose): void {
 const _m1 = new THREE.Matrix4();
 const _m2 = new THREE.Matrix4();
 const _m3 = new THREE.Matrix4();
+const _restSave: THREE.Quaternion[] = [];
+
+// Put every bone BETWEEN the right paw and the model back on its rest
+// rotation — the clavicle, the spine, the waist, the arm twists. A held
+// prop's placement is authored in the rig-root frame, so the solve below
+// reads `root⁻¹ · hand`: with a breathing, swimming torso in between, that
+// matrix is different every frame and the same authored numbers land the prop
+// somewhere else depending on WHEN it was solved (~0.03 u of wander at idle,
+// more mid-stroke — enough to sink a light stick into the palm it was posed
+// on). Freezing the chain makes the solve a pure function of the pose.
+// Returns how many bones were parked, so restoreHandChain can put them back.
+function restHandChain(rig: DiverRig): number {
+  let n = 0;
+  for (
+    let b: THREE.Object3D | null = rig.bones.get("R_Hand") ?? null;
+    b && b !== rig.model;
+    b = b.parent
+  ) {
+    const rest = rig.data.get(b.name)?.rest;
+    if (!rest) continue;
+    (_restSave[n++] ??= new THREE.Quaternion()).copy(b.quaternion);
+    b.quaternion.copy(rest);
+  }
+  return n;
+}
+
+function restoreHandChain(rig: DiverRig, n: number): void {
+  let i = 0;
+  for (
+    let b: THREE.Object3D | null = rig.bones.get("R_Hand") ?? null;
+    b && b !== rig.model;
+    b = b.parent
+  ) {
+    if (!rig.data.get(b.name)?.rest) continue;
+    if (i < n) b.quaternion.copy(_restSave[i++]);
+  }
+}
+
+// The pose bench's half of the same deal: the editor draws the prop at its
+// authored rig-root placement, so the body it draws it against has to be the
+// one solveHeldAnchor reads, or what you drag is not what ships.
+export function freezeHandChain(rig: DiverRig): void {
+  restHandChain(rig);
+}
 
 // Solve where a prop sits in the RIGHT HAND bone's frame, given the arm pose
 // it was authored with and its placement in the rig-root frame:
 //   anchorLocal = boneChain⁻¹ · modelMatrix⁻¹ · tool
 // measured at DIVER_SCALE whatever the rig's own scale is — so a first-person
 // body (scaled up so the arms read) carries a proportionally scaled prop.
-// The arms are left in the authored pose; the next updateDiverRig() overwrites
-// them anyway. Exported because the bench pose editor solves the same thing
-// for poses that are still being dragged around and have no constant yet.
+// Solved against a FROZEN torso (see restHandChain) and restored afterwards,
+// so the answer is the authored pose and nothing else. Exported because the
+// bench pose editor solves the same thing for poses that are still being
+// dragged around and have no constant yet.
 export function solveHeldAnchor(
   rig: DiverRig,
   left: ArmPose,
@@ -1326,6 +1376,7 @@ export function solveHeldAnchor(
 ): boolean {
   const hand = rig.bones.get("R_Hand");
   if (!hand) return false;
+  const parked = restHandChain(rig);
   applyArmPoseSides(rig, left, right);
   rig.root.updateMatrixWorld(true);
   _m1.copy(rig.model.matrixWorld).invert().multiply(hand.matrixWorld);
@@ -1334,6 +1385,8 @@ export function solveHeldAnchor(
   _m2.premultiply(_m3.makeScale(inv, inv, inv));
   _m2.premultiply(_m1.invert());
   _m2.decompose(out.position, out.quaternion, out.scale);
+  restoreHandChain(rig, parked);
+  rig.root.updateMatrixWorld(true);
   return true;
 }
 

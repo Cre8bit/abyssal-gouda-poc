@@ -358,6 +358,18 @@ therefore also clamps `reflectedLight.*Diffuse` (`BODY_LIGHT_CAP`) via
 `toonMaterial`'s `shader` hook: the crater lands on "fully lit gold" instead of
 "white hole", and a diver's torch stays far under the cap and shades normally.
 
+Clamp the IRRADIANCE, not the shaded result, on anything **textured**. A flat
+`min(reflectedLight, vec3(cap))` writes the same value on every texel that
+reaches it, so the surface goes uniformly white and its map disappears — which
+is exactly what the light stick's carabiner did, 0.05 u from its own burn.
+`capClipLight()` in `entities/lightStick.ts` divides the surface's own albedo
+back out, clamps that, and multiplies the albedo back on, scaling the whole
+triple by its peak channel rather than each channel on its own so the burn's
+green still tints the hardware. Its cap is therefore in ALBEDO MULTIPLES (1 =
+"fully lit"), not in absolute radiance like the Gouda's — the Gouda gets away
+with the flat clamp because its map is one bright gold and the crater is the
+only thing that ever reaches the cap.
+
 **Use the rig the artist shipped — don't rebuild it.** `golden_gouda.glb` is a
 real skin: a `SkinnedMesh` plus an `Armature` of 8 joints, being 7 bones
 weighted one per floating cheese bit and Blender's `neutral_bone`, which holds
